@@ -1,0 +1,1 @@
+{"rustc":7458672600737419911,"features":"","declared_features":"","target":0,"profile":0,"path":0,"deps":[[13691476417634920432,"build_script_build",false,11681716772044627784]],"local":[{"RerunIfChanged":{"output":"debug/build/polars-stream-192a805040aff131/output","paths":["build.rs"]}}],"rustflags":[],"config":0,"compile_kind":0}

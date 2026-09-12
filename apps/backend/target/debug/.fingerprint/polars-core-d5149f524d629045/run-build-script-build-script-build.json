@@ -1,0 +1,1 @@
+{"rustc":7458672600737419911,"features":"","declared_features":"","target":0,"profile":0,"path":0,"deps":[[4996662074470395747,"build_script_build",false,18383434136576556550]],"local":[{"RerunIfChanged":{"output":"debug/build/polars-core-d5149f524d629045/output","paths":["build.rs"]}}],"rustflags":[],"config":0,"compile_kind":0}
