@@ -184,7 +184,7 @@ describe('benchmark HTTP contract', () => {
   });
 
   it.each([
-    [401, { error: 'Bearer token required' }, 'Bearer token required'],
+    [400, { error: 'Unknown benchmark: missing' }, 'Unknown benchmark: missing'],
     [409, { error: 'A benchmark run is already active' }, 'A benchmark run is already active'],
     [404, { error: 'This run produced no CSV rows' }, 'This run produced no CSV rows'],
     [

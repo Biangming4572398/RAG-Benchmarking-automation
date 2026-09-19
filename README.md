@@ -91,16 +91,13 @@ Only `completed` runs should be compared as full benchmark results.
 
 ## Start
 
-`BENCHMARK_API_TOKEN` is a local shared password you choose, not a provider API
-key or an existing secret you need to recover. The Rust backend required it before
-the dashboard was added. Use the same value for the backend and frontend's Node
-proxy; it is independent of `NEBULA_API_TOKEN`, which authenticates requests to
-Nebula. Keep these credentials outside Git.
+The benchmark API requires no authentication and only accepts loopback bind
+addresses. `NEBULA_API_TOKEN` authenticates the runner's requests to Nebula and
+stays in backend configuration.
 
 Run in `apps/backend` using Rust 1.95 or newer:
 
 ```sh
-export BENCHMARK_API_TOKEN='a-local-development-token'
 export BENCHMARK_DATA_DIR='/absolute/path/to/experiment-data'
 export BENCHMARK_ADDR='127.0.0.1:4319' # optional; this is the default
 # Optional: export BENCHMARK_CATALOG='/absolute/path/to/benchmarks.yaml'
@@ -108,18 +105,16 @@ cargo run --locked
 ```
 
 The server prints `BENCHMARK_BACKEND_PORT=<port>`; port 0 selects an available
-port. All endpoints require `Authorization: Bearer $BENCHMARK_API_TOKEN`.
+port.
 There is no permissive browser CORS configuration; the internal dashboard uses a
-server-side development proxy. Export the same `BENCHMARK_API_TOKEN` in the shell
-running `pnpm benchmark:ui` or `pnpm start`; optionally set `BENCHMARK_API_TARGET`
-to the backend origin when it differs from `http://127.0.0.1:4319`. Credentials
-never enter the renderer. Only one server may own a data directory.
+server-side development proxy. When running `pnpm benchmark:ui`, optionally set
+`BENCHMARK_API_TARGET` to the backend origin when it differs from
+`http://127.0.0.1:4319`. Only one server may own a data directory.
 
 Load a named benchmark using its YAML defaults:
 
 ```sh
 curl -sS http://127.0.0.1:4319/api/benchmarks/v1/benchmarks \
-  -H "Authorization: Bearer $BENCHMARK_API_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"benchmark":"ragtruth-qa"}'
 ```
@@ -150,7 +145,6 @@ needed: this version calls `/retrieve`, not `/query`.
 
 ```sh
 curl -sS http://127.0.0.1:4319/api/benchmarks/v1/runs \
-  -H "Authorization: Bearer $BENCHMARK_API_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"benchmark_id":"UUID-FROM-LOAD","label":"baseline"}'
 ```
@@ -217,7 +211,7 @@ cargo clippy --locked --all-targets -- -D warnings
 
 Tests use real local Parquet and HTTP with a scripted Nebula peer, checking
 deduplication, CSV quoting, source selection, known ranks, index drift, failures,
-authentication, persistence, and interrupted-run recovery. The optional live
+token-free startup, loopback binding, persistence, and interrupted-run recovery. The optional live
 Hugging Face smoke test requires network access:
 
 ```sh

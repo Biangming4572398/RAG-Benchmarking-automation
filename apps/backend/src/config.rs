@@ -5,7 +5,6 @@ pub struct Config {
     pub address: SocketAddr,
     pub data_dir: PathBuf,
     pub catalog_path: PathBuf,
-    pub api_token: String,
     pub nebula: Option<NebulaConfig>,
 }
 
@@ -25,9 +24,6 @@ impl Config {
         if !address.ip().is_loopback() {
             return Err(Error("BENCHMARK_ADDR must use loopback".into()));
         }
-        let api_token = env::var("BENCHMARK_API_TOKEN")
-            .map_err(|_| Error("BENCHMARK_API_TOKEN is required".into()))?;
-        validate_token(&api_token)?;
         let nebula = match (
             env::var("NEBULA_API_BASE").ok(),
             env::var("NEBULA_API_TOKEN").ok(),
@@ -49,7 +45,6 @@ impl Config {
             data_dir: env::var_os("BENCHMARK_DATA_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("benchmark-data")),
-            api_token,
             catalog_path: env::var_os("BENCHMARK_CATALOG")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("benchmarks.yaml")),
@@ -58,7 +53,7 @@ impl Config {
     }
 }
 
-pub fn validate_token(token: &str) -> Result<()> {
+fn validate_token(token: &str) -> Result<()> {
     if token.is_empty() || token.len() > 1024 || !token.bytes().all(|b| (33..=126).contains(&b)) {
         return Err(Error(
             "API tokens must contain 1–1024 visible ASCII characters without spaces".into(),

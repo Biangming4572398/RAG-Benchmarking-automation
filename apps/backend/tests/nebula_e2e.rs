@@ -1,4 +1,4 @@
-//! Opt-in acceptance through both real executables; no scripted retrieval peer.
+//! Server startup checks and opt-in acceptance through both real executables.
 use std::{
     env,
     fs::{self, File},
@@ -11,7 +11,6 @@ use backend::load_benchmarks::Benchmark;
 use polars::prelude::*;
 use serde_json::{Value, json};
 
-const BENCHMARK_TOKEN: &str = "benchmark-acceptance-local";
 const NEBULA_TOKEN: &str = "nebula-acceptance-local";
 const TIMEOUT: Duration = Duration::from_secs(180);
 
@@ -110,7 +109,7 @@ fn start_benchmark(root: &Path, nebula_port: Option<u16>) -> Process {
     let mut command = Command::new(env!("CARGO_BIN_EXE_backend"));
     command
         .env("BENCHMARK_ADDR", "127.0.0.1:0")
-        .env("BENCHMARK_API_TOKEN", BENCHMARK_TOKEN)
+        .env_remove("BENCHMARK_API_TOKEN")
         .env("BENCHMARK_DATA_DIR", root.join("benchmark-data"))
         .env("BENCHMARK_CATALOG", root.join("benchmarks.yaml"))
         .env_remove("NEBULA_API_BASE")
@@ -139,6 +138,31 @@ async fn response(request: reqwest::RequestBuilder, expected_status: u16) -> Val
 
 fn save_json(root: &Path, name: &str, value: &Value) {
     fs::write(root.join(name), serde_json::to_vec_pretty(value).unwrap()).unwrap();
+}
+
+#[tokio::test]
+async fn benchmark_starts_without_credentials_on_loopback() {
+    let root = tempfile::tempdir().unwrap();
+    fixture(root.path());
+    let mut server = start_benchmark(root.path(), None);
+    let port = server.port("BENCHMARK_BACKEND_PORT=").await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let health = response(
+        client.get(format!("http://127.0.0.1:{port}/api/benchmarks/v1/health")),
+        200,
+    )
+    .await;
+    assert_eq!(health["status"], "ok");
+}
+
+#[test]
+fn benchmark_rejects_non_loopback_addresses() {
+    let output = Command::new(env!("CARGO_BIN_EXE_backend"))
+        .env("BENCHMARK_ADDR", "0.0.0.0:0")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("BENCHMARK_ADDR must use loopback"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -182,12 +206,11 @@ async fn real_nebula_produces_benchmark_results() {
             .await
             .unwrap()
             .status(),
-        reqwest::StatusCode::UNAUTHORIZED
+        reqwest::StatusCode::OK
     );
     let loaded = response(
         client
             .post(format!("{base}/benchmarks"))
-            .bearer_auth(BENCHMARK_TOKEN)
             .json(&json!({"benchmark":"local-qa"})),
         201,
     )
@@ -196,13 +219,7 @@ async fn real_nebula_produces_benchmark_results() {
     assert_eq!(loaded["case_count"], 3);
     let corpus = Path::new(loaded["corpus_path"].as_str().unwrap());
     let benchmark_id = loaded["id"].as_str().unwrap();
-    let snapshot = response(
-        client
-            .get(format!("{base}/benchmarks/{benchmark_id}"))
-            .bearer_auth(BENCHMARK_TOKEN),
-        200,
-    )
-    .await;
+    let snapshot = response(client.get(format!("{base}/benchmarks/{benchmark_id}")), 200).await;
     let benchmark: Benchmark = serde_json::from_value(snapshot.clone()).unwrap();
     assert_eq!(benchmark.documents.len(), 3);
     for document in &benchmark.documents {
@@ -258,7 +275,6 @@ async fn real_nebula_produces_benchmark_results() {
     let started = response(
         client
             .post(format!("{base}/runs"))
-            .bearer_auth(BENCHMARK_TOKEN)
             .json(&json!({"benchmark_id":benchmark_id,"label":"real-nebula-acceptance"})),
         202,
     )
@@ -268,13 +284,7 @@ async fn real_nebula_produces_benchmark_results() {
     let run = loop {
         nebula.assert_running();
         benchmark_server.assert_running();
-        let run = response(
-            client
-                .get(format!("{base}/runs/{run_id}"))
-                .bearer_auth(BENCHMARK_TOKEN),
-            200,
-        )
-        .await;
+        let run = response(client.get(format!("{base}/runs/{run_id}")), 200).await;
         save_json(&root, "run.json", &run);
         if run["status"] != "running" {
             break run;
@@ -294,7 +304,6 @@ async fn real_nebula_produces_benchmark_results() {
     assert_eq!(run["means"]["context_hit_at_k"], 1.0);
     let csv = client
         .get(format!("{base}/runs/{run_id}/scores.csv"))
-        .bearer_auth(BENCHMARK_TOKEN)
         .send()
         .await
         .unwrap()

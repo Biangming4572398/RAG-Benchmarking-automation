@@ -256,7 +256,6 @@ async fn wait_run(client: &reqwest::Client, base: &str, id: &str) -> Value {
     for _ in 0..100 {
         let run: Value = client
             .get(format!("{base}/runs/{id}"))
-            .bearer_auth("test-token")
             .send()
             .await
             .unwrap()
@@ -281,7 +280,6 @@ async fn api_loads_runs_scores_and_reopens_without_a_database() {
     let server = serve(
         router(
             store.clone(),
-            "test-token".into(),
             Some(NebulaConfig {
                 base_url: format!("{}/api/nebula/v1", nebula.base),
                 token: "nebula-token".into(),
@@ -300,11 +298,10 @@ async fn api_loads_runs_scores_and_reopens_without_a_database() {
             .await
             .unwrap()
             .status(),
-        StatusCode::UNAUTHORIZED
+        StatusCode::OK
     );
     let loaded = client
         .post(format!("{base}/benchmarks"))
-        .bearer_auth("test-token")
         .json(&json!({"benchmark":"ragtruth-qa", "limit":2}))
         .send()
         .await
@@ -327,7 +324,6 @@ async fn api_loads_runs_scores_and_reopens_without_a_database() {
     let new_server = serve(
         router(
             store,
-            "test-token".into(),
             Some(NebulaConfig {
                 base_url: format!("{}/api/nebula/v1", nebula.base),
                 token: "nebula-token".into(),
@@ -340,7 +336,6 @@ async fn api_loads_runs_scores_and_reopens_without_a_database() {
     let base = format!("{}/api/benchmarks/v1", new_server.base);
     let catalog: Value = client
         .get(format!("{base}/catalog"))
-        .bearer_auth("test-token")
         .send()
         .await
         .unwrap()
@@ -350,7 +345,6 @@ async fn api_loads_runs_scores_and_reopens_without_a_database() {
     assert_eq!(catalog["benchmarks"]["ragtruth-qa"]["defaults"]["top_k"], 1);
     let invalid = client
         .post(format!("{base}/benchmarks"))
-        .bearer_auth("test-token")
         .json(&json!({"benchmark":"unknown"}))
         .send()
         .await
@@ -358,7 +352,6 @@ async fn api_loads_runs_scores_and_reopens_without_a_database() {
     assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
     let response = client
         .post(format!("{base}/runs"))
-        .bearer_auth("test-token")
         .json(&json!({"benchmark_id":loaded["id"], "label":"baseline"}))
         .send()
         .await
@@ -374,7 +367,6 @@ async fn api_loads_runs_scores_and_reopens_without_a_database() {
     assert_eq!(result["means"]["reciprocal_rank_at_k"], 0.5);
     let csv = client
         .get(format!("{base}/runs/{id}/scores.csv"))
-        .bearer_auth("test-token")
         .send()
         .await
         .unwrap();

@@ -35,7 +35,6 @@
     "proxy": {
       "path": "/api/benchmarks/v1",
       "targetEnv": "BENCHMARK_API_TARGET",
-      "tokenEnv": "BENCHMARK_API_TOKEN",
       "defaultTarget": "http://127.0.0.1:4319"
     }
   },

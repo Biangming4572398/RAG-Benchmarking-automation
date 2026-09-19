@@ -220,9 +220,9 @@ describe('Live benchmarking dashboard', () => {
   it('reports disconnected data honestly and preserves previous results after a refresh failure', async () => {
     const user = userEvent.setup();
     const api = apiWith([run()]);
-    api.listBenchmarks.mockRejectedValueOnce(new ApiError('Bearer token required', 401));
+    api.listBenchmarks.mockRejectedValueOnce(new ApiError('Benchmark server unavailable', 503));
     render(<BenchmarkDashboard api={api} />);
-    expect(await screen.findByRole('alert')).toHaveTextContent('Bearer token required');
+    expect(await screen.findByRole('alert')).toHaveTextContent('Benchmark server unavailable');
     expect(screen.getByText('Disconnected')).toBeVisible();
     expect(screen.queryByText('Sample data')).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Start run' })).toBeDisabled();

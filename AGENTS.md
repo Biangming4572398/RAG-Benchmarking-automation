@@ -18,8 +18,9 @@ separate task using this handoff.
   and interrupted runs as partial results, and identify the current metric as
   paired-context recovery rather than general answer quality. Compare completed
   runs with matching benchmark fingerprints, top-k, and candidate source sets.
-- Connect through a host-owned proxy or bridge that supplies backend credentials.
-  Credentials belong in host configuration, outside renderer state and bundles.
+- Connect through a host-owned proxy or bridge to the loopback benchmark API,
+  which requires no authentication. Nebula credentials stay in backend/host
+  configuration, outside renderer state and bundles.
   Model selection, Nebula launch, and experiment orchestration remain backend/host
   responsibilities; the current benchmark server does not launch Nebula.
 - In the Genesis checkout, inspect `genesis/scripts/generate-registry.ts` and

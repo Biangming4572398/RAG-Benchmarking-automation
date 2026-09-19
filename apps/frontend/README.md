@@ -5,8 +5,7 @@ contracts, styling, and the Genesis SDK adapter belong to this submodule. Genesi
 only discovers the module, displays it, and supplies generic development proxy
 support. The results table is the first content in the dashboard. Benchmark
 definitions live in Git-managed [`apps/backend/benchmarks.yaml`](../backend/benchmarks.yaml),
-starting with RAGTruth QA; the frontend does not create or edit them. The benchmark
-server is unchanged.
+starting with RAGTruth QA; the frontend does not create or edit them.
 
 ## Connect and open
 
@@ -15,17 +14,13 @@ load the `ragtruth-qa` snapshot using the documented curl command, and connect
 Nebula to its exported corpus. The YAML catalog is read at startup; it does not
 automatically load snapshots.
 
-`BENCHMARK_API_TOKEN` is a local shared password you choose. The existing Rust
-backend required it before this frontend was added; it is not a provider API key,
-and there is no pre-existing secret to recover. Use the same value for the backend
-and Node development proxy. It is independent of `NEBULA_API_TOKEN`, which connects
-the benchmark server to Nebula. Do not put either credential in Git or a `VITE_`
-variable.
+The local benchmark server does not require a token. `NEBULA_API_TOKEN` still
+connects the benchmark server to Nebula; keep it in backend configuration, outside
+Git and `VITE_` variables.
 
 In the shell running the frontend:
 
 ```sh
-export BENCHMARK_API_TOKEN='the-same-local-development-token'
 # Optional if the backend uses another origin/port:
 export BENCHMARK_API_TARGET='http://127.0.0.1:4319'
 ```
@@ -42,12 +37,12 @@ Or run `pnpm start` and select **Benchmarking** in the Genesis dock. A customize
 dock layout takes precedence over generated defaults. Restart the frontend/Genesis
 development server after changing proxy environment variables.
 
-The browser calls same-origin `/api/benchmarks/v1` routes. The Node-side proxy adds
-the bearer token; it is never stored in panel state or built into the frontend.
+The browser calls same-origin `/api/benchmarks/v1` routes. The Node-side proxy
+forwards them to the local backend, using port 4319 by default.
 Genesis discovers the submodule's `genesisDevelopment.proxy` declaration. Release
 packaging excludes development module registrations, frontend assets, and backend
 resources. `pnpm --filter @genesis/benchmarking build` builds the standalone UI;
-serving that static build separately requires an equivalent authenticated proxy.
+serving that static build separately requires an equivalent local proxy.
 
 ## Workflow
 

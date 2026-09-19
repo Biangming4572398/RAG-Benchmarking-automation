@@ -2,9 +2,8 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, Request, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{StatusCode, header},
-    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
 };
@@ -15,7 +14,7 @@ use uuid::Uuid;
 use crate::{
     Error, Result,
     catalog::{Catalog, LoadRequest},
-    config::{NebulaConfig, validate_token},
+    config::NebulaConfig,
     load_benchmarks::load_benchmarks,
     storage::Store,
     trials::{Run, RunStatus, StartRunRequest, execute},
@@ -23,26 +22,18 @@ use crate::{
 
 struct AppState {
     store: Arc<Store>,
-    token: String,
     nebula: Option<NebulaConfig>,
     catalog: Catalog,
     run_slot: Arc<Semaphore>,
     load_slot: Arc<Semaphore>,
 }
 
-pub fn router(
-    store: Arc<Store>,
-    token: String,
-    nebula: Option<NebulaConfig>,
-    catalog: Catalog,
-) -> Result<Router> {
-    validate_token(&token)?;
+pub fn router(store: Arc<Store>, nebula: Option<NebulaConfig>, catalog: Catalog) -> Result<Router> {
     if let Some(config) = &nebula {
         config.validate()?;
     }
     let state = Arc::new(AppState {
         store,
-        token,
         nebula,
         catalog,
         run_slot: Arc::new(Semaphore::new(1)),
@@ -63,29 +54,7 @@ pub fn router(
         .route("/api/benchmarks/v1/runs/{id}", get(run))
         .route("/api/benchmarks/v1/runs/{id}/scores.csv", get(scores))
         .layer(DefaultBodyLimit::max(64 * 1024))
-        .layer(middleware::from_fn_with_state(state.clone(), authenticate))
         .with_state(state))
-}
-
-async fn authenticate(
-    State(state): State<Arc<AppState>>,
-    request: Request,
-    next: Next,
-) -> Response {
-    let expected = format!("Bearer {}", state.token);
-    if request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        != Some(&expected)
-    {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "Bearer token required"})),
-        )
-            .into_response();
-    }
-    next.run(request).await
 }
 
 type ApiResult<T> = std::result::Result<T, ApiError>;
