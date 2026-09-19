@@ -1,0 +1,62 @@
+{
+  "name": "@genesis/benchmarking",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local benchmark results and architecture comparisons",
+  "main": "./apps/frontend/src/index.tsx",
+  "types": "./apps/frontend/src/index.tsx",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "peerDependencies": {
+    "@genesis/sdk": "^0.1.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@genesis/sdk": "file:../../../packages/sdk",
+    "@testing-library/jest-dom": "^6.0.0",
+    "@testing-library/react": "^16.0.0",
+    "@testing-library/user-event": "^14.5.2",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "jsdom": "^25.0.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "typescript": "~5.7.0",
+    "vite": "^5.4.21",
+    "vitest": "^2.1.9"
+  },
+  "genesis": {
+    "id": "benchmarking",
+    "displayName": "Benchmarking",
+    "description": "Compare benchmark results across architectures.",
+    "apiVersion": "0.1.0",
+    "version": "0.1.0",
+    "permissions": [],
+    "syncBehavior": "local-only",
+    "sanctumPanels": [
+      {
+        "id": "main",
+        "title": "Benchmarking",
+        "defaultSize": {
+          "width": 1320,
+          "height": 820
+        }
+      }
+    ],
+    "dockItem": {
+      "icon": {
+        "type": "lucide",
+        "name": "TableProperties"
+      },
+      "tooltip": "Benchmarking",
+      "order": 40,
+      "defaultSanctumPanel": "main"
+    }
+  }
+}

@@ -1,5 +1,11 @@
 # RAG benchmarking backend
 
+The experimental architecture comparison dashboard lives in
+[`apps/frontend`](apps/frontend/README.md). Open it with `pnpm benchmark:ui` from
+the Genesis workspace, or use the Benchmarking dock item in development Genesis.
+It currently displays sample or imported JSON reports; it does not start runs or
+connect to this server. The backend and HTTP interface below remain unchanged.
+
 Developer-only Rust HTTP server for loading benchmark data with Polars, running
 Nebula retrieval, and retaining CSV scores. It does not register with the Genesis
 release build, select models, launch Nebula, or modify your normal Genesis storage.
