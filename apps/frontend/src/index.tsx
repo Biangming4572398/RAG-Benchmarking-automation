@@ -17,7 +17,7 @@ class BenchmarkingInstance implements GenesisModuleInstance {
   }
 
   // Genesis may unmount a panel when changing spaces. Retain the latest local
-  // report and filters in its instance, and let the dashboard validate restores.
+  // filters in its instance. Server records are refreshed when the panel reopens.
   readonly #onStateChange = (state: unknown): void => {
     this.#state = state;
   };

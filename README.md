@@ -3,8 +3,10 @@
 The experimental architecture comparison dashboard lives in
 [`apps/frontend`](apps/frontend/README.md). Open it with `pnpm benchmark:ui` from
 the Genesis workspace, or use the Benchmarking dock item in development Genesis.
-It currently displays sample or imported JSON reports; it does not start runs or
-connect to this server. The backend and HTTP interface below remain unchanged.
+It connects to this server through a development proxy, loads benchmark snapshots,
+starts labelled runs, polls progress, compares compatible retrieval results, and
+downloads the server's CSV files. Its UI, API client, and standalone proxy live
+inside this submodule. The backend and HTTP interface below remain unchanged.
 
 Developer-only Rust HTTP server for loading benchmark data with Polars, running
 Nebula retrieval, and retaining CSV scores. It does not register with the Genesis
@@ -96,8 +98,11 @@ cargo run --locked
 
 The server prints `BENCHMARK_BACKEND_PORT=<port>`; port 0 selects an available
 port. All endpoints require `Authorization: Bearer $BENCHMARK_API_TOKEN`.
-There is no permissive browser CORS configuration; a future internal dashboard
-should use its host proxy. Only one server may own a data directory.
+There is no permissive browser CORS configuration; the internal dashboard uses a
+server-side development proxy. Export the same `BENCHMARK_API_TOKEN` in the shell
+running `pnpm benchmark:ui` or `pnpm start`; optionally set `BENCHMARK_API_TARGET`
+to the backend origin when it differs from `http://127.0.0.1:4319`. Credentials
+never enter the renderer. Only one server may own a data directory.
 
 Load a named benchmark using its YAML defaults:
 

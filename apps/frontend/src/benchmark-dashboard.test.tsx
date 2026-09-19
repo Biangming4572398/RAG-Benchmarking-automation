@@ -1,314 +1,310 @@
 // @vitest-environment jsdom
-import React from 'react';
 import '@testing-library/jest-dom/vitest';
-import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import React from 'react';
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { BenchmarkDashboard } from './benchmark-dashboard';
-import { type BenchmarkReport } from './benchmark-data';
+import {
+  ApiError,
+  type BenchmarkApi,
+  type BenchmarkInfo,
+  type BenchmarkRun,
+  type Catalog,
+} from './benchmark-api';
 
-function reportFixture(): BenchmarkReport {
+const catalog: Catalog = {
+  benchmarks: {
+    'ragtruth-qa': {
+      name: 'RAGTruth QA',
+      source: 'fixture.parquet',
+      split: 'test',
+      adapter: 'ragtruth_qa',
+      evaluation: 'paired_context_recovery_v1',
+      defaults: { limit: 100, top_k: 8 },
+    },
+  },
+};
+const benchmark: BenchmarkInfo = {
+  id: 'snapshot-a',
+  source: 'fixture.parquet',
+  split: 'test',
+  metric_kind: 'paired_context_recovery_v1',
+  case_count: 10,
+  document_count: 3,
+  corpus_path: '/experiment/corpus',
+  fingerprint: 'fingerprint-a',
+  configuration: {
+    key: 'ragtruth-qa',
+    definition: { ...catalog.benchmarks['ragtruth-qa'], defaults: { limit: 10, top_k: 4 } },
+  },
+};
+function run(overrides: Partial<BenchmarkRun> = {}): BenchmarkRun {
   return {
-    schemaVersion: 1,
-    name: 'Evaluation batch',
-    sample: false,
-    architectures: [
-      { id: 'baseline', name: 'Baseline', description: 'Reference design' },
-      { id: 'candidate', name: 'Candidate', description: 'Sequential design' },
-      { id: 'parallel', name: 'Parallel', description: 'Concurrent design' },
-    ],
-    benchmarks: [
-      {
-        id: 'accuracy',
-        name: 'Accuracy benchmark',
-        suite: 'Correctness',
-        metric: 'Accuracy',
-        unit: '%',
-        direction: 'higher',
-      },
-      {
-        id: 'errors',
-        name: 'Error benchmark',
-        suite: 'Correctness',
-        metric: 'Error rate',
-        unit: '%',
-        direction: 'lower',
-      },
-      {
-        id: 'reasoning',
-        name: 'Reasoning benchmark',
-        suite: 'Reasoning',
-        metric: 'Points',
-        unit: 'points',
-        direction: 'higher',
-      },
-      {
-        id: 'recovery',
-        name: 'Recovery benchmark',
-        suite: 'Reliability',
-        metric: 'Success rate',
-        unit: '%',
-        direction: 'higher',
-      },
-    ],
-    results: [
-      { benchmarkId: 'accuracy', architectureId: 'baseline', status: 'completed', value: 80 },
-      { benchmarkId: 'accuracy', architectureId: 'candidate', status: 'completed', value: 95 },
-      { benchmarkId: 'accuracy', architectureId: 'parallel', status: 'completed', value: 90 },
-      { benchmarkId: 'errors', architectureId: 'baseline', status: 'completed', value: 4 },
-      { benchmarkId: 'errors', architectureId: 'candidate', status: 'completed', value: 2 },
-      { benchmarkId: 'errors', architectureId: 'parallel', status: 'completed', value: 2 },
-      { benchmarkId: 'reasoning', architectureId: 'baseline', status: 'completed', value: 0 },
-      { benchmarkId: 'reasoning', architectureId: 'candidate', status: 'queued' },
-      {
-        benchmarkId: 'recovery',
-        architectureId: 'baseline',
-        status: 'failed',
-        note: 'The response did not match the expected structure.',
-      },
-      { benchmarkId: 'recovery', architectureId: 'candidate', status: 'running' },
-      { benchmarkId: 'recovery', architectureId: 'parallel', status: 'completed', value: 75 },
-    ],
+    id: 'run-first',
+    request: { benchmark_id: benchmark.id, top_k: 4, label: 'Dense baseline' },
+    metric_kind: benchmark.metric_kind,
+    benchmark_fingerprint: benchmark.fingerprint,
+    status: 'completed',
+    started_at_ms: 1000,
+    finished_at_ms: 2000,
+    total: 10,
+    completed: 10,
+    failed: 0,
+    means: { context_hit_at_k: 0.8, reciprocal_rank_at_k: 0.5, ndcg_at_k: 0.6 },
+    error: null,
+    scope: { corpusId: 'corpus-a' },
+    watermark: { generation: 1 },
+    source_ids: ['source-a', 'source-b'],
+    ...overrides,
   };
 }
-
-function jsonFile(contents: string, name = 'results.json'): File {
-  const file = new File([contents], name, { type: 'application/json' });
-  // jsdom's File does not expose the browser's Blob.text implementation.
-  Object.defineProperty(file, 'text', { value: async () => contents });
-  return file;
+function apiWith(runs: BenchmarkRun[] = []) {
+  return {
+    getCatalog: vi.fn().mockResolvedValue(catalog),
+    listBenchmarks: vi.fn().mockResolvedValue([benchmark]),
+    listRuns: vi.fn().mockResolvedValue(runs),
+    getBenchmark: vi.fn().mockResolvedValue({
+      id: benchmark.id,
+      source: benchmark.source,
+      split: 'test',
+      metric_kind: benchmark.metric_kind,
+      cases: [
+        {
+          id: 'case-a',
+          query: 'Where is the evidence?',
+          document_id: 'doc-a',
+          reference_outputs: [],
+        },
+      ],
+      documents: [],
+    }),
+    getRun: vi.fn().mockImplementation(async (id: string) => runs.find((item) => item.id === id)),
+    loadBenchmark: vi.fn().mockResolvedValue(benchmark),
+    startRun: vi.fn().mockResolvedValue(run({ status: 'running', completed: 0, means: null })),
+    downloadScores: vi.fn().mockResolvedValue(new Blob(['scores'], { type: 'text/csv' })),
+  } satisfies BenchmarkApi;
 }
-
-function readBlob(blob: Blob): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(String(reader.result));
-    reader.onerror = () => reject(reader.error);
-    reader.readAsText(blob);
-  });
+async function connected() {
+  expect(await screen.findByText('Connected')).toBeVisible();
 }
-
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  vi.useRealTimers();
 });
 
-describe('architecture comparison dashboard', () => {
-  it('compares the full matrix, includes ties, and recalculates best scores among selected architectures', async () => {
+describe('Live benchmarking dashboard', () => {
+  it('loads real backend records and compares only completed runs with matching settings', async () => {
+    const candidate = run({
+      id: 'run-second',
+      request: { ...run().request, label: 'Hybrid retrieval' },
+      means: { context_hit_at_k: 0.9, reciprocal_rank_at_k: 0.7, ndcg_at_k: 0.8 },
+    });
+    const partial = run({
+      id: 'run-partial',
+      status: 'failed',
+      completed: 3,
+      failed: 1,
+      means: { context_hit_at_k: 1, reciprocal_rank_at_k: 1, ndcg_at_k: 1 },
+      error: 'Index changed',
+    });
+    const different = run({ id: 'run-other', request: { ...run().request, top_k: 8 } });
+    const api = apiWith([run(), candidate, partial, different]);
     const user = userEvent.setup();
-    render(<BenchmarkDashboard initialState={{ report: reportFixture() }} />);
-
-    const table = screen.getByRole('table');
-    expect(within(table).getAllByRole('columnheader')).toHaveLength(4);
-    expect(within(table).getAllByRole('rowheader')).toHaveLength(4);
-    expect(within(table).getAllByRole('cell')).toHaveLength(12);
+    render(<BenchmarkDashboard api={api} />);
+    await connected();
+    const table = within(screen.getByRole('table'));
+    expect(table.getByText('Hybrid retrieval')).toBeVisible();
+    expect(table.getByText('0.900')).toBeVisible();
+    expect(table.getByText('Partial results')).toBeVisible();
     expect(
-      screen.getByRole('button', { name: 'Accuracy benchmark, Candidate: 95%, best result' }),
-    ).toBeVisible();
-    expect(
-      screen.getByRole('button', { name: 'Error benchmark, Candidate: 2%, best result' }),
-    ).toBeVisible();
-    expect(
-      screen.getByRole('button', { name: 'Error benchmark, Parallel: 2%, best result' }),
-    ).toBeVisible();
-    expect(
-      screen.getByRole('button', { name: 'Reasoning benchmark, Baseline: 0 points, best result' }),
-    ).toBeVisible();
-    expect(
-      screen.getByRole('button', { name: 'Reasoning benchmark, Parallel: Not run' }),
-    ).toBeVisible();
-
-    await user.click(screen.getByRole('checkbox', { name: 'Candidate' }));
-    expect(within(table).getAllByRole('columnheader')).toHaveLength(3);
-    expect(
-      screen.getByRole('button', { name: 'Accuracy benchmark, Parallel: 90%, best result' }),
-    ).toBeVisible();
-    expect(screen.queryByRole('columnheader', { name: /Candidate/ })).not.toBeInTheDocument();
-
-    await user.click(screen.getByRole('checkbox', { name: 'Highlight best in each row' }));
-    expect(within(table).queryByRole('button', { name: /best result/ })).not.toBeInTheDocument();
-    await user.click(screen.getByRole('checkbox', { name: 'Parallel' }));
-    expect(screen.getByRole('checkbox', { name: 'Baseline' })).toBeDisabled();
+      screen.queryByRole('button', { name: 'Compare setup for run-part' }),
+    ).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Compare setup for run-firs' }));
+    expect(table.getAllByRole('row')).toHaveLength(3);
+    expect(table.getByText('0.900')).toHaveAttribute('data-best', 'true');
+    const baseline = within(table.getByRole('row', { name: /Dense baseline/ }));
+    expect(baseline.getByText('0.800')).not.toHaveAttribute('data-best');
+    expect(table.queryByText('Partial results')).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Show all runs' }));
+    expect(table.getAllByRole('row')).toHaveLength(5);
   });
 
-  it('combines suite, metric search, and cell-status filters and offers recovery from an empty view', async () => {
+  it('uses catalog loading and saved snapshot defaults without sending invented architecture options', async () => {
     const user = userEvent.setup();
-    render(<BenchmarkDashboard initialState={{ report: reportFixture() }} />);
-
-    await user.selectOptions(screen.getByLabelText('Filter benchmark suite'), 'Correctness');
-    expect(screen.getAllByRole('rowheader')).toHaveLength(2);
-    await user.type(screen.getByRole('textbox', { name: 'Search benchmarks' }), 'error rate');
-    expect(screen.getAllByRole('rowheader')).toHaveLength(1);
-    expect(screen.getByRole('rowheader', { name: /Error benchmark/ })).toBeVisible();
-    await user.selectOptions(screen.getByLabelText('Filter result status'), 'running');
-    expect(screen.getByRole('heading', { name: 'No matching benchmarks' })).toBeVisible();
-    expect(screen.getByRole('button', { name: 'Export CSV' })).toBeDisabled();
-
-    await user.click(screen.getByRole('button', { name: 'Clear filters' }));
-    expect(screen.getAllByRole('rowheader')).toHaveLength(4);
-    await user.selectOptions(screen.getByLabelText('Filter result status'), 'running');
-    expect(screen.getAllByRole('rowheader')).toHaveLength(1);
-    expect(screen.getByRole('rowheader', { name: /Recovery benchmark/ })).toBeVisible();
-    await user.click(screen.getByRole('checkbox', { name: 'Candidate' }));
-    expect(screen.getByRole('heading', { name: 'No matching benchmarks' })).toBeVisible();
-    await user.selectOptions(screen.getByLabelText('Filter result status'), 'missing');
-    expect(screen.getByRole('rowheader', { name: /Reasoning benchmark/ })).toBeVisible();
+    const api = apiWith();
+    render(<BenchmarkDashboard api={api} />);
+    await connected();
+    expect(screen.getByLabelText('Top k')).toHaveAttribute('placeholder', '4');
+    await user.click(screen.getByRole('button', { name: 'Load snapshot' }));
+    await waitFor(() =>
+      expect(api.loadBenchmark).toHaveBeenCalledWith(
+        { benchmark: 'ragtruth-qa' },
+        expect.any(AbortSignal),
+      ),
+    );
+    await screen.findByRole('status');
+    await user.type(screen.getByLabelText('Architecture label'), 'Hybrid retrieval');
+    await user.click(screen.getByRole('button', { name: 'Start run' }));
+    await waitFor(() =>
+      expect(api.startRun).toHaveBeenCalledWith(
+        { benchmark_id: benchmark.id, label: 'Hybrid retrieval' },
+        expect.any(AbortSignal),
+      ),
+    );
+    await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('started'));
+    expect(api.startRun).toHaveBeenCalledTimes(1);
   });
 
-  it('paginates large batches and exports every filtered row rather than only the visible page', async () => {
+  it('shows active progress, updates it by polling, and aborts requests when closed', async () => {
+    vi.useFakeTimers();
+    const active = run({ status: 'running', completed: 2, finished_at_ms: null });
+    const api = apiWith([active]);
+    const view = render(<BenchmarkDashboard api={api} pollInterval={3000} />);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.getByRole('button', { name: 'Run in progress' })).toBeDisabled();
+    expect(screen.getByRole('progressbar')).toHaveAttribute('value', '2');
+    expect(screen.getByRole('button', { name: 'Download CSV for run-firs' })).toBeDisabled();
+    api.listRuns.mockResolvedValue([run()]);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000);
+    });
+    expect(screen.getByRole('button', { name: 'Start run' })).toBeEnabled();
+    expect(screen.queryByRole('progressbar')).not.toBeInTheDocument();
+    expect(api.listRuns).toHaveBeenCalledTimes(2);
+    const signal = api.listRuns.mock.calls.at(-1)?.[0] as AbortSignal;
+    view.unmount();
+    expect(signal.aborted).toBe(true);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(9000);
+    });
+    expect(api.listRuns).toHaveBeenCalledTimes(2);
+  });
+
+  it('reports disconnected data honestly and preserves previous results after a refresh failure', async () => {
     const user = userEvent.setup();
-    const report = reportFixture();
-    report.benchmarks = Array.from({ length: 52 }, (_, index) => ({
-      ...report.benchmarks[0],
-      id: `benchmark-${index}`,
-      name: index < 26 ? `Retained ${index + 1}` : `Other ${index + 1}`,
-    }));
-    report.results = [];
-    const createObjectURL = vi.fn<(blob: Blob) => string>(() => 'blob:comparison-csv');
-    const OriginalURL = URL;
+    const api = apiWith([run()]);
+    api.getCatalog.mockRejectedValueOnce(new ApiError('Bearer token required', 401));
+    render(<BenchmarkDashboard api={api} />);
+    expect(await screen.findByRole('alert')).toHaveTextContent('Bearer token required');
+    expect(screen.getByText('Disconnected')).toBeVisible();
+    expect(screen.queryByText('Sample data')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Load snapshot' })).toBeDisabled();
+    await user.click(screen.getByRole('button', { name: 'Refresh' }));
+    await connected();
+    expect(screen.getByRole('table')).toHaveTextContent('Dense baseline');
+    api.listRuns.mockRejectedValueOnce(new Error('Server unavailable'));
+    await user.click(screen.getByRole('button', { name: 'Refresh' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Previously loaded results remain visible',
+    );
+    expect(screen.getByRole('table')).toHaveTextContent('Dense baseline');
+    expect(screen.getByRole('button', { name: 'Start run' })).toBeDisabled();
+  });
+
+  it('keeps failed and interrupted scores partial, opens details, and handles missing CSV', async () => {
+    const user = userEvent.setup();
+    const failed = run({
+      status: 'failed',
+      completed: 0,
+      failed: 1,
+      means: null,
+      error: 'Nebula is unavailable',
+    });
+    const interrupted = run({
+      id: 'run-stopped',
+      status: 'interrupted',
+      completed: 2,
+      means: { context_hit_at_k: 0, reciprocal_rank_at_k: 0, ndcg_at_k: 0 },
+    });
+    const api = apiWith([failed, interrupted]);
+    api.downloadScores.mockRejectedValueOnce(new ApiError('This run produced no CSV rows', 404));
+    render(<BenchmarkDashboard api={api} />);
+    await connected();
+    expect(within(screen.getByRole('table')).getAllByText('0.000')).toHaveLength(3);
+    const downloadButton = screen.getByRole('button', { name: 'Download CSV for run-firs' });
+    expect(downloadButton).toBeEnabled();
+    await user.click(downloadButton);
+    expect(await screen.findByRole('alert')).toHaveTextContent('This run produced no CSV rows');
+    await user.click(screen.getByRole('button', { name: 'View run run-firs' }));
+    expect(await screen.findByRole('region', { name: 'Run details' })).toHaveTextContent(
+      'Nebula is unavailable',
+    );
+    expect(api.getRun).toHaveBeenCalledWith('run-first', expect.any(AbortSignal));
+  });
+
+  it('downloads backend CSV and shows saved snapshot questions', async () => {
+    const user = userEvent.setup();
+    const api = apiWith([run()]);
+    const createObjectURL = vi.fn(() => 'blob:results');
+    const revokeObjectURL = vi.fn();
     vi.stubGlobal(
       'URL',
-      class extends OriginalURL {
+      class extends URL {
         static createObjectURL = createObjectURL;
-        static revokeObjectURL = vi.fn();
+        static revokeObjectURL = revokeObjectURL;
       },
     );
-    const download = vi
-      .spyOn(HTMLAnchorElement.prototype, 'click')
-      .mockImplementation(() => undefined);
-    render(<BenchmarkDashboard initialState={{ report }} />);
-
-    expect(screen.getAllByRole('rowheader')).toHaveLength(25);
-    expect(screen.getByText('Page 1 of 3')).toBeVisible();
-    await user.click(screen.getByRole('button', { name: 'Next' }));
-    expect(screen.getByText('Page 2 of 3')).toBeVisible();
-    await user.type(screen.getByRole('textbox', { name: 'Search benchmarks' }), 'Retained');
-    expect(screen.getByText('Page 1 of 2')).toBeVisible();
-    expect(screen.queryByRole('rowheader', { name: /Retained 26/ })).not.toBeInTheDocument();
-    await user.click(screen.getByRole('checkbox', { name: 'Candidate' }));
-    // Reselecting an architecture must not reorder exported columns.
-    await user.click(screen.getByRole('checkbox', { name: 'Baseline' }));
-    await user.click(screen.getByRole('checkbox', { name: 'Baseline' }));
-    await user.click(screen.getByRole('button', { name: 'Export CSV' }));
-
-    expect(download).toHaveBeenCalledOnce();
-    const csv = await readBlob(createObjectURL.mock.calls[0][0]);
-    expect(csv.split('\r\n')).toHaveLength(27);
-    expect(csv).toContain('"Retained 26"');
-    expect(csv).not.toContain('"Other ');
-    expect(csv.split('\r\n')[0]).toContain('"Baseline","Parallel"');
-    expect(csv).not.toContain('"Candidate"');
-    expect(screen.getByRole('status')).toHaveTextContent(
-      'Exported 26 rows across 2 architectures.',
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {});
+    render(<BenchmarkDashboard api={api} />);
+    await connected();
+    await user.click(screen.getByRole('button', { name: 'Download CSV for run-firs' }));
+    await waitFor(() => expect(click).toHaveBeenCalled());
+    expect(api.downloadScores).toHaveBeenCalledWith('run-first', expect.any(AbortSignal));
+    expect(createObjectURL).toHaveBeenCalledWith(expect.any(Blob));
+    await user.click(screen.getByRole('button', { name: 'View snapshot' }));
+    expect(await screen.findByRole('region', { name: 'Snapshot details' })).toHaveTextContent(
+      'Where is the evidence?',
     );
-    await user.click(screen.getByRole('button', { name: 'Next' }));
-    expect(screen.getAllByRole('rowheader')).toHaveLength(1);
-    expect(screen.getByRole('rowheader', { name: /Retained 26/ })).toBeVisible();
-    expect(screen.getByRole('button', { name: 'Next' })).toBeDisabled();
   });
 
-  it('replaces illustrative data on valid import and preserves the current table on invalid import', async () => {
+  it('shows run conflicts and service errors without retrying mutations', async () => {
     const user = userEvent.setup();
-    render(<BenchmarkDashboard />);
-    expect(screen.getByText('Sample data')).toBeVisible();
-    expect(screen.getAllByRole('rowheader')).toHaveLength(12);
-    await user.type(screen.getByRole('textbox', { name: 'Search benchmarks' }), 'Exact match');
-    await user.upload(
-      screen.getByLabelText('Import benchmark results'),
-      jsonFile(JSON.stringify(reportFixture())),
+    const api = apiWith();
+    api.startRun.mockRejectedValueOnce(new ApiError('A benchmark run is already active', 409));
+    render(<BenchmarkDashboard api={api} />);
+    await connected();
+    await user.click(screen.getByRole('button', { name: 'Start run' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('already active');
+    expect(api.startRun).toHaveBeenCalledTimes(1);
+    api.startRun.mockRejectedValueOnce(
+      new ApiError('Configure NEBULA_API_BASE and NEBULA_API_TOKEN before starting runs', 503),
     );
-
-    expect(await screen.findByRole('status')).toHaveTextContent(
-      'Imported 4 benchmarks across 3 architectures.',
-    );
-    expect(screen.getByText('Imported results')).toBeVisible();
-    expect(screen.queryByText('Sample data')).not.toBeInTheDocument();
-    expect(screen.getByRole('textbox', { name: 'Search benchmarks' })).toHaveValue('');
-    expect(screen.getAllByRole('rowheader')).toHaveLength(4);
-    expect(screen.getByRole('heading', { name: 'Evaluation batch' })).toBeVisible();
-
-    await user.upload(
-      screen.getByLabelText('Import benchmark results'),
-      jsonFile('{invalid', 'invalid.json'),
-    );
-    expect(await screen.findByRole('alert')).toHaveTextContent('not valid JSON');
-    expect(screen.getByRole('heading', { name: 'Evaluation batch' })).toBeVisible();
-    expect(screen.getAllByRole('rowheader')).toHaveLength(4);
-    expect(
-      screen.getByRole('button', { name: 'Accuracy benchmark, Candidate: 95%, best result' }),
-    ).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Start run' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Configure NEBULA_API_BASE');
+    expect(api.startRun).toHaveBeenCalledTimes(2);
   });
 
-  it('opens result details with failure notes and closes through both its button and native cancel event', async () => {
+  it('paginates many runs and retains filters in module state', async () => {
     const user = userEvent.setup();
-    const original = Object.getOwnPropertyDescriptor(HTMLDialogElement.prototype, 'showModal');
-    Object.defineProperty(HTMLDialogElement.prototype, 'showModal', {
-      configurable: true,
-      value: function (this: HTMLDialogElement) {
-        this.setAttribute('open', '');
-      },
-    });
-    try {
-      render(<BenchmarkDashboard initialState={{ report: reportFixture() }} />);
-      await user.click(
-        screen.getByRole('button', { name: 'Recovery benchmark, Baseline: Failed' }),
-      );
-      const dialog = screen.getByRole('dialog', { name: 'Recovery benchmark' });
-      expect(dialog).toBeVisible();
-      expect(
-        within(dialog).getByText('The response did not match the expected structure.'),
-      ).toBeVisible();
-      expect(within(dialog).getByText('Success rate')).toBeVisible();
-      await user.click(within(dialog).getByRole('button', { name: 'Close result details' }));
-      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
-
-      await user.click(
-        screen.getByRole('button', { name: 'Error benchmark, Parallel: 2%, best result' }),
-      );
-      const completedDialog = screen.getByRole('dialog', { name: 'Error benchmark' });
-      expect(within(completedDialog).getByText('Lower is better')).toBeVisible();
-      expect(within(completedDialog).getByText('2%')).toBeVisible();
-      fireEvent(completedDialog, new Event('cancel', { bubbles: false }));
-      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
-    } finally {
-      if (original) Object.defineProperty(HTMLDialogElement.prototype, 'showModal', original);
-      else delete (HTMLDialogElement.prototype as Partial<HTMLDialogElement>).showModal;
-    }
-  });
-
-  it('restores a panel’s report, filters, selected architectures, and display preference on remount', async () => {
-    const user = userEvent.setup();
+    const api = apiWith(
+      Array.from({ length: 31 }, (_, index) =>
+        run({ id: `run-${index}`, request: { ...run().request, label: `Architecture ${index}` } }),
+      ),
+    );
     const onStateChange = vi.fn();
-    const first = render(
+    render(
       <BenchmarkDashboard
-        initialState={{ report: reportFixture() }}
+        api={api}
         onStateChange={onStateChange}
+        initialState={{ query: '', status: 'completed' }}
       />,
     );
-    await user.selectOptions(screen.getByLabelText('Filter benchmark suite'), 'Correctness');
-    await user.selectOptions(screen.getByLabelText('Filter result status'), 'completed');
-    await user.type(screen.getByRole('textbox', { name: 'Search benchmarks' }), 'Accuracy');
-    await user.click(screen.getByRole('checkbox', { name: 'Candidate' }));
-    await user.click(screen.getByRole('checkbox', { name: 'Highlight best in each row' }));
-    await waitFor(() => expect(onStateChange).toHaveBeenCalled());
-    const saved = onStateChange.mock.calls.at(-1)![0];
-    first.unmount();
-
-    const restored = render(<BenchmarkDashboard initialState={saved} />);
-    expect(screen.getByRole('heading', { name: 'Evaluation batch' })).toBeVisible();
-    expect(screen.getByRole('textbox', { name: 'Search benchmarks' })).toHaveValue('Accuracy');
-    expect(screen.getByLabelText('Filter benchmark suite')).toHaveValue('Correctness');
-    expect(screen.getByLabelText('Filter result status')).toHaveValue('completed');
-    expect(screen.getByRole('checkbox', { name: 'Candidate' })).not.toBeChecked();
-    expect(screen.getByRole('checkbox', { name: 'Highlight best in each row' })).not.toBeChecked();
-    expect(screen.getAllByRole('rowheader')).toHaveLength(1);
-    expect(screen.getAllByRole('columnheader')).toHaveLength(3);
-    restored.unmount();
-
-    render(<BenchmarkDashboard />);
-    expect(screen.getByText('Sample data')).toBeVisible();
-    expect(screen.getByRole('textbox', { name: 'Search benchmarks' })).toHaveValue('');
-    expect(screen.getAllByRole('rowheader')).toHaveLength(12);
+    await connected();
+    expect(within(screen.getByRole('table')).getAllByRole('row')).toHaveLength(26);
+    await user.click(screen.getByRole('button', { name: 'Next' }));
+    expect(within(screen.getByRole('table')).getAllByRole('row')).toHaveLength(7);
+    await user.type(
+      screen.getByRole('searchbox', { name: 'Search benchmarks' }),
+      'Architecture 30',
+    );
+    expect(within(screen.getByRole('table')).getAllByRole('row')).toHaveLength(2);
+    expect(onStateChange).toHaveBeenLastCalledWith(
+      expect.objectContaining({ query: 'Architecture 30', status: 'completed' }),
+    );
   });
 });

@@ -1,70 +1,90 @@
-# Benchmarking
+# RAG benchmarking dashboard
 
-A frontend-only architecture comparison module for Genesis. Benchmarks are rows;
-architectures are columns. Each row declares a metric, unit, and scoring direction.
-The table shows completed scores, running/queued/failed results, and unstarted cells.
-Best scores are highlighted among the visible architectures, including ties. Scores
-from different benchmarks are never averaged.
+The dashboard reads the existing Rust HTTP API in `apps/backend`. All UI, API
+contracts, styling, and the Genesis SDK adapter belong to this submodule. Genesis
+only discovers the module, displays it, and supplies generic development proxy
+support. The benchmark server is unchanged.
 
-## Open in Genesis
+## Connect and open
 
-From the Genesis repository root, initialize the development submodule and install
-workspace dependencies:
+Start the benchmark backend using the [backend instructions](../../README.md#start).
+Then, in the shell running the frontend, export the **same token** used by that
+backend. Do not use a `VITE_` variable for credentials.
+
+```sh
+export BENCHMARK_API_TOKEN='the-same-local-development-token'
+# Optional if the backend uses another origin/port:
+export BENCHMARK_API_TARGET='http://127.0.0.1:4319'
+```
+
+From the Genesis repository root:
 
 ```sh
 git submodule update --init genesis/Modules/dev/RAG-Banchmarks
 pnpm install
-pnpm start
-```
-
-Development Genesis discovers this package's `genesis`
-manifest during registry generation, registers it through `@genesis/sdk`, and adds
-**Benchmarking** to the default dock. Select it to open the module inside Genesis.
-Restart an already-running Genesis app after adding the module. An explicitly
-customized dock layout continues to take precedence over the generated default.
-Release packaging excludes development modules from its registry and resources.
-
-The module owns its report and filters. Switching away and back preserves them in
-the open Genesis module instance. No backend server or SDK contracts are changed.
-
-## Standalone
-
-```sh
 pnpm benchmark:ui
 ```
 
-This opens `/benchmarking.html` in a browser. `pnpm --filter @genesis/benchmarking build`
-creates the standalone frontend build in this submodule's `dist` directory. All UI,
-styles, sample data, and the SDK adapter are owned by this submodule; Genesis only
-discovers and displays its exported module.
+Or run `pnpm start` and select **Benchmarking** in the Genesis dock. A customized
+dock layout takes precedence over generated defaults. Restart the frontend/Genesis
+development server after changing proxy environment variables.
 
-## Import and export
+The browser calls same-origin `/api/benchmarks/v1` routes. The Node-side proxy adds
+the bearer token; it is never stored in panel state or built into the frontend.
+Genesis discovers the submodule's `genesisDevelopment.proxy` declaration. Release
+packaging excludes development module registrations, frontend assets, and backend
+resources. `pnpm --filter @genesis/benchmarking build` builds the standalone UI;
+serving that static build separately requires an equivalent authenticated proxy.
 
-The initial table contains explicitly illustrative results. **Import results** replaces
-them with a JSON batch report; use [example-results.json](example-results.json) as a
-template. Architecture names are arbitrary and can identify system designs, model
-architectures, or hardware configurations.
+## Workflow
 
-- `schemaVersion`: `1`.
-- `name`: batch name.
-- `architectures`: objects with unique `id`, `name`, and `description`.
-- `benchmarks`: objects with unique `id`, `name`, `suite`, `metric`, `unit`, and
-  `direction` (`higher` or `lower`).
-- `results`: one object per benchmark/architecture pair, with `benchmarkId`,
-  `architectureId`, `status`, and optional `note`. Only `completed` results have a
-  finite numeric `value`; other states are `running`, `queued`, or `failed`.
-- Omitted benchmark/architecture pairs appear as **Not run**.
+1. Select a catalog benchmark. Optionally override its case limit (1–10000), then
+   load a snapshot. The server resolves the source, split, adapter, and metric from
+   its YAML catalog. Loading is synchronous and may take time.
+2. Point your separately configured Nebula runtime at the displayed exported
+   corpus and wait for indexing. The backend README explains its connection
+   settings. The dashboard does not launch Nebula, choose models, or change the
+   architecture.
+3. Select a saved snapshot, add an architecture label, and start a run. Blank top-k
+   uses that snapshot's saved default, including 8 for older snapshots; an explicit
+   top-k must be 1–100. Labels are limited to 256 UTF-8 bytes by the server.
+4. Watch progress and saved results in the table. The server permits **one active
+   run at a time**. Many saved runs can be searched, filtered, and paginated.
+5. Open run details for fingerprint, source IDs, scope, index watermark, and errors.
+   Download CSV after a run stops. A setup failure may produce no CSV; the server's
+   error is displayed without substituting fabricated data.
 
-Reports describe one comparable result per cell. Combine or aggregate repeated trials
-in the producing runner before importing. Run states are snapshots from the report;
-this frontend does not launch jobs or poll a backend. Import an updated report to
-refresh them. Reports stay in memory; refreshing the standalone page resets them.
+## Reading results
 
-Search, suite/status filters, architecture selection, and pagination support larger
-batches. A status filter keeps rows with at least one visible result in that state.
-The table shows 25 rows per page. CSV export includes all filtered rows, including
-other pages, and only the selected architectures. Select any result for its details
-and error notes.
+The current evaluator is `paired_context_recovery_v1`. It measures recovery of the
+supplied context, **not general answer quality or hallucination detection**. Columns
+show mean context Hit@k (also Recall@k for this single positive), mean reciprocal
+rank@k, and binary NDCG@k on a 0–1 scale. Larger is better. Means cover successful
+queries only; missing values stay blank and zero remains a valid score.
 
-The import limit is 8 MB, 2,000 benchmarks, and 50 architectures. There are no remote
-requests, provider credentials, backend dependencies, or benchmark execution hooks.
+Running, failed, and interrupted runs retain available means but are labelled
+partial. Only fully completed runs are eligible for **Compare setup**. A comparison
+requires the same metric kind, benchmark fingerprint, top-k, and candidate source
+ID set. The highest value in each metric is highlighted, including ties; repeated
+runs remain separate rows and different metrics are never averaged.
+
+The panel refreshes every three seconds, with no overlapping polls. Closing it
+aborts pending requests and stops polling. Returning preserves filters and fetches
+fresh server records. Connection failures retain previously loaded data visibly
+as stale, disable mutations, and offer Refresh. Failed mutation requests are never
+automatically retried because the server may already have accepted them.
+
+## Verify
+
+From the Genesis workspace:
+
+```sh
+pnpm --filter @genesis/benchmarking typecheck
+pnpm --filter @genesis/benchmarking test
+pnpm --filter @genesis/benchmarking build
+```
+
+Tests exercise the Rust response shapes, HTTP errors and request bodies, polling,
+partial and incompatible results, loading/running actions, CSV, and Node-only proxy
+configuration. The Genesis host has a real registry/loader/navigation test using
+backend-shaped responses. No tests require external model calls or dataset downloads.

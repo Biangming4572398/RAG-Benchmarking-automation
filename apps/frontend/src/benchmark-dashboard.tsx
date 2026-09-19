@@ -1,596 +1,703 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
 import {
-  SAMPLE_REPORT,
-  parseBenchmarkReport,
-  formatResult,
-  exportComparisonCsv,
-  type BenchmarkReport,
-  type BenchmarkDefinition,
-  type BenchmarkResult,
-} from './benchmark-data';
+  comparabilityKey,
+  createBenchmarkApi,
+  type BenchmarkApi,
+  type BenchmarkInfo,
+  type BenchmarkRun,
+  type BenchmarkSnapshot,
+  type Scores,
+} from './benchmark-api';
+import { useBenchmarkWorkspace } from './use-benchmark-workspace';
 import styles from './benchmark-dashboard.module.css';
 
 interface DashboardState {
-  report: BenchmarkReport;
   query: string;
-  suite: string;
   status: string;
-  architectureIds: string[];
-  highlightBest: boolean;
+  benchmarkId: string;
+  comparison: string;
 }
 
 export interface BenchmarkDashboardProps {
   initialState?: unknown;
   onStateChange?: (state: unknown) => void;
+  api?: BenchmarkApi;
+  pollInterval?: number;
 }
 
-const STATUS_LABELS: Record<BenchmarkResult['status'], string> = {
-  completed: 'Completed',
-  running: 'Running',
-  queued: 'Queued',
-  failed: 'Failed',
-};
+const METRICS: { key: keyof Scores; title: string; description: string }[] = [
+  {
+    key: 'context_hit_at_k',
+    title: 'Hit@k',
+    description: 'Paired context found in the top k chunks',
+  },
+  {
+    key: 'reciprocal_rank_at_k',
+    title: 'MRR@k',
+    description: 'Mean reciprocal rank of the paired context',
+  },
+  {
+    key: 'ndcg_at_k',
+    title: 'NDCG@k',
+    description: 'Binary normalized discounted cumulative gain',
+  },
+];
+const STATUSES = ['running', 'completed', 'failed', 'interrupted'];
+const PAGE_SIZE = 25;
 
-function initialDashboardState(saved?: unknown): DashboardState {
-  const defaults = {
-    report: SAMPLE_REPORT,
-    query: '',
-    suite: 'all',
-    status: 'all',
-    architectureIds: SAMPLE_REPORT.architectures.map((item) => item.id),
-    highlightBest: true,
+function restoreState(saved: unknown): DashboardState {
+  const value = saved && typeof saved === 'object' ? (saved as Partial<DashboardState>) : {};
+  return {
+    query: typeof value.query === 'string' ? value.query : '',
+    status: STATUSES.includes(value.status ?? '') ? value.status! : 'all',
+    benchmarkId: typeof value.benchmarkId === 'string' ? value.benchmarkId : '',
+    comparison: typeof value.comparison === 'string' ? value.comparison : '',
   };
-  if (!saved || typeof saved !== 'object') return defaults;
-  const candidate = saved as Partial<DashboardState>;
-  try {
-    const report = parseBenchmarkReport(JSON.stringify(candidate.report));
-    report.sample = candidate.report?.sample === true;
-    const architectureIds = report.architectures
-      .filter((item) => candidate.architectureIds?.includes(item.id))
-      .map((item) => item.id);
-    return {
-      report,
-      query: typeof candidate.query === 'string' ? candidate.query : '',
-      suite: report.benchmarks.some((item) => item.suite === candidate.suite)
-        ? candidate.suite!
-        : 'all',
-      status: ['completed', 'running', 'queued', 'failed', 'missing'].includes(
-        candidate.status ?? '',
-      )
-        ? candidate.status!
-        : 'all',
-      architectureIds: architectureIds.length
-        ? architectureIds
-        : report.architectures.map((item) => item.id),
-      highlightBest: candidate.highlightBest !== false,
-    };
-  } catch {
-    return defaults;
-  }
 }
 
-function Icon({ name }: { name: 'upload' | 'download' | 'search' | 'grid' | 'close' }) {
-  const paths = {
-    upload: 'M12 16V4m-4 4 4-4 4 4M4 16v4h16v-4',
-    download: 'M12 4v12m-4-4 4 4 4-4M4 16v4h16v-4',
-    search: 'm16 16 4 4M18 10a8 8 0 1 1-16 0 8 8 0 0 1 16 0',
-    grid: 'M3 3h18v18H3zM3 9h18M3 15h18M9 3v18',
-    close: 'm6 6 12 12M6 18 18 6',
-  };
-  return (
-    <svg
-      width="16"
-      height="16"
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="1.3"
-      aria-hidden="true"
-    >
-      <path d={paths[name]} />
-    </svg>
-  );
+function benchmarkName(benchmark?: BenchmarkInfo): string {
+  return benchmark?.configuration?.definition.name ?? benchmark?.source ?? 'Unknown snapshot';
 }
 
-function ResultDetail({
-  benchmark,
-  architecture,
-  result,
-  onClose,
-}: {
-  benchmark: BenchmarkDefinition;
-  architecture: string;
-  result?: BenchmarkResult;
-  onClose: () => void;
-}) {
-  const dialog = useRef<HTMLDialogElement>(null);
-  useEffect(() => {
-    dialog.current?.showModal();
-  }, []);
-  return (
-    <dialog
-      ref={dialog}
-      className={styles.dialog}
-      onCancel={onClose}
-      aria-labelledby="result-detail-title"
-    >
-      <div className={styles.dialogHeader}>
-        <span className={styles.eyebrow}>Result details</span>
-        <button onClick={onClose} aria-label="Close result details">
-          <Icon name="close" />
-        </button>
-      </div>
-      <h2 id="result-detail-title">{benchmark.name}</h2>
-      <p className={styles.muted}>
-        {architecture} · {benchmark.suite}
-      </p>
-      <div className={styles.detailValue}>
-        {result?.status === 'completed'
-          ? formatResult(result.value!, benchmark.unit)
-          : result
-            ? STATUS_LABELS[result.status]
-            : 'Not run'}
-      </div>
-      <dl className={styles.detailList}>
-        <div>
-          <dt>Metric</dt>
-          <dd>{benchmark.metric}</dd>
-        </div>
-        <div>
-          <dt>Scoring</dt>
-          <dd>{benchmark.direction === 'higher' ? 'Higher is better' : 'Lower is better'}</dd>
-        </div>
-        <div>
-          <dt>Status</dt>
-          <dd>{result ? STATUS_LABELS[result.status] : 'Not run'}</dd>
-        </div>
-      </dl>
-      <p className={styles.detailNote}>{result?.note || 'No additional notes in this report.'}</p>
-    </dialog>
-  );
+function score(value: number | undefined): string {
+  return value === undefined ? '—' : value.toFixed(3);
 }
 
-export function BenchmarkDashboard({ initialState, onStateChange }: BenchmarkDashboardProps = {}) {
-  const [state, setState] = useState(() => initialDashboardState(initialState));
+function download(blob: Blob, name: string): void {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = name;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+export function BenchmarkDashboard({
+  initialState,
+  onStateChange,
+  api: providedApi,
+  pollInterval = 3000,
+}: BenchmarkDashboardProps) {
+  const setupId = useId();
+  const api = useMemo(() => providedApi ?? createBenchmarkApi(), [providedApi]);
+  const workspace = useBenchmarkWorkspace(api, pollInterval);
+  const [state, setState] = useState(() => restoreState(initialState));
+  const [catalogKey, setCatalogKey] = useState('');
+  const [limit, setLimit] = useState('');
+  const [topK, setTopK] = useState('');
+  const [label, setLabel] = useState('');
+  const [pending, setPending] = useState('');
+  const [actionError, setActionError] = useState('');
   const [notice, setNotice] = useState('');
-  const [error, setError] = useState('');
-  const [importing, setImporting] = useState(false);
-  const [page, setPage] = useState(1);
-  const [selection, setSelection] = useState<{
-    benchmarkId: string;
-    architectureId: string;
-  } | null>(null);
-  const fileInput = useRef<HTMLInputElement>(null);
-  const { report, query, suite, status, architectureIds, highlightBest } = state;
+  const [detail, setDetail] = useState<BenchmarkRun | null>(null);
+  const [snapshot, setSnapshot] = useState<BenchmarkSnapshot | null>(null);
+  const [page, setPage] = useState(0);
+  const operation = useRef<AbortController | null>(null);
+  useEffect(() => () => operation.current?.abort(), []);
+  useEffect(() => onStateChange?.(state), [state, onStateChange]);
   useEffect(() => {
-    onStateChange?.(state);
-  }, [state, onStateChange]);
-  const update = (patch: Partial<DashboardState>) =>
-    setState((previous) => ({ ...previous, ...patch }));
-  const architectures = report.architectures.filter((item) => architectureIds.includes(item.id));
-  const cells = new Map(
-    report.results.map((result) => [
-      JSON.stringify([result.benchmarkId, result.architectureId]),
-      result,
-    ]),
-  );
-  const resultFor = (benchmarkId: string, architectureId: string) =>
-    cells.get(JSON.stringify([benchmarkId, architectureId]));
-  const benchmarks = report.benchmarks.filter((benchmark) => {
-    if (suite !== 'all' && benchmark.suite !== suite) return false;
-    if (
-      !`${benchmark.name} ${benchmark.suite} ${benchmark.metric}`
-        .toLowerCase()
-        .includes(query.toLowerCase().trim())
-    )
-      return false;
-    return (
-      status === 'all' ||
-      architectures.some((architecture) => {
-        const result = resultFor(benchmark.id, architecture.id);
-        return status === 'missing' ? !result : result?.status === status;
-      })
+    setDetail((current) =>
+      current ? (workspace.runs.find((run) => run.id === current.id) ?? current) : null,
     );
-  });
-  const pageCount = Math.max(1, Math.ceil(benchmarks.length / 25));
-  const activePage = Math.min(page, pageCount);
-  const visibleBenchmarks = benchmarks.slice((activePage - 1) * 25, activePage * 25);
-  useEffect(() => {
-    setPage(1);
-  }, [query, suite, status, architectureIds, report]);
-  const total = report.benchmarks.length * report.architectures.length;
-  const completed = report.results.filter((result) => result.status === 'completed').length;
-  const running = report.results.filter((result) => result.status === 'running').length;
-  const queued = report.results.filter((result) => result.status === 'queued').length;
-  const failed = report.results.filter((result) => result.status === 'failed').length;
-  const unstarted = total - report.results.length;
-  const completion = Math.round((completed / total) * 100);
-  const suites = [...new Set(report.benchmarks.map((benchmark) => benchmark.suite))];
+  }, [workspace.runs]);
 
-  function bestValue(benchmark: BenchmarkDefinition): number | null {
-    const values = architectures
-      .map((architecture) => resultFor(benchmark.id, architecture.id))
-      .filter((result): result is BenchmarkResult => result?.status === 'completed')
-      .map((result) => result.value!);
-    return values.length
-      ? benchmark.direction === 'higher'
-        ? Math.max(...values)
-        : Math.min(...values)
-      : null;
+  const definitions = Object.entries(workspace.catalog.benchmarks);
+  const selectedKey = workspace.catalog.benchmarks[catalogKey]
+    ? catalogKey
+    : (definitions[0]?.[0] ?? '');
+  const definition = workspace.catalog.benchmarks[selectedKey];
+  const selectedBenchmark =
+    workspace.benchmarks.find((item) => item.id === state.benchmarkId) ?? workspace.benchmarks[0];
+  const activeRuns = workspace.runs.filter((run) => run.status === 'running');
+  const canRun = workspace.connected && !!selectedBenchmark && !pending && activeRuns.length === 0;
+  const byId = new Map(workspace.benchmarks.map((item) => [item.id, item]));
+  const comparisonRuns = state.comparison
+    ? workspace.runs.filter((run) => comparabilityKey(run) === state.comparison)
+    : [];
+  const query = state.query.trim().toLowerCase();
+  const filteredRuns = workspace.runs
+    .filter((run) => !state.comparison || comparabilityKey(run) === state.comparison)
+    .filter((run) => state.status === 'all' || run.status === state.status)
+    .filter((run) =>
+      `${benchmarkName(byId.get(run.request.benchmark_id))} ${run.request.label} ${run.id}`
+        .toLowerCase()
+        .includes(query),
+    )
+    .sort((a, b) => b.started_at_ms - a.started_at_ms || a.id.localeCompare(b.id));
+  const pages = Math.max(1, Math.ceil(filteredRuns.length / PAGE_SIZE));
+  const currentPage = Math.min(page, pages - 1);
+  const visibleRuns = filteredRuns.slice(currentPage * PAGE_SIZE, (currentPage + 1) * PAGE_SIZE);
+  const best = Object.fromEntries(
+    METRICS.map(({ key }) => [key, Math.max(...comparisonRuns.map((run) => run.means![key]))]),
+  );
+  const viewedRun = detail;
+
+  function update(patch: Partial<DashboardState>) {
+    setState((current) => ({ ...current, ...patch }));
+    setPage(0);
   }
 
-  async function importReport(event: React.ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0];
-    event.target.value = '';
-    if (!file) return;
-    setImporting(true);
-    setError('');
+  async function perform(name: string, action: (signal: AbortSignal) => Promise<void>) {
+    if (operation.current) return;
+    const controller = new AbortController();
+    operation.current = controller;
+    setPending(name);
+    setActionError('');
     setNotice('');
     try {
-      if (file.size > 8 * 1024 * 1024)
-        throw new Error('Choose a JSON results file smaller than 8 MB.');
-      const imported = parseBenchmarkReport(await file.text());
-      update({
-        report: imported,
-        query: '',
-        suite: 'all',
-        status: 'all',
-        architectureIds: imported.architectures.map((architecture) => architecture.id),
-      });
-      setSelection(null);
-      setNotice(
-        `Imported ${imported.benchmarks.length} benchmarks across ${imported.architectures.length} architectures.`,
-      );
+      await action(controller.signal);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : 'Could not read this report.');
+      if (!controller.signal.aborted) {
+        setActionError(cause instanceof Error ? cause.message : 'The request failed.');
+        // A timeout does not prove a mutation failed on the server. Refresh its
+        // saved state; never automatically retry a load or run creation.
+        void workspace.reload();
+      }
     } finally {
-      setImporting(false);
+      if (operation.current === controller) operation.current = null;
+      if (!controller.signal.aborted) setPending('');
     }
   }
 
-  function exportResults() {
-    const url = URL.createObjectURL(
-      new Blob(
-        [
-          exportComparisonCsv(
-            report,
-            benchmarks,
-            architectures.map(({ id }) => id),
-          ),
-        ],
+  function loadBenchmark(event: React.FormEvent) {
+    event.preventDefault();
+    void perform('load', async (signal) => {
+      const info = await api.loadBenchmark(
+        { benchmark: selectedKey, ...(limit ? { limit: Number(limit) } : {}) },
+        signal,
+      );
+      if (signal.aborted) return;
+      update({ benchmarkId: info.id });
+      setTopK('');
+      setSnapshot(null);
+      setNotice(
+        `Loaded ${info.case_count} cases. Configure Nebula with the exported corpus before starting a run.`,
+      );
+      await workspace.reload();
+    });
+  }
+
+  function startRun(event: React.FormEvent) {
+    event.preventDefault();
+    if (!canRun || !selectedBenchmark) return;
+    if (new TextEncoder().encode(label).length > 256) {
+      setActionError('Architecture label must be at most 256 UTF-8 bytes.');
+      return;
+    }
+    void perform('run', async (signal) => {
+      const run = await api.startRun(
         {
-          type: 'text/csv;charset=utf-8;',
+          benchmark_id: selectedBenchmark.id,
+          label: label.trim(),
+          ...(topK ? { top_k: Number(topK) } : {}),
         },
-      ),
-    );
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = 'architecture-comparison.csv';
-    anchor.click();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-    setNotice(`Exported ${benchmarks.length} rows across ${architectures.length} architectures.`);
+        signal,
+      );
+      if (signal.aborted) return;
+      update({ comparison: '', status: 'all', query: '' });
+      setNotice(`Run ${run.id.slice(0, 8)} started. Progress refreshes automatically.`);
+      await workspace.reload();
+    });
   }
 
   return (
     <main className={styles.dashboard}>
       <div className={styles.breadcrumb}>
-        <span>
-          <Icon name="grid" /> Benchmarking <span className={styles.slash}>/</span> Comparison
-          workspace
-        </span>
-        <span className={styles.prototypeTag}>Prototype</span>
+        <span>Benchmarking / Retrieval workspace</span>
+        <span>Internal</span>
       </div>
       <header className={styles.header}>
         <div>
-          <div className={styles.eyebrow}>Benchmark workspace</div>
+          <span className={styles.eyebrow}>RAG BENCHMARKS</span>
           <h1>Architecture comparison</h1>
-          <p>Every benchmark. Every architecture. One view.</p>
+          <p>Saved runs, retrieval scores, and the architecture behind each result.</p>
         </div>
         <div className={styles.actions}>
-          <button className={styles.button} onClick={exportResults} disabled={!benchmarks.length}>
-            <Icon name="download" /> Export CSV
-          </button>
+          <a className={styles.button} href={`#${setupId}`}>
+            Load / start run
+          </a>
           <button
-            className={styles.primaryButton}
-            disabled={importing}
-            onClick={() => fileInput.current?.click()}
+            className={styles.button}
+            disabled={workspace.refreshing}
+            onClick={() => void workspace.refresh()}
           >
-            <Icon name="upload" /> {importing ? 'Importing…' : 'Import results'}
+            {workspace.refreshing ? 'Refreshing…' : 'Refresh'}
           </button>
-          <input
-            ref={fileInput}
-            className={styles.hiddenInput}
-            type="file"
-            accept=".json,application/json"
-            aria-label="Import benchmark results"
-            onChange={importReport}
-          />
         </div>
       </header>
-
-      <section className={styles.batchPanel} aria-label="Batch summary">
-        <div className={styles.batchIdentity}>
-          <span className={styles.eyebrow}>Current batch</span>
-          <h2>{report.name}</h2>
-          <span className={styles.sourceTag}>
-            {report.sample ? 'Sample data' : 'Imported results'}
-          </span>
+      <section className={styles.summary} aria-label="Benchmark summary">
+        <div>
+          <span className={styles.eyebrow}>SERVER</span>
+          <strong className={styles.connection}>
+            {workspace.connected
+              ? 'Connected'
+              : workspace.refreshing && !workspace.updatedAt
+                ? 'Connecting…'
+                : 'Disconnected'}
+          </strong>
+          <small>
+            {workspace.updatedAt
+              ? `Last updated ${new Date(workspace.updatedAt).toLocaleTimeString()}`
+              : 'Waiting for the benchmark server'}
+          </small>
         </div>
-        <div className={styles.batchStat}>
-          <strong>{report.benchmarks.length}</strong>
-          <span>Benchmarks</span>
+        <div>
+          <strong>{workspace.benchmarks.length}</strong>
+          <small>Loaded snapshots</small>
         </div>
-        <div className={styles.batchStat}>
-          <strong>{report.architectures.length}</strong>
-          <span>Architectures</span>
+        <div>
+          <strong>{workspace.runs.length}</strong>
+          <small>Saved runs</small>
         </div>
-        <div className={styles.batchProgress}>
-          <div>
-            <span>
-              <strong>{completed}</strong> / {total} completed
-            </span>
-            <span>{completion}%</span>
-          </div>
-          <progress max={total} value={completed} aria-label="Completed benchmark results" />
-          <div className={styles.progressLegend}>
-            <span>
-              <i className={styles.runningDot} />
-              {running} running
-            </span>
-            <span>
-              <i className={styles.queuedDot} />
-              {queued} queued
-            </span>
-            <span>
-              <i className={styles.failedDot} />
-              {failed} failed
-            </span>
-            {unstarted > 0 && <span>{unstarted} not run</span>}
-          </div>
+        <div>
+          <strong>{activeRuns.length}</strong>
+          <small>Running · one per server</small>
         </div>
       </section>
-
-      <div className={styles.messages}>
-        {error ? (
-          <p role="alert" className={styles.error}>
-            {error}
-          </p>
-        ) : notice ? (
-          <p role="status">{notice}</p>
-        ) : (
+      {workspace.error && (
+        <div className={styles.error} role="alert">
+          <strong>Could not refresh benchmark data.</strong> {workspace.error}
           <p>
-            {report.sample
-              ? 'Illustrative scores and run states. Import a batch report to compare your own architectures.'
-              : 'Results from the imported report. Import an updated report to refresh run states.'}
+            Start the benchmark server and configure its development proxy using BENCHMARK_API_TOKEN
+            {workspace.updatedAt ? '. Previously loaded results remain visible.' : '.'} See the
+            module README for setup.
           </p>
-        )}
-      </div>
-
-      <section className={styles.resultsPanel} aria-labelledby="comparison-heading">
+        </div>
+      )}
+      <p className={styles.explanation}>
+        Paired-context recovery measures retrieval of the supplied context, not answer quality.
+        Means cover successful queries only; failed and interrupted runs are partial results.
+      </p>
+      {actionError && (
+        <p className={styles.error} role="alert">
+          {actionError}
+        </p>
+      )}
+      {notice && (
+        <p className={styles.notice} role="status">
+          {notice}
+        </p>
+      )}
+      <section className={styles.results} aria-label="Benchmark results">
         <div className={styles.panelHeading}>
           <div>
-            <h2 id="comparison-heading">Benchmark results</h2>
-            <span className={styles.resultCount}>{benchmarks.length} rows</span>
+            <h2>Benchmark results</h2>
+            <span>{filteredRuns.length} runs</span>
           </div>
-          <label className={styles.highlightToggle}>
-            <input
-              type="checkbox"
-              checked={highlightBest}
-              onChange={(event) => update({ highlightBest: event.target.checked })}
-            />{' '}
-            Highlight best in each row
-          </label>
+          <span>Higher scores are better · scale 0–1</span>
         </div>
         <div className={styles.toolbar}>
-          <label className={styles.search}>
-            <Icon name="search" />
-            <input
-              value={query}
-              onChange={(event) => update({ query: event.target.value })}
-              placeholder="Search benchmarks or metrics…"
-              aria-label="Search benchmarks"
-            />
-          </label>
+          <input
+            type="search"
+            aria-label="Search benchmarks"
+            placeholder="Search benchmark, architecture, or run…"
+            value={state.query}
+            onChange={(event) => update({ query: event.target.value })}
+          />
           <select
-            aria-label="Filter benchmark suite"
-            value={suite}
-            onChange={(event) => update({ suite: event.target.value })}
-          >
-            <option value="all">All suites</option>
-            {suites.map((item) => (
-              <option key={item} value={item}>
-                {item}
-              </option>
-            ))}
-          </select>
-          <select
-            aria-label="Filter result status"
-            value={status}
+            aria-label="Filter run status"
+            value={state.status}
             onChange={(event) => update({ status: event.target.value })}
           >
             <option value="all">All run states</option>
-            <option value="completed">With completed results</option>
-            <option value="running">With running results</option>
-            <option value="queued">With queued results</option>
-            <option value="failed">With failed results</option>
-            <option value="missing">With unstarted results</option>
+            {STATUSES.map((status) => (
+              <option key={status} value={status}>
+                {status.charAt(0).toUpperCase() + status.slice(1)}
+              </option>
+            ))}
           </select>
         </div>
-        <fieldset className={styles.architectureFilters}>
-          <legend>Architectures</legend>
-          {report.architectures.map((architecture) => (
-            <label key={architecture.id}>
-              <input
-                type="checkbox"
-                checked={architectureIds.includes(architecture.id)}
-                disabled={architectureIds.length === 1 && architectureIds.includes(architecture.id)}
-                onChange={(event) =>
-                  update({
-                    architectureIds: event.target.checked
-                      ? [...architectureIds, architecture.id]
-                      : architectureIds.filter((id) => id !== architecture.id),
-                  })
-                }
-              />
-              <span>{architecture.name}</span>
-            </label>
-          ))}
-        </fieldset>
-
+        {state.comparison ? (
+          <div className={styles.comparison}>
+            <span>
+              Comparing {comparisonRuns.length} completed runs with matching fingerprint, metric,
+              top-k, and candidate sources. Best scores are highlighted within this group.
+            </span>
+            <button className={styles.button} onClick={() => update({ comparison: '' })}>
+              Show all runs
+            </button>
+          </div>
+        ) : (
+          <p className={styles.tableNote}>
+            Use “Compare setup” on a completed run to compare compatible results. Architecture
+            labels are supplied by the experimenter.
+          </p>
+        )}
         <div
           className={styles.tableScroll}
           tabIndex={0}
           role="region"
-          aria-label="Architecture comparison table, scroll for more results"
+          aria-label="Benchmark results table, scroll for more results"
         >
-          <table className={styles.table}>
-            <caption className={styles.srOnly}>
-              Benchmark scores by architecture. Each row declares its metric and whether higher or
-              lower is better. Highlighted values are best among completed results in the visible
-              architectures.
+          <table>
+            <caption>
+              Benchmark results by architecture label. Partial results are excluded from
+              comparisons.
             </caption>
             <thead>
               <tr>
-                <th scope="col" className={styles.benchmarkColumn}>
-                  <span>Benchmark</span>
-                  <small>Suite / evaluation metric</small>
-                </th>
-                {architectures.map((architecture, index) => (
-                  <th scope="col" key={architecture.id}>
-                    <div className={styles.architectureHeading}>
-                      <span className={styles.architectureNumber}>
-                        {String(index + 1).padStart(2, '0')}
-                      </span>
-                      <span>{architecture.name}</span>
-                    </div>
-                    <small title={architecture.description}>{architecture.description}</small>
+                <th scope="col">Benchmark / run</th>
+                <th scope="col">Architecture label</th>
+                <th scope="col">Status / progress</th>
+                <th scope="col">Top k</th>
+                {METRICS.map((metric) => (
+                  <th scope="col" key={metric.key} title={metric.description}>
+                    {metric.title}
                   </th>
                 ))}
+                <th scope="col">Actions</th>
               </tr>
             </thead>
             <tbody>
-              {visibleBenchmarks.map((benchmark, index) => {
-                const best = bestValue(benchmark);
+              {visibleRuns.map((run) => {
+                const comparable = comparabilityKey(run);
+                const partial = run.status !== 'completed';
                 return (
-                  <tr key={benchmark.id}>
-                    <th scope="row" className={styles.benchmarkColumn}>
-                      <div className={styles.benchmarkName}>
-                        <span className={styles.rowNumber}>
-                          {String((activePage - 1) * 25 + index + 1).padStart(2, '0')}
-                        </span>
-                        <div>
-                          {benchmark.name}
-                          <small>
-                            {benchmark.suite} · {benchmark.metric}
-                          </small>
-                        </div>
-                      </div>
-                      <span className={styles.direction}>
-                        {benchmark.direction === 'higher' ? 'Higher is better' : 'Lower is better'}
-                      </span>
+                  <tr key={run.id}>
+                    <th scope="row">
+                      <strong>{benchmarkName(byId.get(run.request.benchmark_id))}</strong>
+                      <small>
+                        {run.id.slice(0, 8)} · {new Date(run.started_at_ms).toLocaleString()}
+                      </small>
                     </th>
-                    {architectures.map((architecture) => {
-                      const result = resultFor(benchmark.id, architecture.id);
-                      const isBest =
-                        highlightBest && result?.status === 'completed' && result.value === best;
-                      const label =
-                        result?.status === 'completed'
-                          ? formatResult(result.value!, benchmark.unit)
-                          : result
-                            ? STATUS_LABELS[result.status]
-                            : 'Not run';
-                      return (
-                        <td key={architecture.id} className={isBest ? styles.bestCell : ''}>
+                    <td>
+                      <strong>{run.request.label || 'Unlabelled'}</strong>
+                      <small>{run.metric_kind}</small>
+                    </td>
+                    <td>
+                      <span className={styles.badge} data-state={run.status}>
+                        {run.status}
+                      </span>
+                      {run.status === 'running' && (
+                        <progress
+                          aria-label={`Run ${run.id.slice(0, 8)} progress`}
+                          max={Math.max(run.total, 1)}
+                          value={run.completed + run.failed}
+                        />
+                      )}
+                      <small>
+                        {run.completed} / {run.total} successful
+                        {run.failed > 0 ? ` · ${run.failed} failed` : ''}
+                      </small>
+                      {partial && (
+                        <small>
+                          {run.status === 'running' ? 'In progress' : 'Partial results'}
+                        </small>
+                      )}
+                    </td>
+                    <td>{run.request.top_k}</td>
+                    {METRICS.map(({ key }) => (
+                      <td
+                        key={key}
+                        className={styles.score}
+                        data-best={
+                          (!!state.comparison &&
+                            comparisonRuns.length > 1 &&
+                            run.means?.[key] === best[key]) ||
+                          undefined
+                        }
+                      >
+                        {score(run.means?.[key])}
+                        {partial && run.means && <small>partial</small>}
+                      </td>
+                    ))}
+                    <td>
+                      <div className={styles.rowActions}>
+                        <button
+                          disabled={!workspace.connected || !!pending}
+                          onClick={() =>
+                            void perform('detail', async (signal) => {
+                              const result = await api.getRun(run.id, signal);
+                              if (!signal.aborted) setDetail(result);
+                            })
+                          }
+                          aria-label={`View run ${run.id.slice(0, 8)}`}
+                        >
+                          Details
+                        </button>
+                        <button
+                          disabled={!workspace.connected || !!pending || run.status === 'running'}
+                          onClick={() =>
+                            void perform(`csv-${run.id}`, async (signal) => {
+                              const blob = await api.downloadScores(run.id, signal);
+                              if (!signal.aborted) download(blob, `${run.id}.csv`);
+                            })
+                          }
+                          aria-label={`Download CSV for ${run.id.slice(0, 8)}`}
+                        >
+                          CSV
+                        </button>
+                        {comparable && !state.comparison && (
                           <button
-                            className={styles.resultButton}
                             onClick={() =>
-                              setSelection({
-                                benchmarkId: benchmark.id,
-                                architectureId: architecture.id,
-                              })
+                              update({ comparison: comparable, status: 'all', query: '' })
                             }
-                            aria-label={`${benchmark.name}, ${architecture.name}: ${label}${isBest ? ', best result' : ''}`}
+                            aria-label={`Compare setup for ${run.id.slice(0, 8)}`}
                           >
-                            <span
-                              className={
-                                result?.status === 'completed'
-                                  ? styles.score
-                                  : `${styles.cellStatus} ${styles[result?.status ?? 'missing']}`
-                              }
-                            >
-                              {result?.status !== 'completed' && <i />}
-                              {label}
-                            </span>
-                            {isBest ? (
-                              <span className={styles.bestLabel}>Best</span>
-                            ) : result?.status === 'failed' ? (
-                              <span className={styles.cellHint}>View error</span>
-                            ) : null}
+                            Compare setup
                           </button>
-                        </td>
-                      );
-                    })}
+                        )}
+                      </div>
+                    </td>
                   </tr>
                 );
               })}
             </tbody>
           </table>
-          {!benchmarks.length && (
-            <div className={styles.emptyState}>
-              <h3>No matching benchmarks</h3>
-              <p>Change the search, suite, or run-state filter.</p>
-              <button
-                className={styles.button}
-                onClick={() => update({ query: '', suite: 'all', status: 'all' })}
-              >
-                Clear filters
-              </button>
+          {!filteredRuns.length && (
+            <div className={styles.empty}>
+              <h3>
+                {!workspace.updatedAt
+                  ? 'Connect the benchmark server'
+                  : workspace.runs.length
+                    ? 'No matching runs'
+                    : 'No saved runs yet'}
+              </h3>
+              <p>
+                {workspace.runs.length
+                  ? 'Change the search or filters to see other results.'
+                  : 'Load a benchmark snapshot and start a run to populate this table.'}
+              </p>
             </div>
           )}
         </div>
         <div className={styles.tableFooter}>
           <span>
-            {benchmarks.length} of {report.benchmarks.length} benchmarks · {architectures.length} of{' '}
-            {report.architectures.length} architectures
+            {filteredRuns.length} of {workspace.runs.length} runs ·{' '}
+            {activeRuns.length ? 'Polling active run' : 'Auto-refresh every 3 seconds'}
           </span>
-          <span>
-            <i className={styles.bestKey} /> Best completed score per row · Ties included
-          </span>
-          {pageCount > 1 && (
-            <nav className={styles.pagination} aria-label="Benchmark pages">
-              <button disabled={activePage === 1} onClick={() => setPage(activePage - 1)}>
-                Previous
-              </button>
-              <span>
-                Page {activePage} of {pageCount}
-              </span>
-              <button disabled={activePage === pageCount} onClick={() => setPage(activePage + 1)}>
-                Next
-              </button>
-            </nav>
-          )}
+          <div>
+            <button
+              className={styles.button}
+              disabled={currentPage === 0}
+              onClick={() => setPage(currentPage - 1)}
+            >
+              Previous
+            </button>
+            <span>
+              Page {currentPage + 1} of {pages}
+            </span>
+            <button
+              className={styles.button}
+              disabled={currentPage >= pages - 1}
+              onClick={() => setPage(currentPage + 1)}
+            >
+              Next
+            </button>
+          </div>
         </div>
       </section>
-      <footer className={styles.footer}>
-        <span>
-          Results are compared within each benchmark. Scores from different metrics are not
-          averaged.
-        </span>
-        <span>
-          {report.sample ? 'Sample batch' : 'Report snapshot'} · No benchmark runner connected
-        </span>
-      </footer>
-      {selection && (
-        <ResultDetail
-          key={`${selection.benchmarkId}:${selection.architectureId}`}
-          benchmark={report.benchmarks.find((item) => item.id === selection.benchmarkId)!}
-          architecture={
-            report.architectures.find((item) => item.id === selection.architectureId)!.name
-          }
-          result={resultFor(selection.benchmarkId, selection.architectureId)}
-          onClose={() => setSelection(null)}
-        />
+      <div className={styles.setup} id={setupId}>
+        <form className={styles.panel} onSubmit={loadBenchmark} aria-label="Load benchmark">
+          <div className={styles.panelHeading}>
+            <h2>1. Load a benchmark</h2>
+            <span>Catalog → saved snapshot</span>
+          </div>
+          <div className={styles.fields}>
+            <label>
+              Catalog benchmark
+              <select
+                value={selectedKey}
+                onChange={(event) => {
+                  setCatalogKey(event.target.value);
+                  setLimit('');
+                }}
+                disabled={!workspace.connected || !!pending || !definitions.length}
+              >
+                <option value="" disabled>
+                  Select a benchmark
+                </option>
+                {definitions.map(([key, item]) => (
+                  <option key={key} value={key}>
+                    {item.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              Case limit
+              <input
+                type="number"
+                min="1"
+                max="10000"
+                step="1"
+                value={limit}
+                placeholder={String(definition?.defaults.limit ?? 100)}
+                onChange={(event) => setLimit(event.target.value)}
+                disabled={!!pending}
+              />
+            </label>
+            <button
+              className={styles.primaryButton}
+              disabled={!workspace.connected || !definition || !!pending}
+            >
+              {pending === 'load' ? 'Loading…' : 'Load snapshot'}
+            </button>
+          </div>
+          {definition && (
+            <p className={styles.muted}>
+              {definition.split} split · {definition.evaluation}
+              <br />
+              <span className={styles.path}>{definition.source}</span>
+            </p>
+          )}
+          <small>Leave the limit blank to use the catalog default. Loading may take a while.</small>
+        </form>
+        <form className={styles.panel} onSubmit={startRun} aria-label="Start benchmark run">
+          <div className={styles.panelHeading}>
+            <h2>2. Run an architecture</h2>
+            <span>Existing Nebula runtime</span>
+          </div>
+          <label>
+            Loaded snapshot
+            <select
+              value={selectedBenchmark?.id ?? ''}
+              onChange={(event) => {
+                update({ benchmarkId: event.target.value });
+                setTopK('');
+                setSnapshot(null);
+              }}
+              disabled={!!pending || !workspace.benchmarks.length}
+            >
+              <option value="" disabled>
+                Load a snapshot first
+              </option>
+              {workspace.benchmarks.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {benchmarkName(item)} · {item.case_count} cases · {item.id.slice(0, 8)}
+                </option>
+              ))}
+            </select>
+          </label>
+          <div className={styles.fields}>
+            <label>
+              Architecture label
+              <input
+                value={label}
+                onChange={(event) => setLabel(event.target.value)}
+                placeholder="e.g. Dense retrieval baseline"
+                disabled={!!pending}
+              />
+            </label>
+            <label>
+              Top k
+              <input
+                type="number"
+                min="1"
+                max="100"
+                step="1"
+                value={topK}
+                placeholder={String(
+                  selectedBenchmark?.configuration?.definition.defaults.top_k ?? 8,
+                )}
+                onChange={(event) => setTopK(event.target.value)}
+                disabled={!!pending}
+              />
+            </label>
+            <button className={styles.primaryButton} disabled={!canRun}>
+              {pending === 'run'
+                ? 'Starting…'
+                : activeRuns.length
+                  ? 'Run in progress'
+                  : 'Start run'}
+            </button>
+          </div>
+          <small>
+            The label records your externally configured architecture. It does not change models or
+            launch Nebula. Top k defaults to the saved snapshot.
+          </small>
+        </form>
+      </div>
+      {selectedBenchmark && (
+        <section className={styles.corpus} aria-label="Selected snapshot">
+          <div>
+            <strong>{benchmarkName(selectedBenchmark)}</strong>
+            <span>
+              {' '}
+              {selectedBenchmark.document_count} candidate documents ·{' '}
+              {selectedBenchmark.case_count} cases · {selectedBenchmark.split}
+            </span>
+            <p>
+              Exported corpus: <code>{selectedBenchmark.corpus_path}</code>
+            </p>
+            <small>
+              Use this corpus in the configured Nebula runtime and wait for indexing before starting
+              a run.
+            </small>
+          </div>
+          <button
+            className={styles.button}
+            disabled={!!pending || !workspace.connected}
+            onClick={() =>
+              void perform('snapshot', async (signal) => {
+                const result = await api.getBenchmark(selectedBenchmark.id, signal);
+                if (!signal.aborted) setSnapshot(result);
+              })
+            }
+          >
+            View snapshot
+          </button>
+        </section>
       )}
+      {snapshot && (
+        <section className={styles.detail} aria-label="Snapshot details">
+          <div className={styles.panelHeading}>
+            <h2>Snapshot {snapshot.id.slice(0, 8)}</h2>
+            <button className={styles.button} onClick={() => setSnapshot(null)}>
+              Close snapshot
+            </button>
+          </div>
+          <p>
+            {snapshot.cases.length} cases · {snapshot.documents.length} documents ·{' '}
+            {snapshot.metric_kind}
+          </p>
+          <ol>
+            {snapshot.cases.slice(0, 3).map((item) => (
+              <li key={item.id}>{item.query}</li>
+            ))}
+          </ol>
+          <small>Showing the first {Math.min(3, snapshot.cases.length)} saved questions.</small>
+        </section>
+      )}
+      {viewedRun && (
+        <section className={styles.detail} aria-label="Run details">
+          <div className={styles.panelHeading}>
+            <h2>Run {viewedRun.id.slice(0, 8)}</h2>
+            <button className={styles.button} onClick={() => setDetail(null)}>
+              Close details
+            </button>
+          </div>
+          <p>
+            {viewedRun.request.label || 'Unlabelled architecture'} · {viewedRun.status}
+            {viewedRun.status !== 'completed' ? ' · Partial results' : ''}
+          </p>
+          {viewedRun.error && <p className={styles.error}>{viewedRun.error}</p>}
+          <dl>
+            <dt>Benchmark fingerprint</dt>
+            <dd>{viewedRun.benchmark_fingerprint}</dd>
+            <dt>Metric</dt>
+            <dd>{viewedRun.metric_kind}</dd>
+            <dt>Candidate source IDs</dt>
+            <dd>{viewedRun.source_ids.join(', ') || 'Not established'}</dd>
+            <dt>Scope</dt>
+            <dd>
+              <code>{JSON.stringify(viewedRun.scope)}</code>
+            </dd>
+            <dt>Index watermark</dt>
+            <dd>
+              <code>{JSON.stringify(viewedRun.watermark)}</code>
+            </dd>
+          </dl>
+          <small>
+            CSV downloads include per-query scores and evidence. Runs that failed before producing
+            rows may have no CSV.
+          </small>
+        </section>
+      )}
+      <footer className={styles.footer}>
+        Results come from the benchmark server. One active run per server; saved results remain
+        available across sessions.
+      </footer>
     </main>
   );
 }
