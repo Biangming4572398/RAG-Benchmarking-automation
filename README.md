@@ -7,14 +7,53 @@ The benchmark backend uses files only; Nebula manages its own index separately.
 
 ## First dataset and what is measured
 
-The default dataset is [wandb/RAGTruth-processed](https://huggingface.co/datasets/wandb/RAGTruth-processed).
-The loader resolves its repository URL to `data/test-*.parquet` (or the train
-split), filters `task_type == "QA"`, and snapshots the first 100 unique
+The included `ragtruth-qa` catalog entry uses
+[wandb/RAGTruth-processed](https://huggingface.co/datasets/wandb/RAGTruth-processed).
+Its source template selects `data/test-*.parquet` (or the train split).
+The adapter filters `task_type == "QA"` and snapshots the first 100 unique
 question/context pairs by default. Repeated model outputs do not multiply the
 retrieval trials. `limit` controls unique cases, from 1 to 10000. A local Parquet
 file or a direct `hf://`/HTTPS Parquet path/glob with the same schema also works.
 Hugging Face credentials, when needed, come from Polars' `HF_TOKEN` environment
-variable, never the load request.
+variable, never the load request or catalog.
+
+## Benchmark catalog
+
+Edit [`apps/backend/benchmarks.yaml`](apps/backend/benchmarks.yaml):
+
+```yaml
+benchmarks:
+  ragtruth-qa:
+    name: RAGTruth QA
+    source: "hf://datasets/wandb/RAGTruth-processed/data/{split}-*.parquet"
+    split: test
+    adapter: ragtruth_qa
+    evaluation: paired_context_recovery_v1
+    defaults:
+      limit: 100
+      top_k: 8
+```
+
+The server reads this catalog at startup. `BENCHMARK_CATALOG` selects another
+file; otherwise it reads `benchmarks.yaml` in the working directory. Restart to
+apply edits. Missing/invalid catalogs fail startup, including duplicate names,
+unknown fields/adapters/evaluators, unsupported splits, and out-of-range defaults.
+Relative local source paths are resolved against the catalog's directory;
+`{split}` is replaced with the configured `train` or `test` value.
+
+Add named entries for other splits, pinned revisions, local fixtures, or default
+settings. `ragtruth_qa` and `paired_context_recovery_v1` are the only implemented
+adapter/evaluator pair. A dataset with another schema needs an adapter in code.
+Credentials, server addresses, and storage paths remain environment settings.
+
+Loading saves the selected entry and effective `limit` into the immutable
+snapshot's `configuration`. A run without `top_k` uses that snapshot's saved
+default, not the current catalog. An explicit run `top_k` overrides it. Older
+snapshots without a configuration remain readable and use their previous default
+of 8. The content fingerprint still describes the cases/contexts and metric;
+run settings record the effective `top_k` separately.
+
+## Interpreting scores
 
 RAGTruth annotates hallucinations in **historical model outputs**, not retrieval
 relevance. This initial metric is explicitly named `paired_context_recovery_v1`:
@@ -45,6 +84,7 @@ Run in `apps/backend` using Rust 1.95 or newer:
 export BENCHMARK_API_TOKEN='a-local-development-token'
 export BENCHMARK_DATA_DIR='/absolute/path/to/experiment-data'
 export BENCHMARK_ADDR='127.0.0.1:4319' # optional; this is the default
+# Optional: export BENCHMARK_CATALOG='/absolute/path/to/benchmarks.yaml'
 cargo run --locked
 ```
 
@@ -53,14 +93,18 @@ port. All endpoints require `Authorization: Bearer $BENCHMARK_API_TOKEN`.
 There is no permissive browser CORS configuration; a future internal dashboard
 should use its host proxy. Only one server may own a data directory.
 
-Load the first dataset (the source/split/limit below are also the defaults):
+Load a named benchmark using its YAML defaults:
 
 ```sh
 curl -sS http://127.0.0.1:4319/api/benchmarks/v1/benchmarks \
   -H "Authorization: Bearer $BENCHMARK_API_TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"source":"hf://datasets/wandb/RAGTruth-processed/","split":"test","limit":100}'
+  -d '{"benchmark":"ragtruth-qa"}'
 ```
+
+Use `{"benchmark":"ragtruth-qa","limit":50}` to override the case limit for
+one snapshot. Source, split and adapter now come from the catalog; the previous
+source-based load request is replaced by this named request.
 
 The response contains the benchmark `id`, `fingerprint`, counts, and absolute
 `corpus_path`. Loading is synchronous and runs on a blocking worker so health
@@ -86,7 +130,7 @@ needed: this version calls `/retrieve`, not `/query`.
 curl -sS http://127.0.0.1:4319/api/benchmarks/v1/runs \
   -H "Authorization: Bearer $BENCHMARK_API_TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"benchmark_id":"UUID-FROM-LOAD","top_k":8,"label":"baseline"}'
+  -d '{"benchmark_id":"UUID-FROM-LOAD","label":"baseline"}'
 ```
 
 This returns HTTP 202 with a run ID. Poll its status, then download `scores.csv`.
@@ -108,6 +152,7 @@ All paths have prefix `/api/benchmarks/v1`.
 | Method | Path | Result |
 | --- | --- | --- |
 | GET | `/health` | Server liveness |
+| GET | `/catalog` | Configured benchmark names, definitions and defaults |
 | POST | `/benchmarks` | Load/snapshot dataset and export corpus; HTTP 201 |
 | GET | `/benchmarks` | Dataset summaries and corpus paths |
 | GET | `/benchmarks/{id}` | Full saved cases, contexts, and historical annotations |

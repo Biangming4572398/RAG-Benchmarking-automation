@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::{
     Error, Result,
+    catalog::ResolvedBenchmark,
     load_benchmarks::{Benchmark, digest},
     trials::{Run, RunStatus},
 };
@@ -29,6 +30,8 @@ pub struct BenchmarkInfo {
     pub document_count: usize,
     pub corpus_path: PathBuf,
     pub fingerprint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configuration: Option<ResolvedBenchmark>,
 }
 
 impl Store {
@@ -90,6 +93,7 @@ impl Store {
             source: benchmark.source,
             split: benchmark.split,
             metric_kind: benchmark.metric_kind,
+            configuration: benchmark.configuration,
         })
     }
 

@@ -20,13 +20,34 @@ use crate::{
 #[serde(deny_unknown_fields)]
 pub struct RunRequest {
     pub benchmark_id: Uuid,
-    #[serde(default = "default_top_k")]
     pub top_k: usize,
     #[serde(default)]
     pub label: String,
 }
-fn default_top_k() -> usize {
-    8
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartRunRequest {
+    pub benchmark_id: Uuid,
+    pub top_k: Option<usize>,
+    #[serde(default)]
+    pub label: String,
+}
+
+impl StartRunRequest {
+    pub fn resolve(self, benchmark: &Benchmark) -> RunRequest {
+        RunRequest {
+            benchmark_id: self.benchmark_id,
+            top_k: self.top_k.unwrap_or_else(|| {
+                benchmark
+                    .configuration
+                    .as_ref()
+                    .map(|configuration| configuration.definition.defaults.top_k)
+                    .unwrap_or(8)
+            }), // Snapshots written before the catalog used 8.
+            label: self.label,
+        }
+    }
 }
 
 #[derive(Clone, Deserialize, Serialize)]

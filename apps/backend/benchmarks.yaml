@@ -1,0 +1,10 @@
+benchmarks:
+  ragtruth-qa:
+    name: RAGTruth QA
+    source: "hf://datasets/wandb/RAGTruth-processed/data/{split}-*.parquet"
+    split: test
+    adapter: ragtruth_qa
+    evaluation: paired_context_recovery_v1
+    defaults:
+      limit: 100
+      top_k: 8

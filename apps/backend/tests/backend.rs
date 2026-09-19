@@ -6,11 +6,12 @@ use axum::{
     routing::{get, post},
 };
 use backend::{
+    catalog::{Catalog, LoadRequest, ResolvedBenchmark},
     config::NebulaConfig,
-    load_benchmarks::{Benchmark, LoadRequest, load_benchmarks},
+    load_benchmarks::{Benchmark, load_benchmarks},
     server::router,
     storage::Store,
-    trials::{Run, RunRequest, RunStatus},
+    trials::{Run, RunRequest, RunStatus, StartRunRequest},
 };
 use polars::prelude::*;
 use serde_json::{Value, json};
@@ -35,12 +36,25 @@ fn fixture(dir: &TempDir) -> String {
 }
 
 fn load_fixture(dir: &TempDir) -> Benchmark {
-    load_benchmarks(&LoadRequest {
-        source: fixture(dir),
-        limit: 10,
-        ..Default::default()
-    })
-    .unwrap()
+    load_benchmarks(&load_settings(&fixture(dir), 10)).unwrap()
+}
+
+fn catalog_for(source: &str, limit: usize) -> Catalog {
+    let mut catalog = Catalog::from_yaml(include_str!("../benchmarks.yaml")).unwrap();
+    let definition = catalog.benchmarks.get_mut("ragtruth-qa").unwrap();
+    definition.source = source.into();
+    definition.defaults.limit = limit;
+    definition.defaults.top_k = 2;
+    catalog
+}
+
+fn load_settings(source: &str, limit: usize) -> ResolvedBenchmark {
+    catalog_for(source, limit)
+        .resolve(&LoadRequest {
+            benchmark: "ragtruth-qa".into(),
+            limit: None,
+        })
+        .unwrap()
 }
 
 #[test]
@@ -81,43 +95,29 @@ fn parquet_loading_preserves_annotations_but_exports_only_deduplicated_qa_contex
 fn limit_applies_to_unique_cases_and_invalid_input_is_rejected() {
     let dir = TempDir::new().unwrap();
     let source = fixture(&dir);
-    let benchmark = load_benchmarks(&LoadRequest {
-        source: source.clone(),
-        limit: 1,
-        ..Default::default()
-    })
-    .unwrap();
+    let mut settings = load_settings(&source, 1);
+    let benchmark = load_benchmarks(&settings).unwrap();
     assert_eq!(benchmark.cases.len(), 1);
     assert_eq!(benchmark.cases[0].reference_outputs.len(), 2);
-    assert!(
-        load_benchmarks(&LoadRequest {
-            source: source.clone(),
-            limit: 0,
-            ..Default::default()
-        })
-        .is_err()
-    );
-    assert!(
-        load_benchmarks(&LoadRequest {
-            source,
-            split: "../../bad".into(),
-            limit: 1
-        })
-        .is_err()
-    );
-    assert!(
-        load_benchmarks(&LoadRequest {
-            source: "missing.parquet".into(),
-            ..Default::default()
-        })
-        .is_err()
-    );
+    settings.definition.defaults.limit = 0;
+    assert!(load_benchmarks(&settings).is_err());
+    settings.definition.defaults.limit = 1;
+    settings.definition.split = "../../bad".into();
+    assert!(load_benchmarks(&settings).is_err());
+    assert!(load_benchmarks(&load_settings("missing.parquet", 1)).is_err());
 }
 
 #[test]
 #[ignore = "downloads public RAGTruth Parquet from Hugging Face"]
 fn live_hugging_face_ragtruth() {
-    let benchmark = load_benchmarks(&LoadRequest::default()).unwrap();
+    let catalog = Catalog::load(std::path::Path::new("benchmarks.yaml")).unwrap();
+    let settings = catalog
+        .resolve(&LoadRequest {
+            benchmark: "ragtruth-qa".into(),
+            limit: None,
+        })
+        .unwrap();
+    let benchmark = load_benchmarks(&settings).unwrap();
     assert_eq!(benchmark.cases.len(), 100);
     assert!(!benchmark.documents.is_empty());
     assert!(
@@ -169,6 +169,31 @@ fn store_rejects_second_owner_and_recovers_interrupted_runs() {
 struct TestServer {
     base: String,
     task: tokio::task::JoinHandle<()>,
+}
+
+#[test]
+fn run_overrides_and_pre_catalog_snapshots_remain_supported() {
+    let dir = TempDir::new().unwrap();
+    let benchmark = load_fixture(&dir);
+    let request = |top_k| StartRunRequest {
+        benchmark_id: benchmark.id,
+        top_k,
+        label: String::new(),
+    };
+    assert_eq!(request(None).resolve(&benchmark).top_k, 2);
+    assert_eq!(request(Some(7)).resolve(&benchmark).top_k, 7);
+    assert!(
+        Run::new(
+            request(Some(0)).resolve(&benchmark),
+            &benchmark,
+            "fp".into()
+        )
+        .is_err()
+    );
+    let mut old = serde_json::to_value(&benchmark).unwrap();
+    old.as_object_mut().unwrap().remove("configuration");
+    let legacy: Benchmark = serde_json::from_value(old).unwrap();
+    assert_eq!(request(None).resolve(&legacy).top_k, 8);
 }
 impl Drop for TestServer {
     fn drop(&mut self) {
@@ -250,22 +275,18 @@ async fn wait_run(client: &reqwest::Client, base: &str, id: &str) -> Value {
 async fn api_loads_runs_scores_and_reopens_without_a_database() {
     let dir = TempDir::new().unwrap();
     let source = fixture(&dir);
-    let reference = load_benchmarks(&LoadRequest {
-        source: source.clone(),
-        limit: 10,
-        ..Default::default()
-    })
-    .unwrap();
+    let reference = load_benchmarks(&load_settings(&source, 10)).unwrap();
     let nebula = nebula(&reference, false, false).await;
     let store = Arc::new(Store::open(&dir.path().join("data")).unwrap());
     let server = serve(
         router(
-            store,
+            store.clone(),
             "test-token".into(),
             Some(NebulaConfig {
                 base_url: format!("{}/api/nebula/v1", nebula.base),
                 token: "nebula-token".into(),
             }),
+            catalog_for(&source, 10),
         )
         .unwrap(),
     )
@@ -284,22 +305,67 @@ async fn api_loads_runs_scores_and_reopens_without_a_database() {
     let loaded = client
         .post(format!("{base}/benchmarks"))
         .bearer_auth("test-token")
-        .json(&json!({"source":source, "limit":10}))
+        .json(&json!({"benchmark":"ragtruth-qa", "limit":2}))
         .send()
         .await
         .unwrap();
     assert_eq!(loaded.status(), StatusCode::CREATED);
     let loaded: Value = loaded.json().await.unwrap();
     assert_eq!(loaded["case_count"], 2);
+    assert_eq!(
+        loaded["configuration"]["definition"]["defaults"]["limit"],
+        2
+    );
+    // A new server/catalog must not change defaults on an existing snapshot.
+    let mut edited_catalog = catalog_for(&source, 10);
+    edited_catalog
+        .benchmarks
+        .get_mut("ragtruth-qa")
+        .unwrap()
+        .defaults
+        .top_k = 1;
+    let new_server = serve(
+        router(
+            store,
+            "test-token".into(),
+            Some(NebulaConfig {
+                base_url: format!("{}/api/nebula/v1", nebula.base),
+                token: "nebula-token".into(),
+            }),
+            edited_catalog,
+        )
+        .unwrap(),
+    )
+    .await;
+    let base = format!("{}/api/benchmarks/v1", new_server.base);
+    let catalog: Value = client
+        .get(format!("{base}/catalog"))
+        .bearer_auth("test-token")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(catalog["benchmarks"]["ragtruth-qa"]["defaults"]["top_k"], 1);
+    let invalid = client
+        .post(format!("{base}/benchmarks"))
+        .bearer_auth("test-token")
+        .json(&json!({"benchmark":"unknown"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
     let response = client
         .post(format!("{base}/runs"))
         .bearer_auth("test-token")
-        .json(&json!({"benchmark_id":loaded["id"], "top_k":2, "label":"baseline"}))
+        .json(&json!({"benchmark_id":loaded["id"], "label":"baseline"}))
         .send()
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let run: Value = response.json().await.unwrap();
+    assert_eq!(run["request"]["top_k"], 2);
     let id = run["id"].as_str().unwrap();
     let result = wait_run(&client, &base, id).await;
     assert_eq!(result["status"], "completed", "{result}");

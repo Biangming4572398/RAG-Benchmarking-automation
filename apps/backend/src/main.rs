@@ -1,11 +1,12 @@
-use backend::{config::Config, server::router, storage::Store};
+use backend::{catalog::Catalog, config::Config, server::router, storage::Store};
 use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
+    let catalog = Catalog::load(&config.catalog_path)?;
     let store = Arc::new(Store::open(&config.data_dir)?);
-    let app = router(store, config.api_token, config.nebula)?;
+    let app = router(store, config.api_token, config.nebula, catalog)?;
     let listener = tokio::net::TcpListener::bind(config.address).await?;
     println!("BENCHMARK_BACKEND_PORT={}", listener.local_addr()?.port());
     axum::serve(listener, app)

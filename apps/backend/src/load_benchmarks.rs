@@ -5,28 +5,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::{Error, Result};
-
-pub const RAGTRUTH: &str = "hf://datasets/wandb/RAGTruth-processed/";
-
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct LoadRequest {
-    pub source: String,
-    pub split: String,
-    /// Number of unique QA cases, not number of recorded model responses.
-    pub limit: usize,
-}
-
-impl Default for LoadRequest {
-    fn default() -> Self {
-        Self {
-            source: RAGTRUTH.into(),
-            split: "test".into(),
-            limit: 100,
-        }
-    }
-}
+use crate::{
+    Error, Result,
+    catalog::{Adapter, ResolvedBenchmark},
+};
 
 #[derive(Clone, Deserialize, Serialize)]
 pub struct ReferenceOutput {
@@ -60,6 +42,8 @@ pub struct Benchmark {
     pub source: String,
     pub split: String,
     pub metric_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configuration: Option<ResolvedBenchmark>,
     pub cases: Vec<Case>,
     pub documents: Vec<Document>,
 }
@@ -70,23 +54,16 @@ pub fn digest(bytes: &[u8]) -> String {
 
 /// Snapshot the QA subset and deduplicate the model repetitions in RAGTruth.
 /// Only source contexts are exported; outputs/annotations cannot enter retrieval.
-pub fn load_benchmarks(request: &LoadRequest) -> Result<Benchmark> {
-    if request.limit == 0 || request.limit > 10_000 {
-        return Err(Error(
-            "limit must be between 1 and 10000 unique cases".into(),
-        ));
+pub fn load_benchmarks(request: &ResolvedBenchmark) -> Result<Benchmark> {
+    request.definition.validate()?;
+    match request.definition.adapter {
+        Adapter::RagtruthQa => load_ragtruth(request),
     }
-    if !["train", "test"].contains(&request.split.as_str()) {
-        return Err(Error("split must be train or test".into()));
-    }
-    if request.source.trim().is_empty() {
-        return Err(Error("source is required".into()));
-    }
-    let source = if request.source.trim_end_matches('/') == RAGTRUTH.trim_end_matches('/') {
-        format!("{}data/{}-*.parquet", RAGTRUTH, request.split)
-    } else {
-        request.source.clone()
-    };
+}
+
+fn load_ragtruth(request: &ResolvedBenchmark) -> Result<Benchmark> {
+    let definition = &request.definition;
+    let source = definition.source.clone();
     let columns = [
         "id",
         "query",
@@ -158,7 +135,7 @@ pub fn load_benchmarks(request: &LoadRequest) -> Result<Benchmark> {
         let position = if let Some(position) = case_positions.get(&case_id) {
             *position
         } else {
-            if cases.len() >= request.limit {
+            if cases.len() >= definition.defaults.limit {
                 continue;
             }
             let position = cases.len();
@@ -200,8 +177,9 @@ pub fn load_benchmarks(request: &LoadRequest) -> Result<Benchmark> {
     Ok(Benchmark {
         id: Uuid::new_v4(),
         source,
-        split: request.split.clone(),
-        metric_kind: "paired_context_recovery_v1".into(),
+        split: definition.split.clone(),
+        metric_kind: definition.evaluation.metric_kind().into(),
+        configuration: Some(request.clone()),
         cases,
         documents: documents.into_values().collect(),
     })

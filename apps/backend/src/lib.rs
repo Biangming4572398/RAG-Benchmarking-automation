@@ -1,4 +1,5 @@
 pub mod analysis;
+pub mod catalog;
 pub mod config;
 pub mod load_benchmarks;
 pub mod server;

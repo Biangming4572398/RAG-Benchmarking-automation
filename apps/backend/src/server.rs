@@ -14,21 +14,28 @@ use uuid::Uuid;
 
 use crate::{
     Error, Result,
+    catalog::{Catalog, LoadRequest},
     config::{NebulaConfig, validate_token},
-    load_benchmarks::{LoadRequest, load_benchmarks},
+    load_benchmarks::load_benchmarks,
     storage::Store,
-    trials::{Run, RunRequest, RunStatus, execute},
+    trials::{Run, RunStatus, StartRunRequest, execute},
 };
 
 struct AppState {
     store: Arc<Store>,
     token: String,
     nebula: Option<NebulaConfig>,
+    catalog: Catalog,
     run_slot: Arc<Semaphore>,
     load_slot: Arc<Semaphore>,
 }
 
-pub fn router(store: Arc<Store>, token: String, nebula: Option<NebulaConfig>) -> Result<Router> {
+pub fn router(
+    store: Arc<Store>,
+    token: String,
+    nebula: Option<NebulaConfig>,
+    catalog: Catalog,
+) -> Result<Router> {
     validate_token(&token)?;
     if let Some(config) = &nebula {
         config.validate()?;
@@ -37,6 +44,7 @@ pub fn router(store: Arc<Store>, token: String, nebula: Option<NebulaConfig>) ->
         store,
         token,
         nebula,
+        catalog,
         run_slot: Arc::new(Semaphore::new(1)),
         load_slot: Arc::new(Semaphore::new(1)),
     });
@@ -50,6 +58,7 @@ pub fn router(store: Arc<Store>, token: String, nebula: Option<NebulaConfig>) ->
             get(list_benchmarks).post(load),
         )
         .route("/api/benchmarks/v1/benchmarks/{id}", get(benchmark))
+        .route("/api/benchmarks/v1/catalog", get(get_catalog))
         .route("/api/benchmarks/v1/runs", get(list_runs).post(start_run))
         .route("/api/benchmarks/v1/runs/{id}", get(run))
         .route("/api/benchmarks/v1/runs/{id}/scores.csv", get(scores))
@@ -96,10 +105,18 @@ async fn list_benchmarks(State(state): State<Arc<AppState>>) -> ApiResult<impl I
     Ok(Json(state.store.benchmarks()?))
 }
 
+async fn get_catalog(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(state.catalog.clone())
+}
+
 async fn load(
     State(state): State<Arc<AppState>>,
     Json(request): Json<LoadRequest>,
 ) -> ApiResult<impl IntoResponse> {
+    let request = state
+        .catalog
+        .resolve(&request)
+        .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))?;
     let permit = state.load_slot.clone().try_acquire_owned().map_err(|_| {
         ApiError(
             StatusCode::CONFLICT,
@@ -149,7 +166,7 @@ async fn run(
 
 async fn start_run(
     State(state): State<Arc<AppState>>,
-    Json(request): Json<RunRequest>,
+    Json(request): Json<StartRunRequest>,
 ) -> ApiResult<impl IntoResponse> {
     let config = state.nebula.clone().ok_or_else(|| {
         ApiError(
@@ -162,7 +179,7 @@ async fn start_run(
         .benchmark(request.benchmark_id)
         .map_err(|_| ApiError(StatusCode::NOT_FOUND, "Benchmark not found".into()))?;
     let fingerprint = state.store.benchmark_info(benchmark.id)?.fingerprint;
-    let run = Run::new(request, &benchmark, fingerprint)
+    let run = Run::new(request.resolve(&benchmark), &benchmark, fingerprint)
         .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))?;
     let permit = state.run_slot.clone().try_acquire_owned().map_err(|_| {
         ApiError(

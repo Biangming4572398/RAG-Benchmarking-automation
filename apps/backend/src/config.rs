@@ -4,6 +4,7 @@ use std::{env, net::SocketAddr, path::PathBuf};
 pub struct Config {
     pub address: SocketAddr,
     pub data_dir: PathBuf,
+    pub catalog_path: PathBuf,
     pub api_token: String,
     pub nebula: Option<NebulaConfig>,
 }
@@ -49,6 +50,9 @@ impl Config {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("benchmark-data")),
             api_token,
+            catalog_path: env::var_os("BENCHMARK_CATALOG")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("benchmarks.yaml")),
             nebula,
         })
     }
