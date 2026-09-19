@@ -1,3 +1,8 @@
 Cargo.lock
 .env
 .env_test
+
+# Frontend development outputs
+node_modules/
+dist/
+.vite/
