@@ -202,6 +202,37 @@ Hugging Face smoke test requires network access:
 cargo test --locked live_hugging_face_ragtruth -- --ignored --nocapture
 ```
 
+The separate real-Nebula acceptance test launches both backend executables and
+creates a three-question Parquet fixture locally. It uses the current Nebula
+retrieval implementation and a real installed embedding bundle, without dataset
+downloads, remote reasoning, or a scripted retrieval peer. Build Nebula for the
+current platform first, following its backend README, then run from
+`apps/backend`:
+
+```sh
+NEBULA_E2E_BINARY='/absolute/path/to/nebula-backend' \
+NEBULA_E2E_MODEL_DIR='/absolute/path/to/models/intfloat-multilingual-e5-small' \
+NEBULA_E2E_ARTIFACT_DIR='/tmp/nebula-benchmark-acceptance' \
+cargo test --locked --test nebula_e2e -- --ignored --nocapture
+```
+
+`NEBULA_E2E_MODEL_DIR` contains the complete bundle, including the native ONNX
+runtime for the current platform. The test copies it to a fresh private storage
+root and starts both servers on ephemeral loopback ports. It loads the Parquet
+through the Rust HTTP API, waits for actual indexing, and requires a completed run
+with all three paired contexts recovered. It also verifies source revisions,
+scope/index identity, evidence excerpts against the original documents, and the
+downloaded CSV. This small acceptance fixture proves integration, not retrieval
+quality on a representative dataset.
+
+The optional artifact directory retains a uniquely named run folder, including
+`benchmark.json`, `workspace.json`, `run.json`, `scores.csv`, process logs, the
+original Parquet fixture, and both servers' isolated state. It is printed before
+startup so failures can be inspected too. Retaining the copied model requires
+several hundred MB per run. Omit `NEBULA_E2E_ARTIFACT_DIR` to clean up automatically.
+The test always stops its own child processes and never uses the normal Genesis
+storage directory. Ordinary `cargo test` leaves this acceptance test ignored.
+
 Polars' [Hugging Face documentation](https://docs.pola.rs/user-guide/io/hugging-face/)
 describes `hf://datasets/owner/repo@revision/path` syntax. Use a pinned revision
 when reproducibility across future dataset updates matters; loaded snapshots
