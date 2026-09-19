@@ -132,20 +132,20 @@ describe('Live benchmarking dashboard', () => {
     expect(table.getAllByRole('row')).toHaveLength(5);
   });
 
-  it('uses catalog loading and saved snapshot defaults without sending invented architecture options', async () => {
+  it('uses saved RAGTruth defaults without managing benchmark definitions or loading snapshots', async () => {
     const user = userEvent.setup();
     const api = apiWith();
     render(<BenchmarkDashboard api={api} />);
     await connected();
     expect(screen.getByLabelText('Top k')).toHaveAttribute('placeholder', '4');
-    await user.click(screen.getByRole('button', { name: 'Load snapshot' }));
-    await waitFor(() =>
-      expect(api.loadBenchmark).toHaveBeenCalledWith(
-        { benchmark: 'ragtruth-qa' },
-        expect.any(AbortSignal),
-      ),
+    expect(screen.queryByRole('form', { name: 'Load benchmark' })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Catalog benchmark')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Case limit')).not.toBeInTheDocument();
+    expect(screen.getByRole('main').firstElementChild).toBe(
+      screen.getByRole('region', { name: 'Benchmark results' }),
     );
-    await screen.findByRole('status');
+    expect(api.getCatalog).not.toHaveBeenCalled();
+    expect(api.loadBenchmark).not.toHaveBeenCalled();
     await user.type(screen.getByLabelText('Architecture label'), 'Hybrid retrieval');
     await user.click(screen.getByRole('button', { name: 'Start run' }));
     await waitFor(() =>
@@ -156,6 +156,38 @@ describe('Live benchmarking dashboard', () => {
     );
     await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('started'));
     expect(api.startRun).toHaveBeenCalledTimes(1);
+  });
+
+  it('leaves preparation to the YAML workflow when no saved snapshot exists', async () => {
+    const api = apiWith();
+    api.listBenchmarks.mockResolvedValue([]);
+    render(<BenchmarkDashboard api={api} />);
+    await connected();
+    expect(screen.getByRole('button', { name: 'Start run' })).toBeDisabled();
+    expect(screen.getByText(/No prepared snapshots yet/)).toHaveTextContent('RAGTruth QA');
+    expect(api.loadBenchmark).not.toHaveBeenCalled();
+    expect(api.startRun).not.toHaveBeenCalled();
+  });
+
+  it('reads future benchmark names from saved YAML configuration without frontend registration', async () => {
+    const api = apiWith([run({ request: { ...run().request, benchmark_id: 'snapshot-future' } })]);
+    api.listBenchmarks.mockResolvedValue([
+      {
+        ...benchmark,
+        id: 'snapshot-future',
+        configuration: {
+          key: 'team-evaluation',
+          definition: { ...catalog.benchmarks['ragtruth-qa'], name: 'Team evaluation' },
+        },
+      },
+      benchmark,
+    ]);
+    render(<BenchmarkDashboard api={api} />);
+    await connected();
+    expect(within(screen.getByRole('table')).getByText('Team evaluation')).toBeVisible();
+    expect(screen.getByLabelText('Loaded snapshot')).toHaveValue(benchmark.id);
+    expect(screen.getByRole('option', { name: /Team evaluation/ })).toBeInTheDocument();
+    expect(api.getCatalog).not.toHaveBeenCalled();
   });
 
   it('shows active progress, updates it by polling, and aborts requests when closed', async () => {
@@ -188,12 +220,12 @@ describe('Live benchmarking dashboard', () => {
   it('reports disconnected data honestly and preserves previous results after a refresh failure', async () => {
     const user = userEvent.setup();
     const api = apiWith([run()]);
-    api.getCatalog.mockRejectedValueOnce(new ApiError('Bearer token required', 401));
+    api.listBenchmarks.mockRejectedValueOnce(new ApiError('Bearer token required', 401));
     render(<BenchmarkDashboard api={api} />);
     expect(await screen.findByRole('alert')).toHaveTextContent('Bearer token required');
     expect(screen.getByText('Disconnected')).toBeVisible();
     expect(screen.queryByText('Sample data')).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Load snapshot' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Start run' })).toBeDisabled();
     await user.click(screen.getByRole('button', { name: 'Refresh' }));
     await connected();
     expect(screen.getByRole('table')).toHaveTextContent('Dense baseline');

@@ -1,4 +1,4 @@
-import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   comparabilityKey,
   createBenchmarkApi,
@@ -78,12 +78,9 @@ export function BenchmarkDashboard({
   api: providedApi,
   pollInterval = 3000,
 }: BenchmarkDashboardProps) {
-  const setupId = useId();
   const api = useMemo(() => providedApi ?? createBenchmarkApi(), [providedApi]);
   const workspace = useBenchmarkWorkspace(api, pollInterval);
   const [state, setState] = useState(() => restoreState(initialState));
-  const [catalogKey, setCatalogKey] = useState('');
-  const [limit, setLimit] = useState('');
   const [topK, setTopK] = useState('');
   const [label, setLabel] = useState('');
   const [pending, setPending] = useState('');
@@ -101,13 +98,10 @@ export function BenchmarkDashboard({
     );
   }, [workspace.runs]);
 
-  const definitions = Object.entries(workspace.catalog.benchmarks);
-  const selectedKey = workspace.catalog.benchmarks[catalogKey]
-    ? catalogKey
-    : (definitions[0]?.[0] ?? '');
-  const definition = workspace.catalog.benchmarks[selectedKey];
   const selectedBenchmark =
-    workspace.benchmarks.find((item) => item.id === state.benchmarkId) ?? workspace.benchmarks[0];
+    workspace.benchmarks.find((item) => item.id === state.benchmarkId) ??
+    workspace.benchmarks.find((item) => item.configuration?.key === 'ragtruth-qa') ??
+    workspace.benchmarks[0];
   const activeRuns = workspace.runs.filter((run) => run.status === 'running');
   const canRun = workspace.connected && !!selectedBenchmark && !pending && activeRuns.length === 0;
   const byId = new Map(workspace.benchmarks.map((item) => [item.id, item]));
@@ -150,31 +144,13 @@ export function BenchmarkDashboard({
       if (!controller.signal.aborted) {
         setActionError(cause instanceof Error ? cause.message : 'The request failed.');
         // A timeout does not prove a mutation failed on the server. Refresh its
-        // saved state; never automatically retry a load or run creation.
+        // saved state; never automatically retry run creation.
         void workspace.reload();
       }
     } finally {
       if (operation.current === controller) operation.current = null;
       if (!controller.signal.aborted) setPending('');
     }
-  }
-
-  function loadBenchmark(event: React.FormEvent) {
-    event.preventDefault();
-    void perform('load', async (signal) => {
-      const info = await api.loadBenchmark(
-        { benchmark: selectedKey, ...(limit ? { limit: Number(limit) } : {}) },
-        signal,
-      );
-      if (signal.aborted) return;
-      update({ benchmarkId: info.id });
-      setTopK('');
-      setSnapshot(null);
-      setNotice(
-        `Loaded ${info.case_count} cases. Configure Nebula with the exported corpus before starting a run.`,
-      );
-      await workspace.reload();
-    });
   }
 
   function startRun(event: React.FormEvent) {
@@ -202,90 +178,26 @@ export function BenchmarkDashboard({
 
   return (
     <main className={styles.dashboard}>
-      <div className={styles.breadcrumb}>
-        <span>Benchmarking / Retrieval workspace</span>
-        <span>Internal</span>
-      </div>
-      <header className={styles.header}>
-        <div>
-          <span className={styles.eyebrow}>RAG BENCHMARKS</span>
-          <h1>Architecture comparison</h1>
-          <p>Saved runs, retrieval scores, and the architecture behind each result.</p>
-        </div>
-        <div className={styles.actions}>
-          <a className={styles.button} href={`#${setupId}`}>
-            Load / start run
-          </a>
-          <button
-            className={styles.button}
-            disabled={workspace.refreshing}
-            onClick={() => void workspace.refresh()}
-          >
-            {workspace.refreshing ? 'Refreshing…' : 'Refresh'}
-          </button>
-        </div>
-      </header>
-      <section className={styles.summary} aria-label="Benchmark summary">
-        <div>
-          <span className={styles.eyebrow}>SERVER</span>
-          <strong className={styles.connection}>
-            {workspace.connected
-              ? 'Connected'
-              : workspace.refreshing && !workspace.updatedAt
-                ? 'Connecting…'
-                : 'Disconnected'}
-          </strong>
-          <small>
-            {workspace.updatedAt
-              ? `Last updated ${new Date(workspace.updatedAt).toLocaleTimeString()}`
-              : 'Waiting for the benchmark server'}
-          </small>
-        </div>
-        <div>
-          <strong>{workspace.benchmarks.length}</strong>
-          <small>Loaded snapshots</small>
-        </div>
-        <div>
-          <strong>{workspace.runs.length}</strong>
-          <small>Saved runs</small>
-        </div>
-        <div>
-          <strong>{activeRuns.length}</strong>
-          <small>Running · one per server</small>
-        </div>
-      </section>
-      {workspace.error && (
-        <div className={styles.error} role="alert">
-          <strong>Could not refresh benchmark data.</strong> {workspace.error}
-          <p>
-            Start the benchmark server and configure its development proxy using BENCHMARK_API_TOKEN
-            {workspace.updatedAt ? '. Previously loaded results remain visible.' : '.'} See the
-            module README for setup.
-          </p>
-        </div>
-      )}
-      <p className={styles.explanation}>
-        Paired-context recovery measures retrieval of the supplied context, not answer quality.
-        Means cover successful queries only; failed and interrupted runs are partial results.
-      </p>
-      {actionError && (
-        <p className={styles.error} role="alert">
-          {actionError}
-        </p>
-      )}
-      {notice && (
-        <p className={styles.notice} role="status">
-          {notice}
-        </p>
-      )}
       <section className={styles.results} aria-label="Benchmark results">
-        <div className={styles.panelHeading}>
-          <div>
-            <h2>Benchmark results</h2>
-            <span>{filteredRuns.length} runs</span>
+        <header className={styles.resultsHeading}>
+          <h1>Architecture comparison</h1>
+          <div className={styles.actions}>
+            <span className={styles.connection}>
+              {workspace.connected
+                ? 'Connected'
+                : workspace.refreshing && !workspace.updatedAt
+                  ? 'Connecting…'
+                  : 'Disconnected'}
+            </span>
+            <button
+              className={styles.button}
+              disabled={workspace.refreshing}
+              onClick={() => void workspace.refresh()}
+            >
+              {workspace.refreshing ? 'Refreshing…' : 'Refresh'}
+            </button>
           </div>
-          <span>Higher scores are better · scale 0–1</span>
-        </div>
+        </header>
         <div className={styles.toolbar}>
           <input
             type="search"
@@ -307,22 +219,6 @@ export function BenchmarkDashboard({
             ))}
           </select>
         </div>
-        {state.comparison ? (
-          <div className={styles.comparison}>
-            <span>
-              Comparing {comparisonRuns.length} completed runs with matching fingerprint, metric,
-              top-k, and candidate sources. Best scores are highlighted within this group.
-            </span>
-            <button className={styles.button} onClick={() => update({ comparison: '' })}>
-              Show all runs
-            </button>
-          </div>
-        ) : (
-          <p className={styles.tableNote}>
-            Use “Compare setup” on a completed run to compare compatible results. Architecture
-            labels are supplied by the experimenter.
-          </p>
-        )}
         <div
           className={styles.tableScroll}
           tabIndex={0}
@@ -456,7 +352,7 @@ export function BenchmarkDashboard({
               <p>
                 {workspace.runs.length
                   ? 'Change the search or filters to see other results.'
-                  : 'Load a benchmark snapshot and start a run to populate this table.'}
+                  : 'Prepare RAGTruth QA using the backend setup instructions, then start a run below.'}
               </p>
             </div>
           )}
@@ -486,68 +382,59 @@ export function BenchmarkDashboard({
             </button>
           </div>
         </div>
-      </section>
-      <div className={styles.setup} id={setupId}>
-        <form className={styles.panel} onSubmit={loadBenchmark} aria-label="Load benchmark">
-          <div className={styles.panelHeading}>
-            <h2>1. Load a benchmark</h2>
-            <span>Catalog → saved snapshot</span>
-          </div>
-          <div className={styles.fields}>
-            <label>
-              Catalog benchmark
-              <select
-                value={selectedKey}
-                onChange={(event) => {
-                  setCatalogKey(event.target.value);
-                  setLimit('');
-                }}
-                disabled={!workspace.connected || !!pending || !definitions.length}
-              >
-                <option value="" disabled>
-                  Select a benchmark
-                </option>
-                {definitions.map(([key, item]) => (
-                  <option key={key} value={key}>
-                    {item.name}
-                  </option>
-                ))}
-              </select>
-            </label>
-            <label>
-              Case limit
-              <input
-                type="number"
-                min="1"
-                max="10000"
-                step="1"
-                value={limit}
-                placeholder={String(definition?.defaults.limit ?? 100)}
-                onChange={(event) => setLimit(event.target.value)}
-                disabled={!!pending}
-              />
-            </label>
-            <button
-              className={styles.primaryButton}
-              disabled={!workspace.connected || !definition || !!pending}
-            >
-              {pending === 'load' ? 'Loading…' : 'Load snapshot'}
+        {state.comparison ? (
+          <div className={styles.comparison}>
+            <span>
+              Comparing {comparisonRuns.length} completed runs with matching fingerprint, metric,
+              top-k, and candidate sources. Best scores are highlighted within this group.
+            </span>
+            <button className={styles.button} onClick={() => update({ comparison: '' })}>
+              Show all runs
             </button>
           </div>
-          {definition && (
-            <p className={styles.muted}>
-              {definition.split} split · {definition.evaluation}
-              <br />
-              <span className={styles.path}>{definition.source}</span>
-            </p>
-          )}
-          <small>Leave the limit blank to use the catalog default. Loading may take a while.</small>
-        </form>
+        ) : (
+          <p className={styles.tableNote}>
+            Use “Compare setup” on a completed run to compare compatible results. Architecture
+            labels are supplied by the experimenter.
+          </p>
+        )}
+      </section>
+      {workspace.error && (
+        <div className={styles.error} role="alert">
+          <strong>Could not refresh benchmark data.</strong> {workspace.error}
+          <p>
+            The benchmark server is unavailable.
+            {workspace.updatedAt ? ' Previously loaded results remain visible.' : ''} See the module
+            README for connection setup.
+          </p>
+        </div>
+      )}
+      <p className={styles.explanation}>
+        Paired-context recovery measures retrieval of the supplied context, not answer quality.
+        Means cover successful queries only; failed and interrupted runs are partial results.
+      </p>
+      {actionError && (
+        <p className={styles.error} role="alert">
+          {actionError}
+        </p>
+      )}
+      {notice && (
+        <p className={styles.notice} role="status">
+          {notice}
+        </p>
+      )}
+      <div className={styles.setup}>
         <form className={styles.panel} onSubmit={startRun} aria-label="Start benchmark run">
           <div className={styles.panelHeading}>
-            <h2>2. Run an architecture</h2>
+            <h2>Run an architecture</h2>
             <span>Existing Nebula runtime</span>
           </div>
+          {!workspace.benchmarks.length && (
+            <p className={styles.muted}>
+              No prepared snapshots yet. RAGTruth QA is defined in the team’s Git-managed YAML.
+              Follow the backend README to prepare its snapshot and index the corpus in Nebula.
+            </p>
+          )}
           <label>
             Loaded snapshot
             <select
@@ -560,7 +447,7 @@ export function BenchmarkDashboard({
               disabled={!!pending || !workspace.benchmarks.length}
             >
               <option value="" disabled>
-                Load a snapshot first
+                No prepared snapshots
               </option>
               {workspace.benchmarks.map((item) => (
                 <option key={item.id} value={item.id}>
@@ -695,8 +582,8 @@ export function BenchmarkDashboard({
         </section>
       )}
       <footer className={styles.footer}>
-        Results come from the benchmark server. One active run per server; saved results remain
-        available across sessions.
+        Benchmark definitions are maintained in YAML through Git. Results come from the benchmark
+        server. One active run per server; saved results remain available across sessions.
       </footer>
     </main>
   );

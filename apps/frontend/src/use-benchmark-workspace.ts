@@ -1,8 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { BenchmarkApi, BenchmarkInfo, BenchmarkRun, Catalog } from './benchmark-api';
+import type { BenchmarkApi, BenchmarkInfo, BenchmarkRun } from './benchmark-api';
 
 export function useBenchmarkWorkspace(api: BenchmarkApi, pollInterval: number) {
-  const [catalog, setCatalog] = useState<Catalog>({ benchmarks: {} });
   const [benchmarks, setBenchmarks] = useState<BenchmarkInfo[]>([]);
   const [runs, setRuns] = useState<BenchmarkRun[]>([]);
   const [error, setError] = useState('');
@@ -20,13 +19,11 @@ export function useBenchmarkWorkspace(api: BenchmarkApi, pollInterval: number) {
     setRefreshing(true);
     const work = (async () => {
       try {
-        const [nextCatalog, nextBenchmarks, nextRuns] = await Promise.all([
-          api.getCatalog(request.signal),
+        const [nextBenchmarks, nextRuns] = await Promise.all([
           api.listBenchmarks(request.signal),
           api.listRuns(request.signal),
         ]);
         if (request.signal.aborted) return;
-        setCatalog(nextCatalog);
         setBenchmarks(nextBenchmarks);
         setRuns(nextRuns);
         setError('');
@@ -76,5 +73,5 @@ export function useBenchmarkWorkspace(api: BenchmarkApi, pollInterval: number) {
     };
   }, [refresh, pollInterval]);
 
-  return { catalog, benchmarks, runs, error, connected, refreshing, updatedAt, refresh, reload };
+  return { benchmarks, runs, error, connected, refreshing, updatedAt, refresh, reload };
 }

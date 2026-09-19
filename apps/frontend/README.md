@@ -3,13 +3,26 @@
 The dashboard reads the existing Rust HTTP API in `apps/backend`. All UI, API
 contracts, styling, and the Genesis SDK adapter belong to this submodule. Genesis
 only discovers the module, displays it, and supplies generic development proxy
-support. The benchmark server is unchanged.
+support. The results table is the first content in the dashboard. Benchmark
+definitions live in Git-managed [`apps/backend/benchmarks.yaml`](../backend/benchmarks.yaml),
+starting with RAGTruth QA; the frontend does not create or edit them. The benchmark
+server is unchanged.
 
 ## Connect and open
 
-Start the benchmark backend using the [backend instructions](../../README.md#start).
-Then, in the shell running the frontend, export the **same token** used by that
-backend. Do not use a `VITE_` variable for credentials.
+Follow the [backend instructions](../../README.md#start) to start the server,
+load the `ragtruth-qa` snapshot using the documented curl command, and connect
+Nebula to its exported corpus. The YAML catalog is read at startup; it does not
+automatically load snapshots.
+
+`BENCHMARK_API_TOKEN` is a local shared password you choose. The existing Rust
+backend required it before this frontend was added; it is not a provider API key,
+and there is no pre-existing secret to recover. Use the same value for the backend
+and Node development proxy. It is independent of `NEBULA_API_TOKEN`, which connects
+the benchmark server to Nebula. Do not put either credential in Git or a `VITE_`
+variable.
+
+In the shell running the frontend:
 
 ```sh
 export BENCHMARK_API_TOKEN='the-same-local-development-token'
@@ -38,21 +51,23 @@ serving that static build separately requires an equivalent authenticated proxy.
 
 ## Workflow
 
-1. Select a catalog benchmark. Optionally override its case limit (1–10000), then
-   load a snapshot. The server resolves the source, split, adapter, and metric from
-   its YAML catalog. Loading is synchronous and may take time.
-2. Point your separately configured Nebula runtime at the displayed exported
-   corpus and wait for indexing. The backend README explains its connection
-   settings. The dashboard does not launch Nebula, choose models, or change the
-   architecture.
-3. Select a saved snapshot, add an architecture label, and start a run. Blank top-k
+1. Review architecture results in the table at the top. Many saved runs can be
+   searched, filtered, and paginated.
+2. Select a saved snapshot below the table, add an architecture label, and start a
+   run. Snapshot names come from their saved YAML configuration, so newly prepared
+   benchmarks appear automatically. Blank top-k
    uses that snapshot's saved default, including 8 for older snapshots; an explicit
    top-k must be 1–100. Labels are limited to 256 UTF-8 bytes by the server.
-4. Watch progress and saved results in the table. The server permits **one active
-   run at a time**. Many saved runs can be searched, filtered, and paginated.
-5. Open run details for fingerprint, source IDs, scope, index watermark, and errors.
+3. Watch progress in the table. The server permits **one active run at a time**.
+4. Open run details for fingerprint, source IDs, scope, index watermark, and errors.
    Download CSV after a run stops. A setup failure may produce no CSV; the server's
    error is displayed without substituting fabricated data.
+
+Manage benchmark definitions and defaults in YAML through Git. Restart the backend
+after edits, then prepare a new snapshot using its HTTP API when those changes
+should apply. Existing snapshots preserve their original configuration. The
+dashboard lists saved snapshots and runs; it does not fetch or manage the catalog,
+load datasets, launch Nebula, choose models, or change the architecture.
 
 ## Reading results
 
@@ -85,6 +100,6 @@ pnpm --filter @genesis/benchmarking build
 ```
 
 Tests exercise the Rust response shapes, HTTP errors and request bodies, polling,
-partial and incompatible results, loading/running actions, CSV, and Node-only proxy
+partial and incompatible results, run creation, CSV, and Node-only proxy
 configuration. The Genesis host has a real registry/loader/navigation test using
 backend-shaped responses. No tests require external model calls or dataset downloads.

@@ -3,10 +3,15 @@
 The experimental architecture comparison dashboard lives in
 [`apps/frontend`](apps/frontend/README.md). Open it with `pnpm benchmark:ui` from
 the Genesis workspace, or use the Benchmarking dock item in development Genesis.
-It connects to this server through a development proxy, loads benchmark snapshots,
-starts labelled runs, polls progress, compares compatible retrieval results, and
-downloads the server's CSV files. Its UI, API client, and standalone proxy live
-inside this submodule. The backend and HTTP interface below remain unchanged.
+Its results table comes first, comparing benchmarks against architecture labels.
+It connects through a development proxy, starts runs on saved snapshots, polls
+progress, compares compatible retrieval results, and downloads CSV files.
+Benchmark definitions are managed through Git in
+[`apps/backend/benchmarks.yaml`](apps/backend/benchmarks.yaml), starting with
+RAGTruth QA. Prepare snapshots with the HTTP API as described below; their saved
+names appear in the dashboard automatically. Its UI, API client, and standalone
+proxy live inside this submodule. The backend and HTTP interface below remain
+unchanged.
 
 Developer-only Rust HTTP server for loading benchmark data with Polars, running
 Nebula retrieval, and retaining CSV scores. It does not register with the Genesis
@@ -85,6 +90,12 @@ Failed queries have blank metric cells; means cover successful queries only.
 Only `completed` runs should be compared as full benchmark results.
 
 ## Start
+
+`BENCHMARK_API_TOKEN` is a local shared password you choose, not a provider API
+key or an existing secret you need to recover. The Rust backend required it before
+the dashboard was added. Use the same value for the backend and frontend's Node
+proxy; it is independent of `NEBULA_API_TOKEN`, which authenticates requests to
+Nebula. Keep these credentials outside Git.
 
 Run in `apps/backend` using Rust 1.95 or newer:
 
