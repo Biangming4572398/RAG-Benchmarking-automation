@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::{
     Error, Result,
+    answers::{self, AnswerReviewRequest, ReviewFailure, StartAnswerRunRequest, StartFailure},
     catalog::{Catalog, LoadRequest},
     config::NebulaConfig,
     load_benchmarks::load_benchmarks,
@@ -53,6 +54,20 @@ pub fn router(store: Arc<Store>, nebula: Option<NebulaConfig>, catalog: Catalog)
         .route("/api/benchmarks/v1/runs", get(list_runs).post(start_run))
         .route("/api/benchmarks/v1/runs/{id}", get(run))
         .route("/api/benchmarks/v1/runs/{id}/scores.csv", get(scores))
+        .route("/api/benchmarks/v1/answer-runtime", get(answer_runtime))
+        .route(
+            "/api/benchmarks/v1/answer-runs",
+            get(list_answer_runs).post(start_answer_run),
+        )
+        .route("/api/benchmarks/v1/answer-runs/{id}", get(answer_run))
+        .route(
+            "/api/benchmarks/v1/answer-runs/{id}/scores.csv",
+            get(answer_scores),
+        )
+        .route(
+            "/api/benchmarks/v1/answer-runs/{id}/cases/{case_id}/review",
+            axum::routing::post(review_answer),
+        )
         .layer(DefaultBodyLimit::max(64 * 1024))
         .with_state(state))
 }
@@ -203,5 +218,125 @@ async fn scores(
             ),
         ],
         bytes,
+    ))
+}
+
+async fn answer_runtime(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(answers::runtime(state.nebula.as_ref()).await)
+}
+
+async fn list_answer_runs(State(state): State<Arc<AppState>>) -> ApiResult<impl IntoResponse> {
+    Ok(Json(state.store.answer_runs()?))
+}
+
+async fn answer_run(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<impl IntoResponse> {
+    Ok(Json(state.store.answer_run(id).map_err(|_| {
+        ApiError(StatusCode::NOT_FOUND, "Answer run not found".into())
+    })?))
+}
+
+async fn start_answer_run(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<StartAnswerRunRequest>,
+) -> ApiResult<impl IntoResponse> {
+    request
+        .validate()
+        .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))?;
+    let config = state.nebula.clone().ok_or_else(|| {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Configure a Nebula backend before generating answers".into(),
+        )
+    })?;
+    let benchmark = state
+        .store
+        .benchmark(request.benchmark_id)
+        .map_err(|_| ApiError(StatusCode::NOT_FOUND, "Benchmark not found".into()))?;
+    let fingerprint = state.store.benchmark_info(benchmark.id)?.fingerprint;
+    let permit = state.run_slot.clone().try_acquire_owned().map_err(|_| {
+        ApiError(
+            StatusCode::CONFLICT,
+            "A benchmark run is already active".into(),
+        )
+    })?;
+    let run = answers::prepare(&config, request, &benchmark, fingerprint)
+        .await
+        .map_err(|error| match error {
+            StartFailure::Unavailable(message) => {
+                ApiError(StatusCode::SERVICE_UNAVAILABLE, message)
+            }
+            StartFailure::Invalid(message) => ApiError(StatusCode::BAD_REQUEST, message),
+        })?;
+    state.store.create_answer_run(&run)?;
+    let summary = run.summary.clone();
+    tokio::spawn(async move {
+        let _permit = permit;
+        let id = run.summary.id;
+        let task = tokio::spawn(answers::execute(
+            state.store.clone(),
+            config,
+            benchmark,
+            run,
+        ));
+        if task.await.is_err()
+            && let Ok(mut failed) = state.store.answer_run(id)
+        {
+            failed.summary.status = RunStatus::Failed;
+            failed.summary.error = Some("Answer generation worker stopped unexpectedly".into());
+            failed.summary.finished_at_ms = Some(crate::trials::now_ms());
+            let _ = state.store.save_answer_run(&failed);
+        }
+    });
+    Ok((StatusCode::ACCEPTED, Json(summary)))
+}
+
+async fn review_answer(
+    State(state): State<Arc<AppState>>,
+    Path((id, case_id)): Path<(Uuid, String)>,
+    Json(review): Json<AnswerReviewRequest>,
+) -> ApiResult<impl IntoResponse> {
+    let run = state
+        .store
+        .review_answer(id, &case_id, review)
+        .map_err(|error| match error {
+            ReviewFailure::NotFound => {
+                ApiError(StatusCode::NOT_FOUND, "Answer run or case not found".into())
+            }
+            ReviewFailure::Running => ApiError(
+                StatusCode::CONFLICT,
+                "Reviews are available after the run stops".into(),
+            ),
+            ReviewFailure::Invalid(message) => ApiError(StatusCode::BAD_REQUEST, message),
+            ReviewFailure::Storage(error) => ApiError::from(error),
+        })?;
+    Ok(Json(run))
+}
+
+async fn answer_scores(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<impl IntoResponse> {
+    let run = state
+        .store
+        .answer_run(id)
+        .map_err(|_| ApiError(StatusCode::NOT_FOUND, "Answer run not found".into()))?;
+    if run.summary.status == RunStatus::Running {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "CSV is available after the run stops".into(),
+        ));
+    }
+    Ok((
+        [
+            (header::CONTENT_TYPE, "text/csv; charset=utf-8".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"answer-{id}.csv\""),
+            ),
+        ],
+        run.csv()?,
     ))
 }

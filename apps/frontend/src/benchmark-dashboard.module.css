@@ -404,3 +404,136 @@
     margin-bottom: 10px;
   }
 }
+
+.workspace {
+  height: 100%;
+  min-height: 0;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  background: #faf9f5;
+}
+.tabs {
+  display: flex;
+  gap: 6px;
+  padding: 12px clamp(16px, 2vw, 28px) 0;
+  border-bottom: 1px solid #e3e0d6;
+}
+.tabs button {
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: none;
+  color: #707267;
+  padding: 10px 14px;
+  font: 12px/1.4 var(--font-sans, 'Inter', system-ui, sans-serif);
+  cursor: pointer;
+}
+.tabs button[aria-selected='true'] {
+  border-bottom-color: #496044;
+  color: #242721;
+  font-weight: 600;
+}
+.tabs button:focus-visible {
+  outline: 2px solid #496044;
+  outline-offset: -2px;
+}
+.tabPanel {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+.answerTable table {
+  min-width: 1400px;
+}
+.pairingFields {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+}
+.caseNavigation {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 22px 0;
+}
+.caseNavigation > label {
+  flex: 1;
+  min-width: 200px;
+}
+.answerText {
+  margin: 16px 0;
+  padding: 18px;
+  background: var(--bench-surface);
+  border-left: 3px solid #9ba28e;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+}
+.evidence {
+  margin: 20px 0;
+}
+.evidence summary {
+  cursor: pointer;
+  font-weight: 500;
+}
+.evidence article {
+  border-top: 1px solid var(--bench-line);
+  margin-top: 14px;
+  padding-top: 14px;
+}
+.evidence p {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.reviewForm {
+  border-top: 1px solid var(--bench-line);
+  padding-top: 16px;
+  margin-top: 20px;
+}
+.reviewForm fieldset {
+  border: 0;
+  padding: 0;
+  margin: 0;
+}
+.reviewFields {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+.reviewForm label {
+  margin-bottom: 14px;
+}
+.reviewForm textarea {
+  display: block;
+  width: 100%;
+  margin-top: 5px;
+  padding: 10px;
+  color: var(--bench-ink);
+  background: #fffefa;
+  border: 1px solid #d9d6cc;
+  border-radius: 4px;
+  font: inherit;
+  resize: vertical;
+}
+.visuallyHidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+}
+@media (max-width: 800px) {
+  .pairingFields,
+  .reviewFields {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+@media (max-width: 500px) {
+  .pairingFields,
+  .reviewFields {
+    grid-template-columns: 1fr;
+  }
+}

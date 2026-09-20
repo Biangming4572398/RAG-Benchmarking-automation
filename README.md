@@ -5,17 +5,19 @@ The experimental architecture comparison dashboard lives in
 the Genesis workspace, or use the Benchmarking dock item in development Genesis.
 Its results table comes first, comparing benchmarks against architecture labels.
 It connects through a development proxy, starts runs on saved snapshots, polls
-progress, compares compatible retrieval results, and downloads CSV files.
+progress, compares compatible retrieval results, and downloads CSV files. Its
+Generated answers tab runs the configured Nebula generation profile and records
+explicit human reviews of answer quality.
 Benchmark definitions are managed through Git in
 [`apps/backend/benchmarks.yaml`](apps/backend/benchmarks.yaml), starting with
 RAGTruth QA. Prepare snapshots with the HTTP API as described below; their saved
 names appear in the dashboard automatically. Its UI, API client, and standalone
-proxy live inside this submodule. The backend and HTTP interface below remain
-unchanged.
+proxy live inside this submodule.
 
 Developer-only Rust HTTP server for loading benchmark data with Polars, running
-Nebula retrieval, and retaining CSV scores. It does not register with the Genesis
-release build, select models, launch Nebula, or modify your normal Genesis storage.
+Nebula retrieval and answer generation, and retaining results and human reviews.
+It does not register with the Genesis release build, install models, launch
+Nebula, or modify your normal Genesis storage.
 The benchmark backend uses files only; Nebula manages its own index separately.
 
 ## First dataset and what is measured
@@ -38,7 +40,7 @@ Edit [`apps/backend/benchmarks.yaml`](apps/backend/benchmarks.yaml):
 benchmarks:
   ragtruth-qa:
     name: RAGTruth QA
-    source: "hf://datasets/wandb/RAGTruth-processed/data/{split}-*.parquet"
+    source: 'hf://datasets/wandb/RAGTruth-processed/data/{split}-*.parquet'
     split: test
     adapter: ragtruth_qa
     evaluation: paired_context_recovery_v1
@@ -88,6 +90,70 @@ Compare runs on the same benchmark fingerprint, top_k and candidate source set.
 Single-document runs are useful smoke tests, not retrieval-quality evidence.
 Failed queries have blank metric cells; means cover successful queries only.
 Only `completed` runs should be compared as full benchmark results.
+
+## Generated answers and human evaluation
+
+Answer runs use the same immutable benchmark snapshots and candidate corpus.
+`GET /api/benchmarks/v1/answer-runtime` reports the embedding model/revision and
+generation profiles actually exposed by the configured Nebula backend. An
+unavailable runtime includes a reason; the dashboard does not invent model
+choices. The current Nebula implementation uses multilingual-e5-small and exposes
+its one process-configured generation profile. Architecture labels describe the
+experiment; the saved scope and pipeline watermark preserve the runtime identity.
+
+To enable generation, explicitly configure the separate Nebula process with
+`NEBULA_REMOTE_REASONING=1`, a backend-only `MOONSHOT_API_KEY`, and optionally
+`MOONSHOT_MODEL` (`kimi-k3` or `kimi-k2.6`). These are Nebula settings, not benchmark
+request fields. This makes real remote model calls. Keep credentials out of the
+dashboard and request bodies. The benchmark server still uses its existing
+`NEBULA_API_BASE` and `NEBULA_API_TOKEN` connection settings. Generation cannot run
+against a local-only Nebula session.
+
+Start a run with a profile ID returned by `/answer-runtime`:
+
+```sh
+curl -sS http://127.0.0.1:4319/api/benchmarks/v1/answer-runs \
+  -H 'Content-Type: application/json' \
+  -d '{"benchmark_id":"UUID-FROM-LOAD","architecture_label":"Nebula baseline","profile_id":"moonshot-kimi-k3"}'
+```
+
+The runner creates a fresh conversation for every question, calls Nebula's
+strict `/query` endpoint, and retains the answer, evidence, claim lineage, model
+receipt, outcome and latency. Nebula currently fixes this endpoint's retrieval
+top-k to 8. The benchmark verifies source revisions, scope, watermark and model
+receipt throughout the run. Retrieval and answer generation share one active-run
+slot. A hard failure stops the run and retains earlier answers. Refusals and
+`evidence-only` responses are retained as separate outcomes.
+
+Answer quality uses **`manual_review_v1`**. A human reviews a successfully
+generated answer after the run stops and records four independent judgments:
+correctness, groundedness, hallucination present, and citation accuracy, plus a
+reviewer name and optional notes. Scores remain null until reviewed; unanswered
+questions and unreviewed answers never become fabricated zero scores. Means are
+fractions over reviewed answers only. Always show reviewed/answered/total
+coverage alongside means, and compare like-for-like benchmark fingerprints,
+candidate sets, top-k and evaluation versions. Human selection of cases can
+introduce review bias, especially when review coverage differs between runs.
+
+`POST /answer-runs/{run_id}/cases/{case_id}/review` accepts:
+
+```json
+{
+  "reviewer": "Researcher",
+  "correctness": true,
+  "groundedness": true,
+  "hallucination": false,
+  "citation_accuracy": true,
+  "notes": "The answer is supported by the cited passage."
+}
+```
+
+The latest review replaces the previous review for that case and recomputes the
+means atomically. Reviewer names are trimmed and limited to 128 UTF-8 bytes;
+notes are limited to 4000 bytes. Running cases and non-answer outcomes cannot be
+reviewed. RAGTruth's historical outputs and hallucination labels are **not** gold
+answers or labels for these new generations. Nebula's deterministic citation
+checks are not presented as automatic answer-quality evaluation.
 
 ## Start
 
@@ -165,17 +231,23 @@ Nebula supports larger selections.
 
 All paths have prefix `/api/benchmarks/v1`.
 
-| Method | Path | Result |
-| --- | --- | --- |
-| GET | `/health` | Server liveness |
-| GET | `/catalog` | Configured benchmark names, definitions and defaults |
-| POST | `/benchmarks` | Load/snapshot dataset and export corpus; HTTP 201 |
-| GET | `/benchmarks` | Dataset summaries and corpus paths |
-| GET | `/benchmarks/{id}` | Full saved cases, contexts, and historical annotations |
-| POST | `/runs` | Start retrieval run; HTTP 202 |
-| GET | `/runs` | Saved run summaries, including progress |
-| GET | `/runs/{id}` | Run status, settings, source IDs, watermark, means, error |
-| GET | `/runs/{id}/scores.csv` | Download completed/partial CSV after run stops |
+| Method | Path                                       | Result                                                        |
+| ------ | ------------------------------------------ | ------------------------------------------------------------- |
+| GET    | `/health`                                  | Server liveness                                               |
+| GET    | `/catalog`                                 | Configured benchmark names, definitions and defaults          |
+| POST   | `/benchmarks`                              | Load/snapshot dataset and export corpus; HTTP 201             |
+| GET    | `/benchmarks`                              | Dataset summaries and corpus paths                            |
+| GET    | `/benchmarks/{id}`                         | Full saved cases, contexts, and historical annotations        |
+| POST   | `/runs`                                    | Start retrieval run; HTTP 202                                 |
+| GET    | `/runs`                                    | Saved run summaries, including progress                       |
+| GET    | `/runs/{id}`                               | Run status, settings, source IDs, watermark, means, error     |
+| GET    | `/runs/{id}/scores.csv`                    | Download completed/partial CSV after run stops                |
+| GET    | `/answer-runtime`                          | Actual embedding identity and generation profile availability |
+| POST   | `/answer-runs`                             | Start generated-answer run; HTTP 202                          |
+| GET    | `/answer-runs`                             | Saved answer-run summaries and review coverage                |
+| GET    | `/answer-runs/{id}`                        | Summary plus per-case answers, evidence, outcomes and reviews |
+| POST   | `/answer-runs/{id}/cases/{case_id}/review` | Save human judgments after run stops                          |
+| GET    | `/answer-runs/{id}/scores.csv`             | Download answers and current human reviews after run stops    |
 
 Run states are `running`, `completed`, `failed`, and `interrupted`. Startup marks
 unfinished runs interrupted rather than silently resuming against a new index.
@@ -192,6 +264,8 @@ experiment-data/
   runs/<uuid>/
     run.json
     scores.csv
+  answer-runs/<uuid>/
+    run.json
 ```
 
 CSV includes run/case/source identifiers, query, top_k, status, latency,
@@ -199,6 +273,13 @@ individual metrics, retrieved evidence as a JSON cell, and error. JSON metadata
 is replaced atomically; CSV is flushed/synced after each question. A hard kill
 during a row write can leave the final row incomplete; interrupted results are
 partial artifacts. There is no database dependency or schema migration.
+
+Answer runs persist their summary and all finished cases in one atomically
+replaced `run.json`. Their CSV is generated on download from the current saved
+answers/reviews, so it reflects the latest human judgments. Pending review cells
+remain blank. Startup also marks unfinished answer runs interrupted; previously
+generated answers remain available for review and export. Concurrent review
+updates are serialized to preserve other cases' reviews.
 
 ## Verification
 

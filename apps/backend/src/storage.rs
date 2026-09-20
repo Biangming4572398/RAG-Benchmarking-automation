@@ -1,7 +1,9 @@
 use std::{
+    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
+    sync::Mutex,
 };
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -9,6 +11,7 @@ use uuid::Uuid;
 
 use crate::{
     Error, Result,
+    answers::{AnswerReviewRequest, AnswerRun, AnswerRunSummary, ReviewFailure},
     catalog::ResolvedBenchmark,
     load_benchmarks::{Benchmark, digest},
     trials::{Run, RunStatus},
@@ -18,6 +21,10 @@ pub struct Store {
     root: PathBuf,
     // Prevent two servers from racing recovery/progress writes in the same root.
     _lock: File,
+    answer_review_lock: Mutex<()>,
+    // The process owns this directory exclusively. Polling summaries must not reread every
+    // generated answer and evidence history; run.json remains the single durable record.
+    answer_summaries: Mutex<BTreeMap<Uuid, AnswerRunSummary>>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -48,7 +55,13 @@ impl Store {
             .map_err(|_| Error("Benchmark data directory is already in use".into()))?;
         fs::create_dir_all(root.join("benchmarks"))?;
         fs::create_dir_all(root.join("runs"))?;
-        let store = Self { root, _lock: lock };
+        fs::create_dir_all(root.join("answer-runs"))?;
+        let store = Self {
+            root,
+            _lock: lock,
+            answer_review_lock: Mutex::new(()),
+            answer_summaries: Mutex::new(BTreeMap::new()),
+        };
         for mut run in store.runs()? {
             if run.status == RunStatus::Running {
                 run.status = RunStatus::Interrupted;
@@ -56,6 +69,21 @@ impl Store {
                     Some("Server stopped before the run completed; partial CSV is retained".into());
                 run.finished_at_ms = Some(crate::trials::now_ms());
                 store.save_run(&run)?;
+            }
+        }
+        for id in ids_in(&store.root.join("answer-runs"))? {
+            let mut run = store.answer_run(id)?;
+            if run.summary.status == RunStatus::Running {
+                run.summary.status = RunStatus::Interrupted;
+                run.summary.error = Some("Server stopped before answer generation completed; partial answers are retained".into());
+                run.summary.finished_at_ms = Some(crate::trials::now_ms());
+                store.save_answer_run(&run)?;
+            } else {
+                store
+                    .answer_summaries
+                    .lock()
+                    .map_err(|_| Error("Answer summaries are unavailable".into()))?
+                    .insert(id, run.summary);
             }
         }
         Ok(store)
@@ -135,6 +163,67 @@ impl Store {
 
     pub fn scores(&self, id: Uuid) -> Result<Vec<u8>> {
         Ok(fs::read(self.scores_path(id))?)
+    }
+
+    pub fn create_answer_run(&self, run: &AnswerRun) -> Result<()> {
+        let mut summaries = self
+            .answer_summaries
+            .lock()
+            .map_err(|_| Error("Answer summaries are unavailable".into()))?;
+        let parent = self.root.join("answer-runs");
+        let stage = tempfile::tempdir_in(&parent)?;
+        atomic_json(&stage.path().join("run.json"), run)?;
+        fs::rename(stage.path(), parent.join(run.summary.id.to_string()))?;
+        summaries.insert(run.summary.id, run.summary.clone());
+        Ok(())
+    }
+
+    pub fn save_answer_run(&self, run: &AnswerRun) -> Result<()> {
+        let mut summaries = self
+            .answer_summaries
+            .lock()
+            .map_err(|_| Error("Answer summaries are unavailable".into()))?;
+        atomic_json(&self.answer_run_path(run.summary.id), run)?;
+        summaries.insert(run.summary.id, run.summary.clone());
+        Ok(())
+    }
+
+    pub fn answer_run(&self, id: Uuid) -> Result<AnswerRun> {
+        read_json(&self.answer_run_path(id))
+    }
+
+    pub fn answer_runs(&self) -> Result<Vec<AnswerRunSummary>> {
+        Ok(self
+            .answer_summaries
+            .lock()
+            .map_err(|_| Error("Answer summaries are unavailable".into()))?
+            .values()
+            .cloned()
+            .collect())
+    }
+
+    pub fn review_answer(
+        &self,
+        id: Uuid,
+        case_id: &str,
+        review: AnswerReviewRequest,
+    ) -> std::result::Result<AnswerRun, ReviewFailure> {
+        // Terminal-only reviews cannot race generation. Serialize concurrent reviewers so each
+        // read/modify/atomic-write retains the other case's latest saved review.
+        let _guard = self.answer_review_lock.lock().map_err(|_| {
+            ReviewFailure::Storage(Error("Answer review storage is unavailable".into()))
+        })?;
+        let mut run = self.answer_run(id).map_err(|_| ReviewFailure::NotFound)?;
+        run.review(case_id, review)?;
+        self.save_answer_run(&run).map_err(ReviewFailure::Storage)?;
+        Ok(run)
+    }
+
+    fn answer_run_path(&self, id: Uuid) -> PathBuf {
+        self.root
+            .join("answer-runs")
+            .join(id.to_string())
+            .join("run.json")
     }
 
     fn benchmark_path(&self, id: Uuid) -> PathBuf {

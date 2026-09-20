@@ -3,7 +3,7 @@
 The dashboard reads the existing Rust HTTP API in `apps/backend`. All UI, API
 contracts, styling, and the Genesis SDK adapter belong to this submodule. Genesis
 only discovers the module, displays it, and supplies generic development proxy
-support. The results table is the first content in the dashboard. Benchmark
+support. The results table is the first content in each dashboard tab: Retrieval and Generated answers. Benchmark
 definitions live in Git-managed [`apps/backend/benchmarks.yaml`](../backend/benchmarks.yaml),
 starting with RAGTruth QA; the frontend does not create or edit them.
 
@@ -64,7 +64,41 @@ should apply. Existing snapshots preserve their original configuration. The
 dashboard lists saved snapshots and runs; it does not fetch or manage the catalog,
 load datasets, launch Nebula, choose models, or change the architecture.
 
-## Reading results
+## Generated answers
+
+The **Generated answers** tab records an architecture label together with the
+embedding model ID/revision and generation profile reported by the configured
+Nebula runtime. Model choices come from that runtime; the UI does not configure
+providers, credentials, or arbitrary models. The current Nebula query path uses
+top-k 8. The benchmark backend isolates each question in a fresh conversation and
+persists the answer, evidence, citations, model receipt and outcome.
+
+Enable remote generation in your separately configured Nebula process as described
+in the backend README, then start a pairing against a prepared snapshot. The tab
+shows unavailable runtimes honestly and still displays saved results. Retrieval
+and answer generation share the server's single active-run limit. Starting a run
+can incur charges through the configured model provider.
+
+Select **Answers & review** after a run stops. Read each question, generated answer,
+evidence and citation map, then explicitly assess correctness, groundedness,
+hallucination presence and citation accuracy. Supply a reviewer name; notes are
+optional. A saved review can be replaced. These are **human review v1** judgements,
+not an automatic model-judge evaluation. Correctness, groundedness and citation
+accuracy show the fraction of reviewed answers marked as passing; hallucinations
+show the fraction marked present, so lower is better.
+
+Unreviewed scores stay blank. Answer coverage and review coverage remain visible;
+refusals, evidence-only responses and failures are not assigned fabricated scores.
+Only completed runs with every case answered and reviewed can use Compare setup.
+Comparisons require the same snapshot fingerprint, top-k, evaluator version and
+candidate source set. Architecture and model pairings may vary. Partial runs can
+still be inspected, reviewed where answers exist, and exported as CSV.
+
+The selected tab and each tab's filters survive Genesis navigation. Switching tabs
+aborts its pending UI requests and stops polling; already accepted backend runs
+continue. The dashboard never automatically retries generation or review writes.
+
+## Reading retrieval results
 
 The current evaluator is `paired_context_recovery_v1`. It measures recovery of the
 supplied context, **not general answer quality or hallucination detection**. Columns
@@ -95,6 +129,6 @@ pnpm --filter @genesis/benchmarking build
 ```
 
 Tests exercise the Rust response shapes, HTTP errors and request bodies, polling,
-partial and incompatible results, run creation, CSV, and Node-only proxy
+partial and incompatible results, both run types, human review, tab restoration, CSV, and Node-only proxy
 configuration. The Genesis host has a real registry/loader/navigation test using
 backend-shaped responses. No tests require external model calls or dataset downloads.
