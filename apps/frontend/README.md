@@ -61,8 +61,12 @@ serving that static build separately requires an equivalent local proxy.
 Manage benchmark definitions and defaults in YAML through Git. Restart the backend
 after edits, then prepare a new snapshot using its HTTP API when those changes
 should apply. Existing snapshots preserve their original configuration. The
-dashboard lists saved snapshots and runs; it does not fetch or manage the catalog,
-load datasets, launch Nebula, choose models, or change the architecture.
+dashboard shows the YAML catalog below the results table in both tabs, including
+unprepared benchmarks and suites that still need an evaluation integration. Catalog
+rows show dataset links, preparation guidance and prepared snapshot counts. Open a
+supported snapshot in Generated answers directly from its row. The catalog is read-only: the
+dashboard does not edit definitions, load datasets, launch Nebula, choose models, or change
+the architecture. Catalog connection errors leave saved results available.
 
 ## Generated answers
 

@@ -14,6 +14,12 @@ pub struct Catalog {
 #[serde(deny_unknown_fields)]
 pub struct BenchmarkDefinition {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub homepage: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation: Option<String>,
     pub source: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_sha256: Option<String>,
@@ -28,6 +34,8 @@ pub struct BenchmarkDefinition {
 pub enum Adapter {
     RagtruthQa,
     HotpotqaDistractor,
+    /// Catalog registration only; loading requires a dataset-specific integration.
+    ExternalSuite,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -35,6 +43,7 @@ pub enum Adapter {
 pub enum Evaluation {
     PairedContextRecoveryV1,
     HotpotqaAnswerV1,
+    ExternalEvaluation,
 }
 
 impl Evaluation {
@@ -42,6 +51,7 @@ impl Evaluation {
         match self {
             Self::PairedContextRecoveryV1 => "paired_context_recovery_v1",
             Self::HotpotqaAnswerV1 => "hotpotqa_answer_v1",
+            Self::ExternalEvaluation => "external_evaluation",
         }
     }
 }
@@ -137,6 +147,19 @@ impl BenchmarkDefinition {
         if self.name.trim().is_empty() || self.source.trim().is_empty() {
             return Err(Error("name and source must not be empty".into()));
         }
+        for (name, value) in [
+            ("description", &self.description),
+            ("preparation", &self.preparation),
+        ] {
+            if let Some(value) = value
+                && (value.trim().is_empty() || value.len() > 2_000)
+            {
+                return Err(Error(format!("{name} must contain 1–2000 bytes")));
+            }
+        }
+        if let Some(homepage) = &self.homepage {
+            public_url(homepage)?;
+        }
         match (self.adapter, self.evaluation) {
             (Adapter::RagtruthQa, Evaluation::PairedContextRecoveryV1) => {
                 if !["train", "test"].contains(&self.split.as_str()) {
@@ -173,6 +196,22 @@ impl BenchmarkDefinition {
                     }
                 }
             }
+            (Adapter::ExternalSuite, Evaluation::ExternalEvaluation) => {
+                public_url(&self.source)?;
+                if self.preparation.is_none() {
+                    return Err(Error(
+                        "External suites must explain their preparation requirements".into(),
+                    ));
+                }
+                if self.source_sha256.is_some() {
+                    return Err(Error("External suite sources identify the publisher, not a loadable dataset file".into()));
+                }
+                if self.split.trim().is_empty() || self.split.len() > 128 {
+                    return Err(Error(
+                        "External suite split must contain 1–128 bytes".into(),
+                    ));
+                }
+            }
             _ => return Err(Error("Adapter and evaluation do not match".into())),
         }
         if !(1..=10_000).contains(&self.defaults.limit) {
@@ -185,4 +224,21 @@ impl BenchmarkDefinition {
         }
         Ok(())
     }
+}
+
+fn public_url(value: &str) -> Result<()> {
+    let url = reqwest::Url::parse(value)
+        .map_err(|_| Error("Catalog links must be public HTTP(S) URLs".into()))?;
+    if !["http", "https"].contains(&url.scheme())
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+    {
+        return Err(Error(
+            "Catalog links must be public HTTP(S) URLs without credentials or query parameters"
+                .into(),
+        ));
+    }
+    Ok(())
 }

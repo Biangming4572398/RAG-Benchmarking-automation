@@ -6,6 +6,9 @@ export interface BenchmarkDefinition {
   adapter: string;
   evaluation: string;
   defaults: { limit: number; top_k: number };
+  description?: string;
+  homepage?: string;
+  preparation?: string;
 }
 
 export interface Catalog {
@@ -130,6 +133,9 @@ function isDefinition(value: unknown): value is BenchmarkDefinition {
   return (
     isRecord(value) &&
     hasStrings(value, ['name', 'source', 'split', 'adapter', 'evaluation']) &&
+    ['description', 'homepage', 'preparation'].every(
+      (key) => value[key] === undefined || isText(value[key]),
+    ) &&
     isRecord(value.defaults) &&
     isCount(value.defaults.limit) &&
     value.defaults.limit >= 1 &&

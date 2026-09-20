@@ -75,6 +75,15 @@ pub fn load_benchmarks(request: &ResolvedBenchmark) -> Result<Benchmark> {
     match request.definition.adapter {
         Adapter::RagtruthQa => load_ragtruth(request),
         Adapter::HotpotqaDistractor => crate::hotpotqa::load(request),
+        Adapter::ExternalSuite => Err(Error(format!(
+            "{} is registered in the catalog but its dataset loader and evaluator are not integrated. {}",
+            request.definition.name,
+            request
+                .definition
+                .preparation
+                .as_deref()
+                .unwrap_or_default(),
+        ))),
     }
 }
 

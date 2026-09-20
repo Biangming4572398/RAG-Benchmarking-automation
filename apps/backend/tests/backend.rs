@@ -343,6 +343,17 @@ async fn api_loads_runs_scores_and_reopens_without_a_database() {
         .await
         .unwrap();
     assert_eq!(catalog["benchmarks"]["ragtruth-qa"]["defaults"]["top_k"], 1);
+    assert_eq!(catalog["benchmarks"].as_object().unwrap().len(), 8);
+    assert_eq!(catalog["benchmarks"]["qasper"]["adapter"], "external_suite");
+    let external = client
+        .post(format!("{base}/benchmarks"))
+        .json(&json!({"benchmark":"qasper"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(external.status(), StatusCode::BAD_REQUEST);
+    let error: Value = external.json().await.unwrap();
+    assert!(error["error"].as_str().unwrap().contains("not integrated"));
     let invalid = client
         .post(format!("{base}/benchmarks"))
         .json(&json!({"benchmark":"unknown"}))

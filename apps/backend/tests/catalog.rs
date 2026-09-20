@@ -111,3 +111,70 @@ fn local_sources_are_relative_to_the_catalog_file() {
         dir.path().join("fixtures/test.parquet")
     );
 }
+
+#[test]
+fn external_suites_are_visible_once_but_cannot_be_loaded_as_supported_benchmarks() {
+    let catalog = Catalog::from_yaml(YAML).unwrap();
+    assert_eq!(catalog.benchmarks.len(), 8);
+    for key in [
+        "longmemeval-cleaned",
+        "temprageval",
+        "qasper",
+        "abstentionbench",
+        "multihop-rag",
+        "ragbench",
+    ] {
+        let resolved = catalog
+            .resolve(&LoadRequest {
+                benchmark: key.into(),
+                limit: None,
+            })
+            .unwrap();
+        assert!(resolved.definition.homepage.is_some());
+        assert!(resolved.definition.description.is_some());
+        assert!(resolved.definition.preparation.is_some());
+        assert_eq!(
+            resolved.definition.evaluation.metric_kind(),
+            "external_evaluation"
+        );
+        let error = match backend::load_benchmarks::load_benchmarks(&resolved) {
+            Ok(_) => panic!("External suite became a runnable snapshot"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("not integrated"));
+        assert!(
+            error
+                .to_string()
+                .contains(resolved.definition.preparation.as_deref().unwrap())
+        );
+    }
+}
+
+#[test]
+fn external_catalog_metadata_and_evaluation_pairs_are_validated() {
+    let catalog = Catalog::from_yaml(YAML).unwrap();
+    let original = &catalog.benchmarks["qasper"];
+    let mut definition = original.clone();
+    definition.preparation = None;
+    assert!(definition.validate().is_err());
+    definition = original.clone();
+    definition.evaluation = backend::catalog::Evaluation::HotpotqaAnswerV1;
+    assert!(definition.validate().is_err());
+    for url in [
+        "javascript:alert(1)",
+        "https://name:secret@example.org",
+        "https://example.org?token=secret",
+    ] {
+        definition = original.clone();
+        definition.homepage = Some(url.into());
+        assert!(definition.validate().is_err());
+        definition = original.clone();
+        definition.source = url.into();
+        assert!(definition.validate().is_err());
+    }
+    for description in ["".into(), "x".repeat(2001)] {
+        definition = original.clone();
+        definition.description = Some(description);
+        assert!(definition.validate().is_err());
+    }
+}

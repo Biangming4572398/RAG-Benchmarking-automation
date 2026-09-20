@@ -1,6 +1,8 @@
 benchmarks:
   ragtruth-qa:
     name: RAGTruth QA
+    description: Paired-context retrieval and human review of newly generated answers.
+    homepage: "https://github.com/ParticleMedia/RAGTruth"
     source: "hf://datasets/wandb/RAGTruth-processed/data/{split}-*.parquet"
     split: test
     adapter: ragtruth_qa
@@ -10,12 +12,86 @@ benchmarks:
       top_k: 8
   hotpotqa:
     name: HotpotQA (distractor dev)
+    description: Multi-hop questions over supplied candidate passages, scored with answer exact match and token F1.
+    homepage: "https://hotpotqa.github.io/"
     # Byte-identical mirror of the authors' official development distractor JSON.
     source: "https://huggingface.co/datasets/RAGLAB/data/resolve/c33b09b7fa5099b89830e84f9bdff78329268d9b/eval_datasets/HotPotQA/hotpot_dev_distractor_v1.json"
     source_sha256: "4e9ecb5c8d3b719f624d66b60f8d56bf227f03914f5f0753d6fa1b359d7104ea"
     split: dev
     adapter: hotpotqa_distractor
     evaluation: hotpotqa_answer_v1
+    defaults:
+      limit: 100
+      top_k: 8
+  longmemeval-cleaned:
+    name: LongMemEval — cleaned
+    description: Long-term conversational memory, including updates, temporal reasoning and abstention. Uses the official S-cleaned variant.
+    homepage: "https://github.com/xiaowu0162/LongMemEval"
+    source: "https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned"
+    split: longmemeval_s_cleaned
+    adapter: external_suite
+    evaluation: external_evaluation
+    preparation: Integrate the cleaned session-history loader and question-type judge; preserve session dates and isolate each question's history. Official scoring is not implemented here.
+    defaults:
+      limit: 100
+      top_k: 8
+  temprageval:
+    name: TempRAGEval
+    description: Time-sensitive question answering with temporal evidence constraints.
+    homepage: "https://github.com/siyue-zhang/MRAG"
+    source: "https://huggingface.co/datasets/siyue/TempRAGEval"
+    split: test
+    adapter: external_suite
+    evaluation: external_evaluation
+    preparation: Accept the publisher's dataset-access terms, prepare the associated Wikipedia corpus, and integrate temporal retrieval and answer evaluation. Gold evidence alone is not the retrieval corpus.
+    defaults:
+      limit: 100
+      top_k: 8
+  qasper:
+    name: QASPER
+    description: Scientific-paper questions with extractive, free-form, yes/no and unanswerable answers.
+    homepage: "https://allenai.org/data/qasper"
+    source: "https://huggingface.co/datasets/allenai/qasper"
+    split: test
+    adapter: external_suite
+    evaluation: external_evaluation
+    preparation: Integrate paper-text loading and the multiple-reference answer/evidence evaluator, including unanswerable questions. Reference annotations must stay outside the indexed paper text.
+    defaults:
+      limit: 100
+      top_k: 8
+  abstentionbench:
+    name: AbstentionBench
+    description: Answer-versus-abstain behavior across answerable, underspecified and unanswerable questions.
+    homepage: "https://github.com/facebookresearch/AbstentionBench"
+    source: "https://huggingface.co/datasets/facebook/AbstentionBench"
+    split: suite
+    adapter: external_suite
+    evaluation: external_evaluation
+    preparation: Select and prepare the component datasets, then integrate abstention detection and correctness judging. Many tasks have no retrieval corpus; a refused answer cannot automatically be scored as a failure.
+    defaults:
+      limit: 100
+      top_k: 8
+  multihop-rag:
+    name: MultiHop-RAG
+    description: Questions requiring evidence from multiple news documents, with retrieval and answer evaluation.
+    homepage: "https://github.com/yixuantt/MultiHop-RAG"
+    source: "https://huggingface.co/datasets/yixuantt/MultiHopRAG"
+    split: train
+    adapter: external_suite
+    evaluation: external_evaluation
+    preparation: Load the question set and separate news corpus, then integrate multi-evidence retrieval and answer scoring. Keep supporting-document labels separate from candidate documents.
+    defaults:
+      limit: 100
+      top_k: 8
+  ragbench:
+    name: RAGBench
+    description: RAG evaluation across multiple domains with response-level TRACe annotations.
+    homepage: "https://github.com/rungalileo/ragbench"
+    source: "https://huggingface.co/datasets/galileo-ai/ragbench"
+    split: test
+    adapter: external_suite
+    evaluation: external_evaluation
+    preparation: Select dataset subsets and integrate fresh response evaluation. Published response annotations describe historical outputs and cannot be reused as scores for new Kimi answers.
     defaults:
       limit: 100
       top_k: 8

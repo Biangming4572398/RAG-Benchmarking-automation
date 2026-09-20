@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { BenchmarkCatalog } from './benchmark-catalog';
 import type { BenchmarkApi, BenchmarkInfo, BenchmarkRun } from './benchmark-api';
 import {
   answerComparabilityKey,
@@ -90,6 +91,7 @@ export function AnswerDashboard({
   const [selectedCaseId, setSelectedCaseId] = useState('');
   const operation = useRef<AbortController | null>(null);
   const detailElement = useRef<HTMLElement | null>(null);
+  const runForm = useRef<HTMLFormElement | null>(null);
   useEffect(() => () => operation.current?.abort(), []);
   useEffect(() => onStateChange?.(state), [state, onStateChange]);
   const load = useCallback(
@@ -527,6 +529,15 @@ export function AnswerDashboard({
           </p>
         )}
       </section>
+      <BenchmarkCatalog
+        api={benchmarkApi}
+        snapshots={benchmarks}
+        pollInterval={pollInterval}
+        onOpenAnswers={(benchmarkId) => {
+          update({ benchmarkId });
+          runForm.current?.scrollIntoView?.({ block: 'start', behavior: 'smooth' });
+        }}
+      />
       {workspace.error && (
         <p className={styles.error} role="alert">
           {workspace.error}
@@ -546,6 +557,7 @@ export function AnswerDashboard({
       <form
         className={`${styles.panel} ${styles.setup}`}
         aria-label="Start answer run"
+        ref={runForm}
         onSubmit={start}
       >
         <div className={styles.panelHeading}>

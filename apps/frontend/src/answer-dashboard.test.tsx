@@ -178,7 +178,7 @@ function setup(runs: AnswerRunSummary[] = []) {
       .mockResolvedValue(new Blob(['csv'], { type: 'text/csv' })),
   };
   const benchmarkApi = {
-    getCatalog: vi.fn<BenchmarkApi['getCatalog']>(),
+    getCatalog: vi.fn<BenchmarkApi['getCatalog']>().mockResolvedValue({ benchmarks: {} }),
     listBenchmarks: vi.fn<BenchmarkApi['listBenchmarks']>().mockResolvedValue([benchmark]),
     listRuns: vi.fn<BenchmarkApi['listRuns']>().mockResolvedValue([]),
     getBenchmark: vi.fn<BenchmarkApi['getBenchmark']>(),
@@ -344,7 +344,7 @@ describe('Generated answer dashboard', () => {
     expect(api.startRun.mock.calls[0][0]).not.toHaveProperty('top_k');
     expect(api.startRun.mock.calls[0][0]).not.toHaveProperty('token');
     expect(benchmarkApi.loadBenchmark).not.toHaveBeenCalled();
-    expect(benchmarkApi.getCatalog).not.toHaveBeenCalled();
+    expect(benchmarkApi.getCatalog).toHaveBeenCalled();
   });
 
   it('shows automatic scores over all HotpotQA cases before optional human review and keeps reference answers separate', async () => {
@@ -375,7 +375,9 @@ describe('Generated answer dashboard', () => {
     const user = userEvent.setup();
     render(<AnswerDashboard api={api} benchmarkApi={benchmarkApi} />);
     await connected();
-    const table = within(screen.getByRole('table'));
+    const table = within(
+      screen.getByRole('table', { name: /Generated answer quality by architecture/ }),
+    );
     expect(table.getByRole('columnheader', { name: 'Answer EM' })).toBeVisible();
     expect(table.getByRole('columnheader', { name: 'Answer F1' })).toBeVisible();
     const row = within(table.getByRole('row', { name: /Hotpot baseline/ }));
@@ -430,7 +432,9 @@ describe('Generated answer dashboard', () => {
       screen.queryByRole('button', { name: 'Compare answer setup for hotpot-p' }),
     ).not.toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: 'Compare answer setup for hotpot-b' }));
-    const table = within(screen.getByRole('table'));
+    const table = within(
+      screen.getByRole('table', { name: /Generated answer quality by architecture/ }),
+    );
     expect(table.getAllByRole('row')).toHaveLength(3);
     const candidateRow = within(table.getByRole('row', { name: /Hotpot candidate/ }));
     for (const cell of candidateRow.getAllByRole('cell', { name: '100.0% 2 / 2 scored' })) {
@@ -526,7 +530,9 @@ describe('Generated answer dashboard', () => {
       screen.queryByRole('button', { name: 'Compare answer setup for partial-' }),
     ).not.toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: 'Compare answer setup for baseline' }));
-    const table = within(screen.getByRole('table'));
+    const table = within(
+      screen.getByRole('table', { name: /Generated answer quality by architecture/ }),
+    );
     expect(table.getAllByRole('row')).toHaveLength(3);
     const candidateRow = within(table.getByRole('row', { name: /Hybrid candidate/ }));
     expect(candidateRow.getByRole('cell', { name: '0.0%' })).toHaveAttribute('data-best', 'true');
@@ -805,7 +811,11 @@ describe('Generated answer dashboard', () => {
     const user = userEvent.setup();
     render(<AnswerDashboard api={api} benchmarkApi={benchmarkApi} />);
     await connected();
-    expect(within(screen.getByRole('table')).getAllByRole('row')).toHaveLength(26);
+    expect(
+      within(
+        screen.getByRole('table', { name: /Generated answer quality by architecture/ }),
+      ).getAllByRole('row'),
+    ).toHaveLength(26);
     expect(screen.queryByText('Architecture 26')).not.toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: 'Next' }));
     expect(screen.getByText('Page 2 of 2')).toBeVisible();

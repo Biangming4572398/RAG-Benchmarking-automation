@@ -115,7 +115,7 @@ describe('Live benchmarking dashboard', () => {
     const user = userEvent.setup();
     render(<BenchmarkDashboard api={api} />);
     await connected();
-    const table = within(screen.getByRole('table'));
+    const table = within(screen.getByRole('table', { name: /Benchmark results by architecture/ }));
     expect(table.getByText('Hybrid retrieval')).toBeVisible();
     expect(table.getByText('0.900')).toBeVisible();
     expect(table.getByText('Partial results')).toBeVisible();
@@ -132,6 +132,21 @@ describe('Live benchmarking dashboard', () => {
     expect(table.getAllByRole('row')).toHaveLength(5);
   });
 
+  it('keeps saved results and run setup available if only the catalog request fails', async () => {
+    const api = apiWith([run()]);
+    api.getCatalog.mockRejectedValue(new Error('Catalog unavailable'));
+    render(<BenchmarkDashboard api={api} />);
+    await connected();
+    expect(
+      screen.getByRole('table', { name: /Benchmark results by architecture/ }),
+    ).toHaveTextContent('Dense baseline');
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Could not refresh the benchmark catalog',
+    );
+    expect(screen.getByRole('button', { name: 'Start run' })).toBeEnabled();
+    expect(api.loadBenchmark).not.toHaveBeenCalled();
+  });
+
   it('uses saved RAGTruth defaults without managing benchmark definitions or loading snapshots', async () => {
     const user = userEvent.setup();
     const api = apiWith();
@@ -144,7 +159,7 @@ describe('Live benchmarking dashboard', () => {
     expect(screen.getByRole('main').firstElementChild).toBe(
       screen.getByRole('region', { name: 'Benchmark results' }),
     );
-    expect(api.getCatalog).not.toHaveBeenCalled();
+    expect(api.getCatalog).toHaveBeenCalled();
     expect(api.loadBenchmark).not.toHaveBeenCalled();
     await user.type(screen.getByLabelText('Architecture label'), 'Hybrid retrieval');
     await user.click(screen.getByRole('button', { name: 'Start run' }));
@@ -218,10 +233,14 @@ describe('Live benchmarking dashboard', () => {
     ]);
     render(<BenchmarkDashboard api={api} />);
     await connected();
-    expect(within(screen.getByRole('table')).getByText('Team evaluation')).toBeVisible();
+    expect(
+      within(screen.getByRole('table', { name: /Benchmark results by architecture/ })).getByText(
+        'Team evaluation',
+      ),
+    ).toBeVisible();
     expect(screen.getByLabelText('Loaded snapshot')).toHaveValue(benchmark.id);
     expect(screen.getByRole('option', { name: /Team evaluation/ })).toBeInTheDocument();
-    expect(api.getCatalog).not.toHaveBeenCalled();
+    expect(api.getCatalog).toHaveBeenCalled();
   });
 
   it('shows active progress, updates it by polling, and aborts requests when closed', async () => {
@@ -262,13 +281,17 @@ describe('Live benchmarking dashboard', () => {
     expect(screen.getByRole('button', { name: 'Start run' })).toBeDisabled();
     await user.click(screen.getByRole('button', { name: 'Refresh' }));
     await connected();
-    expect(screen.getByRole('table')).toHaveTextContent('Dense baseline');
+    expect(
+      screen.getByRole('table', { name: /Benchmark results by architecture/ }),
+    ).toHaveTextContent('Dense baseline');
     api.listRuns.mockRejectedValueOnce(new Error('Server unavailable'));
     await user.click(screen.getByRole('button', { name: 'Refresh' }));
     expect(await screen.findByRole('alert')).toHaveTextContent(
       'Previously loaded results remain visible',
     );
-    expect(screen.getByRole('table')).toHaveTextContent('Dense baseline');
+    expect(
+      screen.getByRole('table', { name: /Benchmark results by architecture/ }),
+    ).toHaveTextContent('Dense baseline');
     expect(screen.getByRole('button', { name: 'Start run' })).toBeDisabled();
   });
 
@@ -291,7 +314,11 @@ describe('Live benchmarking dashboard', () => {
     api.downloadScores.mockRejectedValueOnce(new ApiError('This run produced no CSV rows', 404));
     render(<BenchmarkDashboard api={api} />);
     await connected();
-    expect(within(screen.getByRole('table')).getAllByText('0.000')).toHaveLength(3);
+    expect(
+      within(screen.getByRole('table', { name: /Benchmark results by architecture/ })).getAllByText(
+        '0.000',
+      ),
+    ).toHaveLength(3);
     const downloadButton = screen.getByRole('button', { name: 'Download CSV for run-firs' });
     expect(downloadButton).toBeEnabled();
     await user.click(downloadButton);
@@ -361,14 +388,26 @@ describe('Live benchmarking dashboard', () => {
       />,
     );
     await connected();
-    expect(within(screen.getByRole('table')).getAllByRole('row')).toHaveLength(26);
+    expect(
+      within(screen.getByRole('table', { name: /Benchmark results by architecture/ })).getAllByRole(
+        'row',
+      ),
+    ).toHaveLength(26);
     await user.click(screen.getByRole('button', { name: 'Next' }));
-    expect(within(screen.getByRole('table')).getAllByRole('row')).toHaveLength(7);
+    expect(
+      within(screen.getByRole('table', { name: /Benchmark results by architecture/ })).getAllByRole(
+        'row',
+      ),
+    ).toHaveLength(7);
     await user.type(
       screen.getByRole('searchbox', { name: 'Search benchmarks' }),
       'Architecture 30',
     );
-    expect(within(screen.getByRole('table')).getAllByRole('row')).toHaveLength(2);
+    expect(
+      within(screen.getByRole('table', { name: /Benchmark results by architecture/ })).getAllByRole(
+        'row',
+      ),
+    ).toHaveLength(2);
     expect(onStateChange).toHaveBeenLastCalledWith(
       expect.objectContaining({ query: 'Architecture 30', status: 'completed' }),
     );

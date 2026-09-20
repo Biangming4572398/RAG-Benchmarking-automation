@@ -10,7 +10,7 @@ import type { AnswerApi } from './answer-api';
 
 function setup() {
   const api = {
-    getCatalog: vi.fn<BenchmarkApi['getCatalog']>(),
+    getCatalog: vi.fn<BenchmarkApi['getCatalog']>().mockResolvedValue({ benchmarks: {} }),
     listBenchmarks: vi.fn<BenchmarkApi['listBenchmarks']>().mockResolvedValue([]),
     listRuns: vi.fn<BenchmarkApi['listRuns']>().mockResolvedValue([]),
     getBenchmark: vi.fn<BenchmarkApi['getBenchmark']>(),
@@ -90,6 +90,46 @@ describe('Benchmark evaluation tabs', () => {
       'Saved filter',
     );
     expect(screen.getByText('HotpotQA EM/F1 v1')).toBeVisible();
+    expect(api.startRun).not.toHaveBeenCalled();
+    expect(answerApi.startRun).not.toHaveBeenCalled();
+  });
+
+  it('shows unprepared YAML entries below the results in both tabs without loading or running them', async () => {
+    const { api, answerApi } = setup();
+    api.getCatalog.mockResolvedValue({
+      benchmarks: {
+        pending: {
+          name: 'Pending team evaluation',
+          source: 'https://example.org/dataset',
+          split: 'test',
+          adapter: 'external_suite',
+          evaluation: 'external_evaluation',
+          defaults: { limit: 100, top_k: 8 },
+          description: 'A team-configured evaluation suite.',
+          preparation: 'Integrate its dataset-specific judging protocol.',
+        },
+      },
+    });
+    const user = userEvent.setup();
+    render(<BenchmarkDashboard api={api} answerApi={answerApi} />);
+    expect(await screen.findByText('Pending team evaluation')).toBeVisible();
+    expect(screen.getByText('Integration required')).toBeVisible();
+    expect(screen.getByRole('main').firstElementChild).toBe(
+      screen.getByRole('region', { name: 'Benchmark results' }),
+    );
+    expect(screen.getByRole('main').children[1]).toBe(
+      screen.getByRole('region', { name: 'Configured benchmarks' }),
+    );
+    await user.click(screen.getByRole('tab', { name: 'Generated answers' }));
+    expect(await screen.findByText('Pending team evaluation')).toBeVisible();
+    expect(screen.getByText('Dataset-specific evaluation')).toBeVisible();
+    expect(screen.getByRole('main').firstElementChild).toBe(
+      screen.getByRole('region', { name: 'Generated answer results' }),
+    );
+    expect(screen.getByRole('main').children[1]).toBe(
+      screen.getByRole('region', { name: 'Configured benchmarks' }),
+    );
+    expect(api.loadBenchmark).not.toHaveBeenCalled();
     expect(api.startRun).not.toHaveBeenCalled();
     expect(answerApi.startRun).not.toHaveBeenCalled();
   });

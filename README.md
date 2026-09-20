@@ -10,7 +10,13 @@ Generated answers tab runs the configured Nebula generation profile, scores
 HotpotQA answers automatically, and records explicit human reviews of answer quality.
 Benchmark definitions are managed through Git in
 [`apps/backend/benchmarks.yaml`](apps/backend/benchmarks.yaml), including
-RAGTruth QA and HotpotQA. Prepare snapshots with the HTTP API as described below; their saved
+RAGTruth QA, HotpotQA, LongMemEval — cleaned, TempRAGEval, QASPER,
+AbstentionBench, MultiHop-RAG and RAGBench. The read-only catalog appears below
+the results in both tabs, including entries that have no prepared snapshot.
+RAGTruth and HotpotQA have working loaders and evaluators; the six newly registered
+suites are explicitly marked **Integration required**, with their setup requirements
+and publisher links. Registering a suite does not make it runnable or produce scores.
+Prepare supported snapshots with the HTTP API as described below; their saved
 names appear in the dashboard automatically. Its UI, API client, and standalone
 proxy live inside this submodule.
 
@@ -93,6 +99,22 @@ settings. Supported adapter/evaluator pairs are `ragtruth_qa` /
 `hotpotqa_answer_v1` for generated-answer exact match and token F1.
 A dataset with another schema needs an adapter in code.
 Credentials, server addresses, and storage paths remain environment settings.
+
+Catalog-only suites use `adapter: external_suite` and
+`evaluation: external_evaluation`. They require a `preparation` description and
+an HTTP(S) publisher `source`; optional `description` and `homepage` fields are
+also displayed. Loading one returns a clear error before downloading anything or
+creating a snapshot. Its defaults are intended preparation settings, not evidence
+that an evaluator is implemented. A working integration must replace this pair
+with a supported loader/evaluator and preserve the dataset's scoring semantics.
+
+The LongMemEval entry selects the authors' **S-cleaned** variant. TempRAGEval
+requires publisher-approved dataset access and its associated Wikipedia corpus.
+AbstentionBench needs abstention-aware evaluation; refusals are not automatically
+failures. RAGBench's historical response annotations must not be copied as scores
+for newly generated answers. Source references, variants, schemas and remaining
+integration work are recorded in
+[`docs/research/benchmark-catalog-expansion.md`](docs/research/benchmark-catalog-expansion.md).
 
 Loading saves the selected entry and effective `limit` into the immutable
 snapshot's `configuration`. A run without `top_k` uses that snapshot's saved

@@ -346,3 +346,32 @@ describe('comparable completed results', () => {
     expect(comparabilityKey(run(changes))).toBeNull();
   });
 });
+
+describe('catalog metadata', () => {
+  it('accepts optional description, homepage and preparation without changing saved definitions', async () => {
+    const enriched: Catalog = {
+      benchmarks: {
+        external: {
+          ...catalog.benchmarks['ragtruth-qa'],
+          adapter: 'external_suite',
+          evaluation: 'external_evaluation',
+          description: 'A future evaluation integration',
+          homepage: 'https://example.org/benchmark',
+          preparation: 'Prepare its original evaluation protocol.',
+        },
+      },
+    };
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse(enriched));
+    await expect(createBenchmarkApi(fetcher).getCatalog()).resolves.toEqual(enriched);
+  });
+  it.each(['description', 'homepage', 'preparation'])(
+    'rejects malformed optional %s metadata',
+    async (field) => {
+      const malformed = {
+        benchmarks: { suite: { ...catalog.benchmarks['ragtruth-qa'], [field]: 42 } },
+      };
+      const fetcher = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse(malformed));
+      await expect(createBenchmarkApi(fetcher).getCatalog()).rejects.toBeInstanceOf(ApiError);
+    },
+  );
+});
