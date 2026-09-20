@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use crate::{
     Error, Result,
-    answers::{AnswerReviewRequest, AnswerRun, AnswerRunSummary, ReviewFailure},
+    answers::{AnswerCase, AnswerReviewRequest, AnswerRun, AnswerRunSummary, ReviewFailure},
     catalog::ResolvedBenchmark,
     load_benchmarks::{Benchmark, digest},
     trials::{Run, RunStatus},
@@ -185,6 +185,25 @@ impl Store {
             .map_err(|_| Error("Answer summaries are unavailable".into()))?;
         atomic_json(&self.answer_run_path(run.summary.id), run)?;
         summaries.insert(run.summary.id, run.summary.clone());
+        Ok(())
+    }
+
+    pub fn append_answer_failure(&self, id: Uuid, case: &AnswerCase) -> Result<()> {
+        let Some(failure) = &case.failure else {
+            return Ok(());
+        };
+        let mut event = serde_json::to_value(failure)?;
+        let fields = event
+            .as_object_mut()
+            .expect("failure serializes as an object");
+        fields.insert("run_id".into(), serde_json::to_value(id)?);
+        fields.insert("case_id".into(), serde_json::to_value(&case.case_id)?);
+        fields.insert("latency_ms".into(), serde_json::to_value(case.latency_ms)?);
+        let path = self.answer_run_path(id).with_file_name("failures.jsonl");
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        serde_json::to_writer(&mut file, &event)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
         Ok(())
     }
 

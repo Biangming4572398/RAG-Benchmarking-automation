@@ -72,6 +72,10 @@ Nebula runtime. Model choices come from that runtime; the UI does not configure
 providers, credentials, or arbitrary models. The current Nebula query path uses
 top-k 8. The benchmark backend isolates each question in a fresh conversation and
 persists the answer, evidence, citations, model receipt and outcome.
+Requests are sent in batches of up to four; all responses must arrive before
+the next batch starts. Per-question request failures are recorded while the
+remaining questions continue. Fully attempted runs containing failures are
+shown as **finished with errors** and remain excluded from comparisons.
 
 Enable remote generation in your separately configured Nebula process as described
 in the backend README, then start a pairing against a prepared snapshot. The tab
@@ -97,6 +101,12 @@ optional. A saved review can be replaced. These are **human review v1** judgemen
 not an automatic model-judge evaluation. Correctness, groundedness and citation
 accuracy show the fraction of reviewed answers marked as passing; hallucinations
 show the fraction marked present, so lower is better.
+
+Failed questions show the request stage, HTTP status and safe provider diagnostics
+when available, including request size and output-token limit. **Download failure
+log** exports the recorded failures as JSONL without prompts or credentials.
+Historical failures remain visible; detailed metadata cannot be recovered for
+runs made before failure logging was added.
 
 Unreviewed human scores stay blank. Answer coverage and review coverage remain visible.
 Completed HotpotQA runs with every case processed can use Compare setup without

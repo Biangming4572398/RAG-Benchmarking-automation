@@ -155,8 +155,26 @@ strict `/query` endpoint, and retains the answer, evidence, claim lineage, model
 receipt, outcome and latency. Nebula currently fixes this endpoint's retrieval
 top-k to 8. The benchmark verifies source revisions, scope, watermark and model
 receipt throughout the run. Retrieval and answer generation share one active-run
-slot. A hard failure stops the run and retains earlier answers. Refusals and
-`evidence-only` responses are retained as separate outcomes.
+slot. Questions run in batches of at most four. Every request in the current
+batch must finish before the next batch starts. Each response is persisted as it
+arrives, with cases retained in benchmark order. Request failures are recorded
+per question and the remaining batches continue. A run that attempts all cases
+with some failures finishes with `status: failed`; the dashboard labels it
+“finished with errors.” Runtime/provenance changes and storage failures stop
+scheduling new batches. Refusals and `evidence-only` responses are retained as
+separate outcomes. Saved `max_in_flight` records the batch limit; older runs
+default to one.
+
+Each failed case records `failure` metadata: timestamp, request stage, HTTP
+status, stable error code and a safe message. Optional `provider_diagnostic`
+records Moonshot's upstream status/category, recognized error codes, request byte
+count, output-token limit, attempt and elapsed time. Provider free-text errors,
+prompts and credentials are excluded. The backend syncs each failure to
+`answer-runs/<run-id>/failures.jsonl`; the run JSON and CSV also retain the
+diagnostics. Open **Answers & review → Download failure log** for a JSONL export
+of recorded case failures. Older runs remain readable but cannot recover
+provider details that were never saved. Nebula additionally emits structured
+provider failure events to its backend log.
 
 HotpotQA runs use **`hotpotqa_answer_v1`**: exact match and token F1 with the
 [official normalization](https://github.com/hotpotqa/hotpot/blob/master/hotpot_evaluate_v1.py).

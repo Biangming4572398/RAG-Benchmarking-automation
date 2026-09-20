@@ -195,10 +195,123 @@ async function connected() {
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  vi.unstubAllGlobals();
   vi.useRealTimers();
 });
 
 describe('Generated answer dashboard', () => {
+  it('keeps the selected question stable when an earlier question finishes later', async () => {
+    const later = answer({ case_id: 'case-b', query: 'Second question' });
+    const running = detail({ total: 2, status: 'running', finished_at_ms: null, cases: [later] });
+    const { api, benchmarkApi } = setup([running]);
+    api.getRun.mockResolvedValue(running);
+    const user = userEvent.setup();
+    render(<AnswerDashboard api={api} benchmarkApi={benchmarkApi} pollInterval={60000} />);
+    await connected();
+    await user.click(screen.getByRole('button', { name: 'Review answers for baseline' }));
+    const panel = within(await screen.findByRole('region', { name: 'Answer run details' }));
+    await waitFor(() =>
+      expect(panel.getByRole('combobox', { name: 'Question' })).toHaveValue('case-b'),
+    );
+    const updated = { ...running, completed: 2, answered: 2, cases: [answer(), later] };
+    api.getRun.mockResolvedValue(updated);
+    api.listRuns.mockResolvedValue([updated]);
+    await user.click(screen.getByRole('button', { name: 'Refresh' }));
+    await waitFor(() =>
+      expect(
+        within(panel.getByRole('combobox', { name: 'Question' })).getAllByRole('option'),
+      ).toHaveLength(2),
+    );
+    expect(panel.getByRole('combobox', { name: 'Question' })).toHaveValue('case-b');
+    expect(panel.getByRole('heading', { name: 'Second question' })).toBeVisible();
+  });
+
+  it('shows fully processed failures and downloads their diagnostic log without restarting generation', async () => {
+    const failed = detail({
+      max_in_flight: 4,
+      total: 2,
+      status: 'failed',
+      completed: 1,
+      failed: 1,
+      answered: 1,
+      reviewed: 0,
+      means: null,
+      error: '1 question failed; all 2 questions were attempted.',
+      cases: [
+        answer({
+          status: 'error',
+          outcome: 'error',
+          answer: null,
+          review: null,
+          error: 'Nebula returned HTTP 422: reasoning_rejected',
+          failure: {
+            timestamp_ms: 1000,
+            operation: 'generate_answer',
+            http_status: 422,
+            code: 'reasoning_rejected',
+            message: 'The remote reasoning service rejected this grounded request.',
+            provider_diagnostic: {
+              provider: 'moonshot',
+              category: 'rejected',
+              upstreamStatus: 400,
+              upstreamCode: 'context_length_exceeded',
+              upstreamType: null,
+              requestBytes: 12800,
+              maxOutputTokens: 2048,
+              attempt: 1,
+              elapsedMs: 902,
+              responseTruncated: false,
+            },
+          },
+        }),
+        answer({ case_id: 'case-b', review: null }),
+      ],
+    });
+    const { api, benchmarkApi } = setup([failed]);
+    api.getRun.mockResolvedValue(failed);
+    const objectUrl = vi.fn().mockReturnValue('blob:failure-log');
+    vi.stubGlobal(
+      'URL',
+      class extends URL {
+        static createObjectURL = objectUrl;
+        static revokeObjectURL = vi.fn();
+      },
+    );
+    let downloadName = '';
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (
+      this: HTMLAnchorElement,
+    ) {
+      downloadName = this.download;
+    });
+    const user = userEvent.setup();
+    render(<AnswerDashboard api={api} benchmarkApi={benchmarkApi} />);
+    await connected();
+    expect(screen.getByText('finished with errors')).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Review answers for baseline' }));
+    const panel = within(await screen.findByRole('region', { name: 'Answer run details' }));
+    expect(panel.getByText(/Batches of up to 4 requests/)).toHaveTextContent('2 / 2 processed');
+    const diagnostics = within(panel.getByRole('region', { name: 'Failure details' }));
+    expect(diagnostics.getByText(/Request: 12,800 bytes/)).toBeVisible();
+    expect(diagnostics.getByText(/context_length_exceeded/)).toBeVisible();
+    await user.click(panel.getByRole('button', { name: 'Download failure log' }));
+    expect(click).toHaveBeenCalledOnce();
+    expect(downloadName).toBe('baseline-run-failures.jsonl');
+    const blob = objectUrl.mock.calls[0][0] as Blob;
+    const text = await new Promise<string>((resolve) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result));
+      reader.readAsText(blob);
+    });
+    expect(JSON.parse(text)).toMatchObject({
+      run_id: failed.id,
+      case_id: 'case-a',
+      http_status: 422,
+      provider_diagnostic: { requestBytes: 12800, upstreamCode: 'context_length_exceeded' },
+    });
+    expect(api.startRun).not.toHaveBeenCalled();
+    vi.unstubAllGlobals();
+  });
+
   it('starts only the selected saved snapshot, architecture label and enabled runtime profile', async () => {
     const user = userEvent.setup();
     const { api, benchmarkApi } = setup();

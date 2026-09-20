@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import type { BenchmarkApi, BenchmarkInfo, BenchmarkRun } from './benchmark-api';
 import {
   answerComparabilityKey,
+  answerFailureLog,
   type AnswerApi,
   type AnswerCase,
   type AnswerMeans,
@@ -62,6 +63,15 @@ function percent(value: number | undefined) {
   return value === undefined ? '—' : `${(value * 100).toFixed(1)}%`;
 }
 
+function saveDownload(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
 export function AnswerDashboard({
   api,
   benchmarkApi,
@@ -77,7 +87,7 @@ export function AnswerDashboard({
   const [notice, setNotice] = useState('');
   const [page, setPage] = useState(0);
   const [detail, setDetail] = useState<AnswerRun | null>(null);
-  const [caseIndex, setCaseIndex] = useState(0);
+  const [selectedCaseId, setSelectedCaseId] = useState('');
   const operation = useRef<AbortController | null>(null);
   const detailElement = useRef<HTMLElement | null>(null);
   useEffect(() => () => operation.current?.abort(), []);
@@ -161,7 +171,14 @@ export function AnswerDashboard({
       ),
     ]),
   );
-  const selectedCase = detail?.cases[Math.min(caseIndex, detail.cases.length - 1)];
+  const caseIndex = Math.max(
+    0,
+    detail?.cases.findIndex((item) => item.case_id === selectedCaseId) ?? 0,
+  );
+  const selectedCase = detail?.cases[caseIndex];
+  useEffect(() => {
+    if (!selectedCaseId && selectedCase) setSelectedCaseId(selectedCase.case_id);
+  }, [selectedCaseId, selectedCase?.case_id]);
   function update(patch: Partial<AnswerState>) {
     setState((current) => ({ ...current, ...patch }));
     setPage(0);
@@ -218,7 +235,7 @@ export function AnswerDashboard({
       const result = await api.getRun(run.id, signal);
       if (!signal.aborted) {
         setDetail(result);
-        setCaseIndex(0);
+        setSelectedCaseId(result.cases[0]?.case_id ?? '');
       }
     });
   }
@@ -226,12 +243,7 @@ export function AnswerDashboard({
     void perform('csv', async (signal) => {
       const blob = await api.downloadScores(run.id, signal);
       if (signal.aborted) return;
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = `${run.id}-answers.csv`;
-      link.click();
-      setTimeout(() => URL.revokeObjectURL(url), 0);
+      saveDownload(blob, `${run.id}-answers.csv`);
     });
   }
   return (
@@ -356,14 +368,16 @@ export function AnswerDashboard({
                         {run.automatic_scores && (
                           <small>
                             {run.scored ?? 0} / {run.total} scored
-                            {run.status !== 'completed' ? ' · partial run' : ''}
+                            {run.completed + run.failed < run.total ? ' · partial run' : ''}
                           </small>
                         )}
                       </td>
                     ))}
                   <td>
                     <span className={styles.badge} data-state={run.status}>
-                      {run.status}
+                      {run.status === 'failed' && run.completed + run.failed === run.total
+                        ? 'finished with errors'
+                        : run.status}
                     </span>
                     <small>
                       {run.answered} / {run.total} answered
@@ -625,18 +639,41 @@ export function AnswerDashboard({
         <small>
           Uses the configured Nebula model and retrieval settings (top k 8). Generation may use your
           configured provider and incur its charges. Each question gets a fresh conversation.
+          Requests run in batches of up to four; the next batch waits for every response. Request
+          failures are recorded and the remaining questions continue.
         </small>
       </form>
       {detail && (
         <section className={styles.detail} ref={detailElement} aria-label="Answer run details">
           <div className={styles.panelHeading}>
             <h2>Answers &amp; review · {detail.id.slice(0, 8)}</h2>
-            <button className={styles.button} onClick={() => setDetail(null)}>
-              Close answers
-            </button>
+            <div className={styles.actions}>
+              {detail.cases.some((item) => item.status === 'error') && (
+                <button
+                  className={styles.button}
+                  onClick={() =>
+                    saveDownload(
+                      new Blob([answerFailureLog(detail)], { type: 'application/x-ndjson' }),
+                      `${detail.id}-failures.jsonl`,
+                    )
+                  }
+                >
+                  Download failure log
+                </button>
+              )}
+              <button className={styles.button} onClick={() => setDetail(null)}>
+                Close answers
+              </button>
+            </div>
           </div>
           <p>
             {detail.request.architecture_label} · {detail.generation_model.label} · {detail.status}
+          </p>
+          <p>
+            {detail.max_in_flight === undefined || detail.max_in_flight === 1
+              ? 'One request at a time'
+              : `Batches of up to ${detail.max_in_flight} requests`}{' '}
+            · {detail.completed + detail.failed} / {detail.total} processed · {detail.failed} failed
           </p>
           <small>
             {detail.embedding_model.id} · revision {detail.embedding_model.revision} · snapshot{' '}
@@ -652,11 +689,7 @@ export function AnswerDashboard({
                   Question
                   <select
                     value={selectedCase.case_id}
-                    onChange={(event) =>
-                      setCaseIndex(
-                        detail.cases.findIndex((item) => item.case_id === event.target.value),
-                      )
-                    }
+                    onChange={(event) => setSelectedCaseId(event.target.value)}
                   >
                     {detail.cases.map((item, index) => (
                       <option key={item.case_id} value={item.case_id}>
@@ -670,14 +703,14 @@ export function AnswerDashboard({
                   <button
                     className={styles.button}
                     disabled={caseIndex === 0}
-                    onClick={() => setCaseIndex(caseIndex - 1)}
+                    onClick={() => setSelectedCaseId(detail.cases[caseIndex - 1].case_id)}
                   >
                     Previous answer
                   </button>
                   <button
                     className={styles.button}
                     disabled={caseIndex >= detail.cases.length - 1}
-                    onClick={() => setCaseIndex(caseIndex + 1)}
+                    onClick={() => setSelectedCaseId(detail.cases[caseIndex + 1].case_id)}
                   >
                     Next answer
                   </button>
@@ -706,6 +739,45 @@ export function AnswerDashboard({
               )}
               {selectedCase.reason && <p>{selectedCase.reason}</p>}
               {selectedCase.error && <p className={styles.error}>{selectedCase.error}</p>}
+              {selectedCase.failure ? (
+                <section className={styles.referenceAnswer} aria-label="Failure details">
+                  <h3>Failure details</h3>
+                  <p>
+                    {new Date(selectedCase.failure.timestamp_ms).toLocaleString()} ·{' '}
+                    {selectedCase.failure.operation.replaceAll('_', ' ')} ·{' '}
+                    {selectedCase.failure.http_status
+                      ? `HTTP ${selectedCase.failure.http_status} · `
+                      : ''}
+                    {selectedCase.failure.code}
+                  </p>
+                  {selectedCase.failure.provider_diagnostic && (
+                    <>
+                      <p>
+                        Provider: {selectedCase.failure.provider_diagnostic.category}
+                        {selectedCase.failure.provider_diagnostic.upstreamStatus
+                          ? ` · HTTP ${selectedCase.failure.provider_diagnostic.upstreamStatus}`
+                          : ''}
+                        {selectedCase.failure.provider_diagnostic.upstreamCode
+                          ? ` · ${selectedCase.failure.provider_diagnostic.upstreamCode}`
+                          : ''}
+                      </p>
+                      <p>
+                        Request:{' '}
+                        {selectedCase.failure.provider_diagnostic.requestBytes.toLocaleString()}{' '}
+                        bytes · Output limit:{' '}
+                        {selectedCase.failure.provider_diagnostic.maxOutputTokens.toLocaleString()}{' '}
+                        tokens · Attempt {selectedCase.failure.provider_diagnostic.attempt}
+                      </p>
+                      {selectedCase.failure.provider_diagnostic.responseTruncated && (
+                        <small>Provider error response exceeded the diagnostic read limit.</small>
+                      )}
+                    </>
+                  )}
+                  <small>The failure log records metadata without prompts or credentials.</small>
+                </section>
+              ) : selectedCase.status === 'error' ? (
+                <small>This older run did not record detailed provider diagnostics.</small>
+              ) : null}
               {selectedCase.model_receipt && (
                 <small>
                   Model receipt: {selectedCase.model_receipt.modelLabel} ·{' '}

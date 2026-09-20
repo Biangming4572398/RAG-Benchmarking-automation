@@ -45,6 +45,7 @@ export interface AnswerRunSummary {
   embedding_model: AnswerEmbeddingModel;
   generation_model: { profile_id: string; label: string };
   top_k: 8;
+  max_in_flight?: number;
   status: 'running' | 'completed' | 'failed' | 'interrupted';
   started_at_ms: number;
   finished_at_ms: number | null;
@@ -97,6 +98,34 @@ export interface AnswerReview extends AnswerReviewRequest {
   reviewed_at_ms: number;
 }
 
+export interface ProviderDiagnostic {
+  provider: 'moonshot';
+  category:
+    | 'authentication'
+    | 'rate_limited'
+    | 'rejected'
+    | 'incomplete_response'
+    | 'invalid_response'
+    | 'unavailable';
+  requestBytes: number;
+  maxOutputTokens: number;
+  attempt: number;
+  elapsedMs: number;
+  upstreamStatus?: number | null;
+  upstreamCode?: string | null;
+  upstreamType?: string | null;
+  responseTruncated?: boolean;
+}
+
+export interface AnswerFailure {
+  timestamp_ms: number;
+  operation: 'create_conversation' | 'generate_answer' | 'validate_answer';
+  http_status: number | null;
+  code: string;
+  message: string;
+  provider_diagnostic?: ProviderDiagnostic;
+}
+
 export interface AnswerCase {
   case_id: string;
   query: string;
@@ -112,6 +141,7 @@ export interface AnswerCase {
   review: AnswerReview | null;
   reference_answer?: string;
   automatic_scores?: AutomaticAnswerScores;
+  failure?: AnswerFailure;
 }
 
 export interface AnswerRun extends AnswerRunSummary {
@@ -251,6 +281,8 @@ function isSummary(value: unknown): value is AnswerRunSummary {
     isNonemptyText(value.generation_model.profile_id) &&
     isNonemptyText(value.generation_model.label) &&
     value.top_k === 8 &&
+    (value.max_in_flight === undefined ||
+      (isCount(value.max_in_flight) && value.max_in_flight >= 1 && value.max_in_flight <= 4)) &&
     ['running', 'completed', 'failed', 'interrupted'].includes(String(value.status)) &&
     isCount(value.started_at_ms) &&
     (value.finished_at_ms === null || isCount(value.finished_at_ms)) &&
@@ -305,6 +337,54 @@ function isReview(value: unknown): value is AnswerReview {
   return isReviewRequest(value) && 'reviewed_at_ms' in value && isCount(value.reviewed_at_ms);
 }
 
+function isHttpStatus(value: unknown): value is number {
+  return isCount(value) && value >= 100 && value <= 599;
+}
+
+function isErrorCode(value: unknown): value is string {
+  return isText(value) && /^[a-zA-Z0-9_.:-]{1,80}$/.test(value);
+}
+
+function isProviderDiagnostic(value: unknown): value is ProviderDiagnostic {
+  return (
+    isRecord(value) &&
+    value.provider === 'moonshot' &&
+    [
+      'authentication',
+      'rate_limited',
+      'rejected',
+      'incomplete_response',
+      'invalid_response',
+      'unavailable',
+    ].includes(String(value.category)) &&
+    isCount(value.requestBytes) &&
+    isCount(value.maxOutputTokens) &&
+    value.maxOutputTokens > 0 &&
+    isCount(value.attempt) &&
+    value.attempt > 0 &&
+    isCount(value.elapsedMs) &&
+    (value.upstreamStatus == null || isHttpStatus(value.upstreamStatus)) &&
+    (value.upstreamCode == null || isErrorCode(value.upstreamCode)) &&
+    (value.upstreamType == null || isErrorCode(value.upstreamType)) &&
+    (value.responseTruncated === undefined || typeof value.responseTruncated === 'boolean')
+  );
+}
+
+function isFailure(value: unknown): value is AnswerFailure {
+  return (
+    isRecord(value) &&
+    isCount(value.timestamp_ms) &&
+    ['create_conversation', 'generate_answer', 'validate_answer'].includes(
+      String(value.operation),
+    ) &&
+    (value.http_status === null || isHttpStatus(value.http_status)) &&
+    isErrorCode(value.code) &&
+    isNonemptyText(value.message) &&
+    textFits(value.message, 500) &&
+    (value.provider_diagnostic === undefined || isProviderDiagnostic(value.provider_diagnostic))
+  );
+}
+
 function isCase(value: unknown): value is AnswerCase {
   if (
     !isRecord(value) ||
@@ -321,7 +401,8 @@ function isCase(value: unknown): value is AnswerCase {
     !(value.model_receipt === null || isReceipt(value.model_receipt)) ||
     !isCount(value.latency_ms) ||
     !isNullableText(value.error) ||
-    !(value.review === null || isReview(value.review))
+    !(value.review === null || isReview(value.review)) ||
+    (value.failure !== undefined && (value.status !== 'error' || !isFailure(value.failure)))
   ) {
     return false;
   }
@@ -384,6 +465,43 @@ function isRun(value: unknown): value is AnswerRun {
       value.answered &&
     value.cases.filter((item) => item.review !== null).length === value.reviewed
   );
+}
+
+/** Export only recorded diagnostic fields; exclude questions, answers and arbitrary response data. */
+export function answerFailureLog(run: AnswerRun): string {
+  const entries = run.cases
+    .filter((item) => item.status === 'error')
+    .map((item) => {
+      const failure = item.failure;
+      const provider = failure?.provider_diagnostic;
+      return JSON.stringify({
+        run_id: run.id,
+        case_id: item.case_id,
+        latency_ms: item.latency_ms,
+        timestamp_ms: failure?.timestamp_ms ?? null,
+        operation: failure?.operation ?? 'unknown',
+        http_status: failure?.http_status ?? null,
+        code: failure?.code ?? 'legacy_error',
+        message: failure?.message ?? item.error ?? 'No failure details were recorded.',
+        ...(provider
+          ? {
+              provider_diagnostic: {
+                provider: provider.provider,
+                category: provider.category,
+                requestBytes: provider.requestBytes,
+                maxOutputTokens: provider.maxOutputTokens,
+                attempt: provider.attempt,
+                elapsedMs: provider.elapsedMs,
+                upstreamStatus: provider.upstreamStatus,
+                upstreamCode: provider.upstreamCode,
+                upstreamType: provider.upstreamType,
+                responseTruncated: provider.responseTruncated,
+              },
+            }
+          : {}),
+      });
+    });
+  return entries.length ? `${entries.join('\n')}\n` : '';
 }
 
 async function responseError(response: Response): Promise<ApiError> {

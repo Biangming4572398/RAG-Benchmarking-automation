@@ -23,7 +23,7 @@ use backend::{
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 use uuid::Uuid;
 
 const PROFILE: &str = "moonshot-kimi-k3";
@@ -150,6 +150,9 @@ enum Outcome {
     #[default]
     Answered,
     FailSecond,
+    UnsafeFailure,
+    MalformedDiagnostic(usize),
+    ScoringOrder,
     EvidenceOnly,
     Refused,
     MissingReceipt,
@@ -170,7 +173,8 @@ struct Script {
     queries: Mutex<Vec<Value>>,
     conversations: Mutex<Vec<Value>>,
     query_started: Notify,
-    release_query: Option<Arc<Notify>>,
+    release_query: Option<Arc<Semaphore>>,
+    release_cases: Vec<Semaphore>,
 }
 
 fn scope() -> Value {
@@ -229,26 +233,29 @@ async fn conversation(
     let mut actual = body["sourceIds"].as_array().unwrap().clone();
     actual.sort_by_key(Value::to_string);
     let mut conversations = script.conversations.lock().unwrap();
-    let case = &script.benchmark.cases[conversations.len() % script.benchmark.cases.len()];
-    let mut expected = if let Some(reference) = &case.answer_reference {
-        reference
-            .candidate_document_ids
-            .iter()
-            .map(|id| json!(id))
-            .collect::<Vec<_>>()
-    } else {
-        script
-            .benchmark
-            .documents
-            .iter()
-            .map(|doc| json!(doc.id))
-            .collect::<Vec<_>>()
-    };
-    expected.sort_by_key(Value::to_string);
-    assert_eq!(
-        actual, expected,
-        "each case must use its complete candidate corpus"
+    let mut candidates = script.benchmark.cases.iter().map(|case| {
+        let mut ids = if let Some(reference) = &case.answer_reference {
+            reference
+                .candidate_document_ids
+                .iter()
+                .map(|id| json!(id))
+                .collect::<Vec<_>>()
+        } else {
+            script
+                .benchmark
+                .documents
+                .iter()
+                .map(|doc| json!(doc.id))
+                .collect::<Vec<_>>()
+        };
+        ids.sort_by_key(Value::to_string);
+        ids
+    });
+    assert!(
+        candidates.any(|expected| actual == expected),
+        "each conversation uses one case's complete candidate corpus"
     );
+    let expected = actual;
     conversations.push(body);
     let id = if matches!(script.outcome, Outcome::ReusedConversation) {
         "conversation-reused".into()
@@ -280,7 +287,7 @@ async fn query(
     script.queries.lock().unwrap().push(body.clone());
     script.query_started.notify_one();
     if let Some(release) = &script.release_query {
-        release.notified().await;
+        release.acquire().await.unwrap().forget();
     }
     let index = script
         .benchmark
@@ -288,13 +295,102 @@ async fn query(
         .iter()
         .position(|case| body["query"] == case.query)
         .unwrap();
-    if matches!(script.outcome, Outcome::FailSecond) && index == 1 {
+    if matches!(script.outcome, Outcome::ScoringOrder) {
+        script.release_cases[index]
+            .acquire()
+            .await
+            .unwrap()
+            .forget();
+    }
+    if matches!(
+        script.outcome,
+        Outcome::FailSecond | Outcome::MalformedDiagnostic(_)
+    ) && index == 1
+    {
+        let mut body = json!({"error":{
+            "code":"reasoning_rejected",
+            "message":"DO-NOT-LOG upstream echoed prompt and credential",
+            "diagnostic":{
+                "provider":"moonshot", "category":"rejected", "upstreamStatus":400,
+                "upstreamCode":"context_length_exceeded", "upstreamType":"invalid_request_error",
+                "requestBytes":12456, "maxOutputTokens":2048, "attempt":1, "elapsedMs":32,
+                "requestId":"DO-NOT-LOG request identifier", "model":"DO-NOT-LOG model",
+                "extra":"DO-NOT-LOG secret"
+            }
+        }});
+        if let Outcome::MalformedDiagnostic(index) = script.outcome {
+            let (field, value) = [
+                ("maxOutputTokens", 0),
+                ("attempt", 0),
+                ("requestBytes", u64::MAX),
+                ("elapsedMs", u64::MAX),
+                ("maxOutputTokens", u64::MAX),
+                ("attempt", u64::MAX),
+            ][index];
+            body["error"]["diagnostic"][field] = json!(value);
+        }
+        return (StatusCode::UNPROCESSABLE_ENTITY, Json(body));
+    }
+    if matches!(script.outcome, Outcome::UnsafeFailure) && index == 1 {
         return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error":"scripted generator unavailable"})),
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error":{
+                "code":"reasoning_rejected", "message":"DO-NOT-LOG".repeat(2000),
+                "diagnostic":{"provider":"moonshot", "category":"rejected", "requestBytes":42}
+            }})),
         );
     }
-    let document = &script.benchmark.documents[index];
+    let case = &script.benchmark.cases[index];
+    let document = script
+        .benchmark
+        .documents
+        .iter()
+        .find(|document| {
+            case.answer_reference
+                .as_ref()
+                .map_or(document.id == case.document_id, |reference| {
+                    document.text == reference.answer
+                })
+        })
+        .unwrap();
+    if !matches!(script.outcome, Outcome::ReusedConversation) {
+        let conversation_index = body["conversationId"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("conversation-")
+            .unwrap()
+            .parse::<usize>()
+            .unwrap()
+            - 1;
+        let mut selected = script.conversations.lock().unwrap()[conversation_index]["sourceIds"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let mut expected = case
+            .answer_reference
+            .as_ref()
+            .map(|reference| {
+                reference
+                    .candidate_document_ids
+                    .iter()
+                    .map(|id| json!(id))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| {
+                script
+                    .benchmark
+                    .documents
+                    .iter()
+                    .map(|doc| json!(doc.id))
+                    .collect()
+            });
+        selected.sort_by_key(Value::to_string);
+        expected.sort_by_key(Value::to_string);
+        assert_eq!(
+            selected, expected,
+            "each query retains its own selected candidates"
+        );
+    }
     let mut result = json!({
         "scope":scope(), "conversationScope":body["conversationScope"],
         "watermark":watermark(), "outcome":"answered", "answer":format!("Generated answer: {}", document.text),
@@ -306,6 +402,10 @@ async fn query(
     match script.outcome {
         Outcome::ConciseAnswer => {
             result["answer"] = json!(document.text);
+        }
+        Outcome::ScoringOrder => {
+            let suffix = ["", " x", " x y", " x y z q r"][index];
+            result["answer"] = json!(format!("{}{suffix}", document.text));
         }
         Outcome::OtherCaseEvidence => {
             let foreign = script.benchmark.documents.last().unwrap();
@@ -354,7 +454,8 @@ async fn scripted_nebula(
         queries: Mutex::new(vec![]),
         conversations: Mutex::new(vec![]),
         query_started: Notify::new(),
-        release_query: block.then(|| Arc::new(Notify::new())),
+        release_query: block.then(|| Arc::new(Semaphore::new(0))),
+        release_cases: benchmark.cases.iter().map(|_| Semaphore::new(0)).collect(),
     });
     let app = Router::new()
         .route("/api/nebula/v1/workspace", get(workspace))
@@ -402,7 +503,7 @@ async fn start(client: &reqwest::Client, server: &TestServer, benchmark: &Benchm
 }
 
 async fn wait_run(client: &reqwest::Client, server: &TestServer, id: &str) -> Value {
-    for _ in 0..100 {
+    for _ in 0..1000 {
         let run = response(
             client.get(format!("{}/answer-runs/{id}", base(server))),
             StatusCode::OK,
@@ -414,6 +515,36 @@ async fn wait_run(client: &reqwest::Client, server: &TestServer, id: &str) -> Va
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("answer run did not stop");
+}
+
+async fn wait_queries(script: &Script, count: usize) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while script.queries.lock().unwrap().len() < count {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+async fn wait_progress(
+    client: &reqwest::Client,
+    server: &TestServer,
+    id: &str,
+    processed: u64,
+) -> Value {
+    for _ in 0..100 {
+        let run = response(
+            client.get(format!("{}/answer-runs/{id}", base(server))),
+            StatusCode::OK,
+        )
+        .await;
+        if run["completed"].as_u64().unwrap() + run["failed"].as_u64().unwrap() >= processed {
+            return run;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("answer run did not persist progress");
 }
 
 async fn csv(client: &reqwest::Client, server: &TestServer, id: &str) -> String {
@@ -803,12 +934,12 @@ async fn generation_rejects_missing_or_changed_provenance_and_unpinned_evidence(
         let result = wait_run(&client, &server, created["id"].as_str().unwrap()).await;
         assert_eq!(result["status"], "failed", "{result}");
         assert_eq!(result["answered"], 0);
-        assert_eq!(result["failed"], 1);
+        assert_eq!(result["failed"], 2);
         assert!(result["means"].is_null());
         assert_eq!(
             script.queries.lock().unwrap().len(),
-            1,
-            "stop at the first invalid response"
+            2,
+            "drain already started cases after invalid provenance"
         );
     }
 }
@@ -827,7 +958,15 @@ async fn reused_conversations_stop_before_a_second_question_can_leak_history() {
     assert_eq!(result["status"], "failed", "{result}");
     assert_eq!(result["answered"], 1);
     assert_eq!(result["failed"], 1);
-    assert_eq!(result["cases"][1]["status"], "error");
+    assert_eq!(
+        result["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|case| case["status"] == "error")
+            .count(),
+        1
+    );
     assert_eq!(script.conversations.lock().unwrap().len(), 2);
     assert_eq!(script.queries.lock().unwrap().len(), 1);
 }
@@ -870,7 +1009,7 @@ async fn active_answer_runs_share_retrieval_slot_and_reject_early_reviews_and_cs
         StatusCode::CONFLICT,
     )
     .await;
-    script.release_query.as_ref().unwrap().notify_one();
+    script.release_query.as_ref().unwrap().add_permits(1);
     assert_eq!(wait_run(&client, &server, id).await["status"], "completed");
 }
 
@@ -1148,21 +1287,16 @@ async fn hotpot_scores_use_all_selected_cases_as_denominator_while_running() {
     let client = client();
     let created = start(&client, &server, &benchmark).await;
     let id = created["id"].as_str().unwrap();
-    script.query_started.notified().await;
-    script.release_query.as_ref().unwrap().notify_one();
-    script.query_started.notified().await;
-    let partial = response(
-        client.get(format!("{}/answer-runs/{id}", base(&server))),
-        StatusCode::OK,
-    )
-    .await;
+    wait_queries(&script, 2).await;
+    script.release_query.as_ref().unwrap().add_permits(1);
+    let partial = wait_progress(&client, &server, id, 1).await;
     assert_eq!(partial["status"], "running");
     assert_eq!(partial["scored"], 1);
     assert_eq!(
         partial["automatic_scores"],
         json!({"exact_match":0.5,"f1":0.5})
     );
-    script.release_query.as_ref().unwrap().notify_one();
+    script.release_query.as_ref().unwrap().add_permits(1);
     let run = wait_run(&client, &server, id).await;
     assert_eq!(run["scored"], 2);
     assert_eq!(run["automatic_scores"], json!({"exact_match":1.0,"f1":1.0}));
@@ -1173,8 +1307,8 @@ async fn hotpot_nonanswers_and_errors_score_zero_without_inflating_partial_resul
     for (outcome, status, completed, failed, scored, f1) in [
         (Outcome::EvidenceOnly, "completed", 2, 0, 2, 0.0),
         (Outcome::Refused, "completed", 2, 0, 2, 0.0),
-        (Outcome::FailSecond, "failed", 1, 1, 2, 0.005),
-        (Outcome::OtherCaseEvidence, "failed", 0, 1, 1, 0.0),
+        (Outcome::FailSecond, "failed", 99, 1, 100, 0.495),
+        (Outcome::OtherCaseEvidence, "failed", 1, 1, 2, 0.25),
     ] {
         let dir = TempDir::new().unwrap();
         let mut benchmark = hotpot_benchmark();
@@ -1198,25 +1332,29 @@ async fn hotpot_nonanswers_and_errors_score_zero_without_inflating_partial_resul
         assert_eq!(run["failed"], failed);
         assert_eq!(run["scored"], scored);
         assert_eq!(run["automatic_scores"]["exact_match"], 0.0);
-        assert_eq!(run["automatic_scores"]["f1"], f1);
+        assert!((run["automatic_scores"]["f1"].as_f64().unwrap() - f1).abs() < 1e-9);
         let rows = csv_rows(&csv(&client, &server, created["id"].as_str().unwrap()).await);
         for row in &rows {
             assert_eq!(row["run_status"], status);
             assert_eq!(row["run_total"], benchmark.cases.len().to_string());
             assert_eq!(row["run_scored"], scored.to_string());
             assert_eq!(row["run_exact_match"], "0");
-            assert_eq!(row["run_f1"].parse::<f64>().unwrap(), f1);
+            assert!((row["run_f1"].parse::<f64>().unwrap() - f1).abs() < 1e-9);
         }
         if matches!(outcome, Outcome::FailSecond) {
-            assert_eq!(rows.len(), 2);
+            assert_eq!(rows.len(), 100);
             assert_eq!(rows[0]["f1"], "0.5");
             assert_eq!(rows[0]["run_total"], "100");
-            assert_eq!(rows[0]["run_f1"], "0.005");
+            assert_eq!(rows[1]["f1"], "0");
         }
-        assert_eq!(
-            run["cases"].as_array().unwrap().last().unwrap()["automatic_scores"],
-            json!({"exact_match":0.0,"f1":0.0})
-        );
+        for case in run["cases"].as_array().unwrap() {
+            if case["status"] == "error" || case["outcome"] != "answered" {
+                assert_eq!(
+                    case["automatic_scores"],
+                    json!({"exact_match":0.0,"f1":0.0})
+                );
+            }
+        }
         if matches!(outcome, Outcome::OtherCaseEvidence) {
             assert!(
                 run["error"]
@@ -1274,4 +1412,274 @@ async fn hotpot_validates_candidate_selections_individually_instead_of_the_large
         backend::answers::prepare(&config, request, &benchmark, "fingerprint".into()).await,
         Err(backend::answers::StartFailure::Invalid(_))
     ));
+}
+
+fn repeated_benchmark(count: usize) -> Benchmark {
+    let mut benchmark = benchmark();
+    benchmark.cases = (0..count)
+        .map(|index| {
+            let mut case = benchmark.cases[index % 2].clone();
+            case.id = format!("case-{index}");
+            case.query = format!("Question {index}: {}", case.query);
+            case
+        })
+        .collect();
+    benchmark
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn generation_waits_for_the_entire_four_request_batch_and_persists_each_completion() {
+    let dir = TempDir::new().unwrap();
+    let benchmark = repeated_benchmark(6);
+    let store = Arc::new(Store::open(dir.path()).unwrap());
+    store.save_benchmark(&benchmark).unwrap();
+    let (nebula, script) = scripted_nebula(&benchmark, Outcome::Answered, true).await;
+    let server = benchmark_server(store, Some(&nebula)).await;
+    let client = client();
+    let created = start(&client, &server, &benchmark).await;
+    let id = created["id"].as_str().unwrap();
+    assert_eq!(created["max_in_flight"], 4);
+    wait_queries(&script, 4).await;
+    assert_eq!(script.conversations.lock().unwrap().len(), 4);
+    script.release_query.as_ref().unwrap().add_permits(3);
+    let partial = wait_progress(&client, &server, id, 3).await;
+    assert_eq!(partial["status"], "running");
+    assert_eq!(partial["cases"].as_array().unwrap().len(), 3);
+    let ids = partial["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|case| case["case_id"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        ids.windows(2).all(|pair| pair[0] < pair[1]),
+        "partial results retain dataset order"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        script.queries.lock().unwrap().len(),
+        4,
+        "no fifth query until all four responses arrive"
+    );
+    assert_eq!(
+        script.conversations.lock().unwrap().len(),
+        4,
+        "no fifth conversation before the batch finishes"
+    );
+    script.release_query.as_ref().unwrap().add_permits(1);
+    wait_queries(&script, 6).await;
+    let partial = wait_progress(&client, &server, id, 4).await;
+    assert_eq!(partial["completed"], 4);
+    script.release_query.as_ref().unwrap().add_permits(2);
+    let run = wait_run(&client, &server, id).await;
+    assert_eq!(run["status"], "completed");
+    assert_eq!(run["completed"], 6);
+    assert_eq!(run["failed"], 0);
+    for (index, case) in run["cases"].as_array().unwrap().iter().enumerate() {
+        assert_eq!(case["case_id"], format!("case-{index}"));
+    }
+    let mut conversations = script
+        .queries
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|query| query["conversationId"].to_string())
+        .collect::<Vec<_>>();
+    conversations.sort();
+    conversations.dedup();
+    assert_eq!(conversations.len(), 6);
+    assert!(
+        !dir.path()
+            .join("answer-runs")
+            .join(id)
+            .join("failures.jsonl")
+            .exists()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn request_failures_continue_remaining_batches_and_are_safely_logged_and_exported() {
+    for outcome in [Outcome::FailSecond, Outcome::UnsafeFailure] {
+        let dir = TempDir::new().unwrap();
+        let benchmark = repeated_benchmark(7);
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        store.save_benchmark(&benchmark).unwrap();
+        let (nebula, script) = scripted_nebula(&benchmark, outcome, false).await;
+        let server = benchmark_server(store.clone(), Some(&nebula)).await;
+        let client = client();
+        let created = start(&client, &server, &benchmark).await;
+        let id = created["id"].as_str().unwrap();
+        let run = wait_run(&client, &server, id).await;
+        assert_eq!(run["status"], "failed");
+        assert_eq!(run["total"], 7);
+        assert_eq!(run["completed"], 6);
+        assert_eq!(run["failed"], 1);
+        assert_eq!(run["answered"], 6);
+        assert_eq!(script.queries.lock().unwrap().len(), 7);
+        assert_eq!(run["cases"].as_array().unwrap().len(), 7);
+        assert_eq!(run["cases"][6]["status"], "ok");
+        let failure = &run["cases"][1]["failure"];
+        assert!(failure["timestamp_ms"].as_u64().unwrap() > 0);
+        assert_eq!(failure["operation"], "generate_answer");
+        if matches!(outcome, Outcome::FailSecond) {
+            assert_eq!(failure["http_status"], 422);
+            assert_eq!(failure["code"], "reasoning_rejected");
+            assert_eq!(failure["provider_diagnostic"]["upstreamStatus"], 400);
+            assert_eq!(
+                failure["provider_diagnostic"]["upstreamCode"],
+                "context_length_exceeded"
+            );
+            assert_eq!(failure["provider_diagnostic"]["requestBytes"], 12456);
+            assert!(failure["provider_diagnostic"].get("requestId").is_none());
+            assert!(failure["provider_diagnostic"].get("model").is_none());
+        } else {
+            assert_eq!(failure["http_status"], 502);
+            assert_eq!(failure["code"], "http_error");
+            assert!(failure.get("provider_diagnostic").is_none());
+        }
+        let log = std::fs::read_to_string(
+            dir.path()
+                .join("answer-runs")
+                .join(id)
+                .join("failures.jsonl"),
+        )
+        .unwrap();
+        let events = log
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["run_id"], id);
+        assert_eq!(events[0]["case_id"], "case-1");
+        assert_eq!(events[0]["latency_ms"], run["cases"][1]["latency_ms"]);
+        assert_eq!(events[0]["code"], failure["code"]);
+        let exported = csv(&client, &server, id).await;
+        let rows = csv_rows(&exported);
+        assert_eq!(rows[1]["max_in_flight"], "4");
+        assert_eq!(
+            serde_json::from_str::<Value>(&rows[1]["failure_json"]).unwrap(),
+            *failure
+        );
+        for output in [run.to_string(), log, exported] {
+            assert!(!output.contains("DO-NOT-LOG"));
+            assert!(!output.contains(TOKEN));
+        }
+        let saved = store.answer_run(id.parse().unwrap()).unwrap();
+        assert!(saved.cases[1].failure.is_some());
+        let mut legacy = serde_json::to_value(saved).unwrap();
+        legacy.as_object_mut().unwrap().remove("max_in_flight");
+        for case in legacy["cases"].as_array_mut().unwrap() {
+            case.as_object_mut().unwrap().remove("failure");
+        }
+        let legacy: AnswerRun = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy.summary.max_in_flight, 1);
+        assert!(legacy.cases.iter().all(|case| case.failure.is_none()));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn fatal_provenance_failure_drains_its_batch_and_never_starts_the_next_batch() {
+    let dir = TempDir::new().unwrap();
+    let benchmark = repeated_benchmark(8);
+    let store = Arc::new(Store::open(dir.path()).unwrap());
+    store.save_benchmark(&benchmark).unwrap();
+    let (nebula, script) = scripted_nebula(&benchmark, Outcome::ChangedWatermark, true).await;
+    let server = benchmark_server(store, Some(&nebula)).await;
+    let client = client();
+    let created = start(&client, &server, &benchmark).await;
+    let id = created["id"].as_str().unwrap();
+    wait_queries(&script, 4).await;
+    script.release_query.as_ref().unwrap().add_permits(1);
+    let partial = wait_progress(&client, &server, id, 1).await;
+    assert_eq!(
+        partial["status"], "running",
+        "drain active requests before marking terminal"
+    );
+    assert_eq!(partial["failed"], 1);
+    script.release_query.as_ref().unwrap().add_permits(3);
+    let run = wait_run(&client, &server, id).await;
+    assert_eq!(run["status"], "failed");
+    assert_eq!(run["failed"], 4);
+    assert_eq!(run["completed"], 0);
+    assert_eq!(script.queries.lock().unwrap().len(), 4);
+    assert_eq!(script.conversations.lock().unwrap().len(), 4);
+    assert_eq!(run["cases"][0]["failure"]["operation"], "validate_answer");
+    assert_eq!(run["cases"][0]["failure"]["code"], "provenance_changed");
+    let log = std::fs::read_to_string(
+        dir.path()
+            .join("answer-runs")
+            .join(id)
+            .join("failures.jsonl"),
+    )
+    .unwrap();
+    assert_eq!(log.lines().count(), 4);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_provider_metadata_is_dropped_without_losing_the_case_failure() {
+    for index in 0..6 {
+        let dir = TempDir::new().unwrap();
+        let benchmark = benchmark();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        store.save_benchmark(&benchmark).unwrap();
+        let (nebula, _) =
+            scripted_nebula(&benchmark, Outcome::MalformedDiagnostic(index), false).await;
+        let server = benchmark_server(store, Some(&nebula)).await;
+        let client = client();
+        let created = start(&client, &server, &benchmark).await;
+        let run = wait_run(&client, &server, created["id"].as_str().unwrap()).await;
+        assert_eq!(run["status"], "failed");
+        assert_eq!(run["completed"], 1);
+        assert_eq!(run["failed"], 1);
+        let failure = &run["cases"][1]["failure"];
+        assert_eq!(failure["http_status"], 422);
+        assert_eq!(failure["code"], "reasoning_rejected");
+        assert!(
+            failure.get("provider_diagnostic").is_none(),
+            "invalid field variant {index}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn automatic_scores_are_identical_for_forward_and_reverse_completion_order() {
+    let mut aggregates = vec![];
+    for order in [[0, 1, 2, 3], [3, 2, 1, 0]] {
+        let dir = TempDir::new().unwrap();
+        let mut benchmark = hotpot_benchmark();
+        for index in 2..4 {
+            let mut case = benchmark.cases[index % 2].clone();
+            case.id = format!("case-{index}");
+            case.query = format!("Question {index}: {}", case.query);
+            benchmark.cases.push(case);
+        }
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        store.save_benchmark(&benchmark).unwrap();
+        let (nebula, script) = scripted_nebula(&benchmark, Outcome::ScoringOrder, false).await;
+        let server = benchmark_server(store, Some(&nebula)).await;
+        let client = client();
+        let created = start(&client, &server, &benchmark).await;
+        let id = created["id"].as_str().unwrap();
+        wait_queries(&script, 4).await;
+        for (processed, index) in order.into_iter().enumerate() {
+            script.release_cases[index].add_permits(1);
+            wait_progress(&client, &server, id, (processed + 1) as u64).await;
+        }
+        let run = wait_run(&client, &server, id).await;
+        assert_eq!(run["status"], "completed");
+        assert_eq!(run["scored"], 4);
+        for (index, case) in run["cases"].as_array().unwrap().iter().enumerate() {
+            assert_eq!(case["case_id"], format!("case-{index}"));
+        }
+        aggregates.push(run["automatic_scores"].clone());
+    }
+    assert_eq!(
+        aggregates[0], aggregates[1],
+        "completion order must never affect the winner"
+    );
+    assert_eq!(aggregates[0]["exact_match"], 0.25);
+    assert_eq!(
+        aggregates[0]["f1"],
+        (1.0 + 2.0 / 3.0 + 0.5 + 2.0 / 7.0) / 4.0
+    );
 }

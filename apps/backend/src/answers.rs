@@ -2,7 +2,7 @@
 //! Historical RAGTruth labels never score new answers.
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -20,6 +20,7 @@ use crate::{
 };
 
 pub const EVALUATION: &str = "manual_review_v1";
+const GENERATION_BATCH_SIZE: usize = 4;
 const QUERY_TOP_K: usize = 8; // Nebula /query fixes this value; it is not a request option.
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -87,6 +88,8 @@ pub struct AnswerRunSummary {
     pub embedding_model: EmbeddingModel,
     pub generation_model: GenerationModel,
     pub top_k: usize,
+    #[serde(default = "legacy_max_in_flight")]
+    pub max_in_flight: usize,
     pub status: RunStatus,
     pub started_at_ms: u64,
     pub finished_at_ms: Option<u64>,
@@ -183,11 +186,65 @@ pub struct AnswerCase {
     pub model_receipt: Option<ModelReceipt>,
     pub latency_ms: u64,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<AnswerFailure>,
     pub review: Option<AnswerReview>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reference_answer: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub automatic_scores: Option<AnswerScores>,
+}
+
+/// Only locally generated text and allowlisted diagnostics enter durable failure logs.
+#[derive(Clone, Deserialize, Serialize)]
+pub struct AnswerFailure {
+    pub timestamp_ms: u64,
+    pub operation: String,
+    pub http_status: Option<u16>,
+    pub code: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_diagnostic: Option<ProviderDiagnostic>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderDiagnostic {
+    pub provider: String,
+    pub category: String,
+    pub upstream_status: Option<u16>,
+    pub upstream_code: Option<String>,
+    pub upstream_type: Option<String>,
+    pub request_bytes: u64,
+    pub max_output_tokens: u64,
+    pub attempt: u64,
+    pub elapsed_ms: u64,
+    pub response_truncated: bool,
+}
+
+fn legacy_max_in_flight() -> usize {
+    1
+}
+
+struct CaseFailure {
+    diagnostic: AnswerFailure,
+    fatal: bool,
+}
+
+impl CaseFailure {
+    fn local(operation: &str, code: &str, message: impl Into<String>, fatal: bool) -> Self {
+        Self {
+            diagnostic: AnswerFailure {
+                timestamp_ms: now_ms(),
+                operation: operation.into(),
+                http_status: None,
+                code: code.into(),
+                message: message.into(),
+                provider_diagnostic: None,
+            },
+            fatal,
+        }
+    }
 }
 
 fn is_zero(value: &usize) -> bool {
@@ -311,6 +368,173 @@ async fn response<T: DeserializeOwned>(request: reqwest::RequestBuilder) -> Resu
         bytes.extend_from_slice(&chunk);
     }
     serde_json::from_slice(&bytes).map_err(|_| Error("Nebula returned an invalid response".into()))
+}
+
+// Never persist arbitrary upstream error bodies: providers may echo prompts or credentials.
+fn public_error(code: &str) -> Option<(&'static str, bool)> {
+    Some(match code {
+        "reasoning_unavailable" => ("The remote reasoning service is unavailable", false),
+        "reasoning_authentication_failed" => ("Remote reasoning authentication failed", false),
+        "reasoning_rate_limited" => (
+            "The remote reasoning service rate limited this request",
+            false,
+        ),
+        "reasoning_rejected" => ("The remote reasoning service rejected this request", false),
+        "reasoning_invalid_response" => (
+            "The remote reasoning service returned an invalid response",
+            false,
+        ),
+        "reasoning_failed" => ("Remote reasoning failed", false),
+        "scope_mismatch" => ("Nebula workspace scope changed", true),
+        "knowledge_not_ready" => ("Nebula knowledge is no longer ready", true),
+        "knowledge_unavailable" => ("Nebula knowledge is unavailable", true),
+        "knowledge_changed" => ("Nebula knowledge changed during generation", true),
+        "conversation_not_found" => ("Nebula conversation is no longer available", true),
+        "conversation_scope_changed" => ("Nebula conversation scope changed", true),
+        "source_selection_invalid" => ("Nebula rejected the pinned source selection", true),
+        "invalid_request" => ("Nebula rejected this request", false),
+        _ => return None,
+    })
+}
+
+fn provider_diagnostic(value: &Value) -> Option<ProviderDiagnostic> {
+    let category = value["category"].as_str()?;
+    if value["provider"] != "moonshot"
+        || ![
+            "rejected",
+            "rate_limited",
+            "authentication",
+            "unavailable",
+            "invalid_response",
+            "incomplete_response",
+        ]
+        .contains(&category)
+    {
+        return None;
+    }
+    let known_symbol = |value: &Value| {
+        value
+            .as_str()
+            .filter(|code| {
+                [
+                    "invalid_request_error",
+                    "context_length_exceeded",
+                    "context_window_exceeded",
+                    "prompt_too_long",
+                    "rate_limit_exceeded",
+                    "rate_limit_reached",
+                    "insufficient_quota",
+                    "invalid_api_key",
+                    "content_filter",
+                    "content_policy_violation",
+                    "model_not_found",
+                    "invalid_parameter",
+                    "unsupported_parameter",
+                    "engine_overloaded",
+                    "server_error",
+                    "authentication_error",
+                    "rate_limit_error",
+                    "permission_error",
+                    "not_found_error",
+                    "api_error",
+                    "overloaded_error",
+                ]
+                .contains(code)
+            })
+            .map(str::to_owned)
+    };
+    // These records are also consumed by JavaScript. Invalid metadata must never make
+    // the otherwise useful HTTP failure unreadable in the dashboard.
+    let safe_count = |field: &str| {
+        value[field]
+            .as_u64()
+            .filter(|count| *count <= 9_007_199_254_740_991)
+    };
+    let max_output_tokens = safe_count("maxOutputTokens").filter(|count| *count > 0)?;
+    let attempt = safe_count("attempt").filter(|count| *count > 0)?;
+    Some(ProviderDiagnostic {
+        provider: "moonshot".into(),
+        category: category.into(),
+        upstream_status: value["upstreamStatus"]
+            .as_u64()
+            .filter(|status| (100..=599).contains(status))
+            .map(|status| status as u16),
+        upstream_code: known_symbol(&value["upstreamCode"]),
+        upstream_type: known_symbol(&value["upstreamType"]),
+        request_bytes: safe_count("requestBytes")?,
+        max_output_tokens,
+        attempt,
+        elapsed_ms: safe_count("elapsedMs")?,
+        response_truncated: value["responseTruncated"].as_bool().unwrap_or(false),
+    })
+}
+
+async fn case_response<T: DeserializeOwned>(
+    request: reqwest::RequestBuilder,
+    operation: &str,
+) -> std::result::Result<T, CaseFailure> {
+    let mut response = request.send().await.map_err(|_| {
+        CaseFailure::local(
+            operation,
+            "request_failed",
+            "Nebula request failed or timed out",
+            false,
+        )
+    })?;
+    let status = response.status();
+    let limit = if status.is_success() {
+        8 * 1024 * 1024
+    } else {
+        16 * 1024
+    };
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| {
+        CaseFailure::local(
+            operation,
+            "response_read_failed",
+            "Cannot read Nebula response",
+            false,
+        )
+    })? {
+        if bytes.len() + chunk.len() > limit {
+            if status.is_success() {
+                return Err(CaseFailure::local(
+                    operation,
+                    "response_too_large",
+                    "Nebula response exceeds the 8 MiB limit",
+                    false,
+                ));
+            }
+            // Even malformed/oversized error responses retain their safe HTTP status.
+            bytes.clear();
+            break;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if !status.is_success() {
+        let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        let code = value["error"]["code"].as_str().unwrap_or_default();
+        let known = public_error(code);
+        let mut failure = CaseFailure::local(
+            operation,
+            if known.is_some() { code } else { "http_error" },
+            known
+                .map(|(message, _)| message.to_owned())
+                .unwrap_or_else(|| format!("Nebula returned HTTP {}", status.as_u16())),
+            known.is_some_and(|(_, fatal)| fatal),
+        );
+        failure.diagnostic.http_status = Some(status.as_u16());
+        failure.diagnostic.provider_diagnostic = provider_diagnostic(&value["error"]["diagnostic"]);
+        return Err(failure);
+    }
+    serde_json::from_slice(&bytes).map_err(|_| {
+        CaseFailure::local(
+            operation,
+            "invalid_response",
+            "Nebula returned an invalid response",
+            false,
+        )
+    })
 }
 
 async fn workspace(config: &NebulaConfig) -> Result<Workspace> {
@@ -525,6 +749,7 @@ pub async fn prepare(
                 .embedding_model
                 .expect("available runtime has model"),
             top_k: QUERY_TOP_K,
+            max_in_flight: GENERATION_BATCH_SIZE,
             status: RunStatus::Running,
             started_at_ms: now_ms(),
             finished_at_ms: None,
@@ -597,119 +822,219 @@ async fn execute_inner(
         .filter(|source| run.summary.source_ids.contains(&source.id))
         .map(|source| (source.id.clone(), source.revision.clone()))
         .collect();
-    let client = client()?;
-    let base = config.base_url.trim_end_matches('/');
-    let mut conversations = HashSet::new();
-    for case in &benchmark.cases {
-        let start = Instant::now();
-        let mut captured = AnswerCase {
-            case_id: case.id.clone(),
-            query: case.query.clone(),
-            status: "error".into(),
-            outcome: "error".into(),
-            answer: None,
-            reason: None,
-            evidence: vec![],
-            lineage: vec![],
-            model_receipt: None,
-            latency_ms: 0,
-            error: None,
-            review: None,
-            reference_answer: (run.summary.evaluation == HOTPOTQA_EVALUATION)
-                .then(|| {
-                    case.answer_reference
-                        .as_ref()
-                        .map(|reference| reference.answer.clone())
-                })
-                .flatten(),
-            automatic_scores: (run.summary.evaluation == HOTPOTQA_EVALUATION)
-                .then(AnswerScores::default),
-        };
-        let result: Result<()> = async {
-            let source_ids = case_sources(case, benchmark, &sources)?;
-            validate_selection(&run.summary.scope, &source_ids)?;
-            let selected_revisions = revisions
-                .iter()
-                .filter(|(id, _)| source_ids.contains(id))
-                .map(|(id, revision)| (id.clone(), revision.clone()))
-                .collect();
-            // A fresh conversation isolates every question from provider history. Nebula evicts
-            // old conversations after 32; cases persist the full answers and citations here.
-            let conversation: Conversation = response(
-                client
-                    .post(format!("{base}/conversations"))
-                    .bearer_auth(&config.token)
-                    .json(&json!({"scope":run.summary.scope,"sourceIds":source_ids})),
-            )
-            .await?;
-            if !conversation.source_scope.r#ref.is_object()
-                || conversation.source_scope.r#ref["conversationId"] != conversation.id
-                || !conversations.insert(conversation.id.clone())
-            {
-                return Err(Error(
-                    "Nebula returned an invalid conversation identity".into(),
-                ));
-            }
-            let generated: GeneratedAnswer = response(
-                client
-                    .post(format!("{base}/query"))
-                    .bearer_auth(&config.token)
-                    .json(&json!({
-                        "scope":run.summary.scope,
-                        "conversationId":conversation.id,
-                        "conversationScope":conversation.source_scope.r#ref,
-                        "query":case.query,
-                        "profileId":run.summary.generation_model.profile_id,
-                        "strict":true,
-                    })),
-            )
-            .await?;
-            // Keep returned output for diagnosis even if it fails the pinned-runtime checks.
-            captured.outcome = if ["answered", "refused", "evidence-only", "not-ready"]
-                .contains(&generated.outcome.as_str())
-            {
-                generated.outcome.clone()
-            } else {
-                "error".into()
-            };
-            captured.answer = generated.answer.clone();
-            captured.reason = generated.reason.clone();
-            captured.evidence = generated.evidence.clone();
-            captured.lineage = generated.lineage.clone();
-            captured.model_receipt = generated.model_receipt.clone();
-            validate_answer(&generated, &conversation, &run.summary, &selected_revisions)?;
-            Ok(())
+    let context = Arc::new(CaseContext {
+        client: client()?,
+        config: config.clone(),
+        benchmark: benchmark.clone(),
+        summary: run.summary.clone(),
+        sources,
+        revisions,
+        conversations: Mutex::new(HashSet::new()),
+    });
+    let mut finished = BTreeMap::new();
+    for batch in benchmark.cases.chunks(GENERATION_BATCH_SIZE) {
+        let mut tasks = tokio::task::JoinSet::new();
+        for case in batch {
+            let context = context.clone();
+            let case = case.clone();
+            let index = finished.len() + tasks.len();
+            tasks.spawn(async move { (index, execute_case(&context, &case).await) });
         }
-        .await;
-        captured.latency_ms = start.elapsed().as_millis().min(u64::MAX as u128) as u64;
-        match result {
-            Ok(()) => {
-                captured.status = "ok".into();
+        let mut fatal = None;
+        // Drain the entire batch before opening more conversations. This also prevents a
+        // slow question from being evicted from Nebula's bounded conversation history.
+        while let Some(result) = tasks.join_next().await {
+            let (index, (captured, failure)) = match result {
+                Ok(result) => result,
+                Err(_) => {
+                    fatal = Some(Error(
+                        "Answer generation worker stopped unexpectedly".into(),
+                    ));
+                    continue;
+                }
+            };
+            let log_result = if let Some(failure) = failure {
+                if failure.fatal && fatal.is_none() {
+                    fatal = Some(Error(failure.diagnostic.message.clone()));
+                }
+                run.summary.failed += 1;
+                store.append_answer_failure(run.summary.id, &captured)
+            } else {
                 run.summary.completed += 1;
                 if captured.outcome == "answered" {
                     run.summary.answered += 1;
-                    if let Some(reference) = &captured.reference_answer {
-                        captured.automatic_scores = Some(score_answer(
-                            captured.answer.as_deref().unwrap_or_default(),
-                            reference,
-                        ));
-                    }
+                }
+                Ok(())
+            };
+            finished.insert(index, captured);
+            run.cases = finished.values().cloned().collect();
+            // Completion order must not change floating-point scores or invent a winner
+            // between identical runs. Recompute every partial aggregate in dataset order.
+            if let Some(scores) = &mut run.summary.automatic_scores {
+                *scores = AnswerScores::default();
+                run.summary.scored = 0;
+                for case in &run.cases {
+                    record_scores(&mut run.summary, case);
                 }
             }
-            Err(error) => {
-                captured.error = Some(error.to_string());
-                run.summary.failed += 1;
-                record_scores(&mut run.summary, &captured);
-                run.cases.push(captured);
-                store.save_answer_run(run)?;
+            if let Err(error) = log_result {
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
+                return Err(error);
+            }
+            if let Err(error) = store.save_answer_run(run) {
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
                 return Err(error);
             }
         }
-        record_scores(&mut run.summary, &captured);
-        run.cases.push(captured);
-        store.save_answer_run(run)?;
+        if let Some(error) = fatal {
+            return Err(error);
+        }
+    }
+    if run.summary.failed > 0 {
+        return Err(Error(format!(
+            "Finished all {} questions with {} failed requests; inspect the failure log",
+            run.summary.total, run.summary.failed
+        )));
     }
     Ok(())
+}
+
+struct CaseContext {
+    client: reqwest::Client,
+    config: NebulaConfig,
+    benchmark: Benchmark,
+    summary: AnswerRunSummary,
+    sources: BTreeMap<String, String>,
+    revisions: HashMap<String, String>,
+    conversations: Mutex<HashSet<String>>,
+}
+
+async fn execute_case(context: &CaseContext, case: &Case) -> (AnswerCase, Option<CaseFailure>) {
+    let start = Instant::now();
+    let mut captured = AnswerCase {
+        case_id: case.id.clone(),
+        query: case.query.clone(),
+        status: "error".into(),
+        outcome: "error".into(),
+        answer: None,
+        reason: None,
+        evidence: vec![],
+        lineage: vec![],
+        model_receipt: None,
+        latency_ms: 0,
+        error: None,
+        failure: None,
+        review: None,
+        reference_answer: (context.summary.evaluation == HOTPOTQA_EVALUATION)
+            .then(|| {
+                case.answer_reference
+                    .as_ref()
+                    .map(|reference| reference.answer.clone())
+            })
+            .flatten(),
+        automatic_scores: (context.summary.evaluation == HOTPOTQA_EVALUATION)
+            .then(AnswerScores::default),
+    };
+    let result: std::result::Result<(), CaseFailure> = async {
+        let pinned = |error: Error| {
+            CaseFailure::local(
+                "validate_answer",
+                "provenance_changed",
+                error.to_string(),
+                true,
+            )
+        };
+        let source_ids =
+            case_sources(case, &context.benchmark, &context.sources).map_err(pinned)?;
+        validate_selection(&context.summary.scope, &source_ids).map_err(pinned)?;
+        let selected_revisions = context
+            .revisions
+            .iter()
+            .filter(|(id, _)| source_ids.contains(id))
+            .map(|(id, revision)| (id.clone(), revision.clone()))
+            .collect();
+        let base = context.config.base_url.trim_end_matches('/');
+        let conversation: Conversation = case_response(
+            context
+                .client
+                .post(format!("{base}/conversations"))
+                .bearer_auth(&context.config.token)
+                .json(&json!({"scope":context.summary.scope,"sourceIds":source_ids})),
+            "create_conversation",
+        )
+        .await?;
+        if !conversation.source_scope.r#ref.is_object()
+            || conversation.source_scope.r#ref["conversationId"] != conversation.id
+            || !context
+                .conversations
+                .lock()
+                .map_err(|_| pinned(Error("Conversation identities are unavailable".into())))?
+                .insert(conversation.id.clone())
+        {
+            return Err(pinned(Error(
+                "Nebula returned an invalid conversation identity".into(),
+            )));
+        }
+        let generated: GeneratedAnswer = case_response(
+            context
+                .client
+                .post(format!("{base}/query"))
+                .bearer_auth(&context.config.token)
+                .json(&json!({
+                    "scope":context.summary.scope,
+                    "conversationId":conversation.id,
+                    "conversationScope":conversation.source_scope.r#ref,
+                    "query":case.query,
+                    "profileId":context.summary.generation_model.profile_id,
+                    "strict":true,
+                })),
+            "generate_answer",
+        )
+        .await?;
+        captured.outcome = if ["answered", "refused", "evidence-only", "not-ready"]
+            .contains(&generated.outcome.as_str())
+        {
+            generated.outcome.clone()
+        } else {
+            "error".into()
+        };
+        captured.answer = generated.answer.clone();
+        captured.reason = generated.reason.clone();
+        captured.evidence = generated.evidence.clone();
+        captured.lineage = generated.lineage.clone();
+        captured.model_receipt = generated.model_receipt.clone();
+        validate_answer(
+            &generated,
+            &conversation,
+            &context.summary,
+            &selected_revisions,
+        )
+        .map_err(pinned)?;
+        Ok(())
+    }
+    .await;
+    captured.latency_ms = start.elapsed().as_millis().min(u64::MAX as u128) as u64;
+    match result {
+        Ok(()) => {
+            captured.status = "ok".into();
+            if captured.outcome == "answered"
+                && let Some(reference) = &captured.reference_answer
+            {
+                captured.automatic_scores = Some(score_answer(
+                    captured.answer.as_deref().unwrap_or_default(),
+                    reference,
+                ));
+            }
+            (captured, None)
+        }
+        Err(failure) => {
+            captured.error = Some(failure.diagnostic.message.clone());
+            captured.failure = Some(failure.diagnostic.clone());
+            (captured, Some(failure))
+        }
+    }
 }
 
 fn record_scores(summary: &mut AnswerRunSummary, case: &AnswerCase) {
@@ -879,6 +1204,8 @@ impl AnswerRun {
             "run_scored",
             "run_exact_match",
             "run_f1",
+            "max_in_flight",
+            "failure_json",
         ])?;
         for case in &self.cases {
             let review = case.review.as_ref();
@@ -945,6 +1272,12 @@ impl AnswerRun {
                 self.summary
                     .automatic_scores
                     .map(|scores| scores.f1.to_string())
+                    .unwrap_or_default(),
+                self.summary.max_in_flight.to_string(),
+                case.failure
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?
                     .unwrap_or_default(),
             ])?;
         }

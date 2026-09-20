@@ -2,7 +2,9 @@ import { describe, expect, it, vi } from 'vitest';
 import { ApiError } from './benchmark-api';
 import {
   answerComparabilityKey,
+  answerFailureLog,
   createAnswerApi,
+  type AnswerFailure,
   type AnswerCase,
   type AnswerReviewRequest,
   type AnswerRun,
@@ -31,6 +33,26 @@ const review: AnswerReviewRequest = {
   hallucination: false,
   citation_accuracy: true,
   notes: 'The cited source directly supports the answer.',
+};
+
+const failure: AnswerFailure = {
+  timestamp_ms: 1_790_000_001_000,
+  operation: 'generate_answer',
+  http_status: 422,
+  code: 'reasoning_rejected',
+  message: 'The remote reasoning service rejected this grounded request.',
+  provider_diagnostic: {
+    provider: 'moonshot',
+    category: 'rejected',
+    upstreamStatus: 400,
+    upstreamCode: 'context_length_exceeded',
+    upstreamType: null,
+    requestBytes: 12800,
+    maxOutputTokens: 2048,
+    attempt: 1,
+    elapsedMs: 902,
+    responseTruncated: false,
+  },
 };
 
 function summary(changes: Partial<AnswerRunSummary> = {}): AnswerRunSummary {
@@ -97,6 +119,29 @@ function detail(changes: Partial<AnswerRun> = {}): AnswerRun {
   return { ...summary(), cases: [answerCase()], ...changes };
 }
 
+function failedDetail(): AnswerRun {
+  return detail({
+    max_in_flight: 4,
+    status: 'failed',
+    completed: 0,
+    failed: 1,
+    answered: 0,
+    reviewed: 0,
+    means: null,
+    error: '1 question failed',
+    cases: [
+      answerCase({
+        status: 'error',
+        outcome: 'error',
+        answer: null,
+        review: null,
+        error: 'Nebula returned HTTP 422: reasoning_rejected',
+        failure: structuredClone(failure),
+      }),
+    ],
+  });
+}
+
 function hotpotSummary(changes: Partial<AnswerRunSummary> = {}): AnswerRunSummary {
   return summary({
     evaluation: 'hotpotqa_answer_v1',
@@ -129,6 +174,95 @@ function response(value: unknown, status = 200): Response {
 }
 
 describe('answer-quality HTTP transport', () => {
+  it('reads batch limits and safe failure diagnostics and exports only diagnostic fields', async () => {
+    const run = failedDetail();
+    const payload = {
+      ...run,
+      cases: [
+        {
+          ...run.cases[0],
+          failure: {
+            ...failure,
+            raw_response: 'must-not-export',
+            provider_diagnostic: {
+              ...failure.provider_diagnostic,
+              raw_prompt: 'must-not-export',
+            },
+          },
+        },
+      ],
+    };
+    const api = createAnswerApi(vi.fn<typeof fetch>().mockResolvedValue(response(payload)));
+    const parsed = await api.getRun(run.id);
+    expect(parsed.max_in_flight).toBe(4);
+    expect(parsed.cases[0].failure?.provider_diagnostic?.requestBytes).toBe(12800);
+    const log = answerFailureLog(parsed);
+    expect(log).not.toContain('must-not-export');
+    expect(log).not.toContain(run.cases[0].query);
+    expect(JSON.parse(log)).toEqual({
+      run_id: run.id,
+      case_id: 'case-a',
+      latency_ms: 1500,
+      ...failure,
+    });
+    expect(answerComparabilityKey(parsed)).toBeNull();
+  });
+
+  it.each([
+    [
+      'batch limit',
+      (run: AnswerRun) => {
+        run.max_in_flight = 5;
+      },
+    ],
+    [
+      'timestamp',
+      (run: AnswerRun) => {
+        run.cases[0].failure!.timestamp_ms = -1;
+      },
+    ],
+    [
+      'status',
+      (run: AnswerRun) => {
+        run.cases[0].failure!.http_status = 800;
+      },
+    ],
+    [
+      'request bytes',
+      (run: AnswerRun) => {
+        run.cases[0].failure!.provider_diagnostic!.requestBytes = -1;
+      },
+    ],
+    [
+      'output tokens',
+      (run: AnswerRun) => {
+        run.cases[0].failure!.provider_diagnostic!.maxOutputTokens = 0;
+      },
+    ],
+    [
+      'provider code',
+      (run: AnswerRun) => {
+        run.cases[0].failure!.provider_diagnostic!.upstreamCode = 'arbitrary response text\n';
+      },
+    ],
+  ])('rejects invalid diagnostic %s', async (_label, mutate) => {
+    const run = failedDetail();
+    mutate(run);
+    const api = createAnswerApi(vi.fn<typeof fetch>().mockResolvedValue(response(run)));
+    await expect(api.getRun(run.id)).rejects.toThrow('Invalid answer-quality response');
+  });
+
+  it('exports legacy failures without inventing timestamps or provider details', () => {
+    const run = failedDetail();
+    delete run.max_in_flight;
+    delete run.cases[0].failure;
+    const record = JSON.parse(answerFailureLog(run));
+    expect(record.timestamp_ms).toBeNull();
+    expect(record.operation).toBe('unknown');
+    expect(record.message).toBe(run.cases[0].error);
+    expect(record.provider_diagnostic).toBeUndefined();
+  });
+
   it('reads runtime, summaries and detail through exact same-origin paths with no credentials', async () => {
     const fetcher = vi
       .fn<typeof fetch>()
