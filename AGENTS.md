@@ -16,11 +16,14 @@ Its frontend and backend live together in this submodule; Genesis is a thin host
   managed through YAML/Git and backend setup, not frontend catalog editing.
   Support prepared snapshots, run creation, progress/status, saved results and CSV.
 - Keep Retrieval and Generated answers separate. Retrieval scores measure paired
-  context recovery. Answer quality uses explicit `manual_review_v1` human reviews
-  with answered/reviewed coverage; pending reviews have no scores. Never reuse
+  context recovery. RAGTruth answer quality uses explicit `manual_review_v1` human reviews
+  with answered/reviewed coverage; pending reviews have no scores. HotpotQA uses
+  `hotpotqa_answer_v1` full-answer exact match/token F1 over all snapshot cases,
+  with the supplied candidate passages per question (typically ten) and separate optional human review.
+  Never pass reference answers into retrieval or generation. Never reuse
   RAGTruth historical annotations as labels for newly generated answers.
 - Record actual embedding/generation provenance from Nebula. Compare only complete,
-  fully reviewed answer runs with matching fingerprints, top-k, evaluator version
+  fully scored HotpotQA runs or fully reviewed RAGTruth answer runs with matching fingerprints, top-k, evaluator version
   and candidate source sets; partial results remain inspectable.
 - Connect through a host-owned proxy or bridge to the loopback benchmark API,
   which requires no authentication. Nebula credentials stay in backend/host

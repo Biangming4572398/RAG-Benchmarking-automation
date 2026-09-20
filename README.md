@@ -6,11 +6,11 @@ the Genesis workspace, or use the Benchmarking dock item in development Genesis.
 Its results table comes first, comparing benchmarks against architecture labels.
 It connects through a development proxy, starts runs on saved snapshots, polls
 progress, compares compatible retrieval results, and downloads CSV files. Its
-Generated answers tab runs the configured Nebula generation profile and records
-explicit human reviews of answer quality.
+Generated answers tab runs the configured Nebula generation profile, scores
+HotpotQA answers automatically, and records explicit human reviews of answer quality.
 Benchmark definitions are managed through Git in
-[`apps/backend/benchmarks.yaml`](apps/backend/benchmarks.yaml), starting with
-RAGTruth QA. Prepare snapshots with the HTTP API as described below; their saved
+[`apps/backend/benchmarks.yaml`](apps/backend/benchmarks.yaml), including
+RAGTruth QA and HotpotQA. Prepare snapshots with the HTTP API as described below; their saved
 names appear in the dashboard automatically. Its UI, API client, and standalone
 proxy live inside this submodule.
 
@@ -20,7 +20,7 @@ It does not register with the Genesis release build, install models, launch
 Nebula, or modify your normal Genesis storage.
 The benchmark backend uses files only; Nebula manages its own index separately.
 
-## First dataset and what is measured
+## Datasets
 
 The included `ragtruth-qa` catalog entry uses
 [wandb/RAGTruth-processed](https://huggingface.co/datasets/wandb/RAGTruth-processed).
@@ -31,6 +31,26 @@ retrieval trials. `limit` controls unique cases, from 1 to 10000. A local Parque
 file or a direct `hf://`/HTTPS Parquet path/glob with the same schema also works.
 Hugging Face credentials, when needed, come from Polars' `HF_TOKEN` environment
 variable, never the load request or catalog.
+
+The `hotpotqa` entry uses the authors' **development distractor v1** dataset from
+[HotpotQA](https://hotpotqa.github.io/). It selects the first 100 questions in file
+order by default. Each question retains all its supplied candidate passages
+(normally ten; the published file includes some shorter candidate lists), its
+reference answer, and supporting-fact annotations. The exported Markdown corpus
+contains only passage titles and sentences. Questions, answer labels, and support
+annotations are never added to that corpus. Identical title/sentence passages are
+shared across questions; each question still searches only its own candidates.
+
+The catalog pins a [RAGLAB mirror revision](https://huggingface.co/datasets/RAGLAB/data/tree/c33b09b7fa5099b89830e84f9bdff78329268d9b/eval_datasets/HotPotQA)
+because the [authors' download](https://curtis.ml.cmu.edu/datasets/hotpot/hotpot_dev_distractor_v1.json)
+can be unavailable. Its SHA-256 is byte-identical to the original download checksum
+recorded in the [published HotpotQA dataset metadata](https://huggingface.co/datasets/hotpotqa/hotpot_qa/blob/cb440e4e72efe5808fe5df497ffa0b4e8da85c32/dataset_infos.json).
+The loader verifies this checksum, bounds JSON downloads to 64 MiB, and accepts
+local JSON paths or public HTTP(S) URLs. To use a deliberately modified fixture,
+update or remove `source_sha256` in its separate catalog entry. Original support
+annotations are retained without repair, including any unresolved sentence indices;
+supporting-fact and joint scores are not implemented. HotpotQA is distributed under
+CC BY-SA 4.0.
 
 ## Benchmark catalog
 
@@ -47,6 +67,16 @@ benchmarks:
     defaults:
       limit: 100
       top_k: 8
+  hotpotqa:
+    name: HotpotQA (distractor dev)
+    source: 'https://huggingface.co/datasets/RAGLAB/data/resolve/c33b09b7fa5099b89830e84f9bdff78329268d9b/eval_datasets/HotPotQA/hotpot_dev_distractor_v1.json'
+    source_sha256: '4e9ecb5c8d3b719f624d66b60f8d56bf227f03914f5f0753d6fa1b359d7104ea'
+    split: dev
+    adapter: hotpotqa_distractor
+    evaluation: hotpotqa_answer_v1
+    defaults:
+      limit: 100
+      top_k: 8
 ```
 
 The server reads this catalog at startup. `BENCHMARK_CATALOG` selects another
@@ -54,11 +84,14 @@ file; otherwise it reads `benchmarks.yaml` in the working directory. Restart to
 apply edits. Missing/invalid catalogs fail startup, including duplicate names,
 unknown fields/adapters/evaluators, unsupported splits, and out-of-range defaults.
 Relative local source paths are resolved against the catalog's directory;
-`{split}` is replaced with the configured `train` or `test` value.
+`{split}` is replaced with the configured split value (`train`/`test` for RAGTruth,
+`dev` for HotpotQA).
 
 Add named entries for other splits, pinned revisions, local fixtures, or default
-settings. `ragtruth_qa` and `paired_context_recovery_v1` are the only implemented
-adapter/evaluator pair. A dataset with another schema needs an adapter in code.
+settings. Supported adapter/evaluator pairs are `ragtruth_qa` /
+`paired_context_recovery_v1` for retrieval and `hotpotqa_distractor` /
+`hotpotqa_answer_v1` for generated-answer exact match and token F1.
+A dataset with another schema needs an adapter in code.
 Credentials, server addresses, and storage paths remain environment settings.
 
 Loading saves the selected entry and effective `limit` into the immutable
@@ -91,7 +124,7 @@ Single-document runs are useful smoke tests, not retrieval-quality evidence.
 Failed queries have blank metric cells; means cover successful queries only.
 Only `completed` runs should be compared as full benchmark results.
 
-## Generated answers and human evaluation
+## Generated answers and evaluation
 
 Answer runs use the same immutable benchmark snapshots and candidate corpus.
 `GET /api/benchmarks/v1/answer-runtime` reports the embedding model/revision and
@@ -125,7 +158,24 @@ receipt throughout the run. Retrieval and answer generation share one active-run
 slot. A hard failure stops the run and retains earlier answers. Refusals and
 `evidence-only` responses are retained as separate outcomes.
 
-Answer quality uses **`manual_review_v1`**. A human reviews a successfully
+HotpotQA runs use **`hotpotqa_answer_v1`**: exact match and token F1 with the
+[official normalization](https://github.com/hotpotqa/hotpot/blob/master/hotpot_evaluate_v1.py).
+Each question searches only its supplied candidate passages. Reference answers
+remain in benchmark storage and never enter a Nebula request. Scoring uses the
+entire returned answer, with no gold-guided answer extraction or judge-model call.
+Nebula's strict mode currently quotes evidence lines, so even a relevant long quote
+can score low against a short reference. These are development subset scores,
+not official leaderboard results or general hallucination scores.
+
+`automatic_scores` holds `exact_match` and `f1` fractions; `scored` counts attempted
+cases. The denominator is always the snapshot's total, including zero for refused,
+failed and unprocessed cases. Partial runs remain labelled and cannot be compared
+as completed runs. CSV includes the reference answer and per-case EM/F1, plus
+run status, total/scored counts and aggregate EM/F1 so partial exports retain
+their scoring denominator. Completed HotpotQA runs can be compared without
+human reviews.
+
+RAGTruth answer quality uses **`manual_review_v1`**. A human reviews a successfully
 generated answer after the run stops and records four independent judgments:
 correctness, groundedness, hallucination present, and citation accuracy, plus a
 reviewer name and optional notes. Scores remain null until reviewed; unanswered
@@ -134,6 +184,8 @@ fractions over reviewed answers only. Always show reviewed/answered/total
 coverage alongside means, and compare like-for-like benchmark fingerprints,
 candidate sets, top-k and evaluation versions. Human selection of cases can
 introduce review bias, especially when review coverage differs between runs.
+These same optional human reviews are available on HotpotQA answers, separately
+from its automatic scores.
 
 `POST /answer-runs/{run_id}/cases/{case_id}/review` accepts:
 
@@ -197,6 +249,11 @@ Start a standalone Nebula backend with `-corpus <corpus_path>` and its own
 `-module-storage` directory containing the embedding model bundle. This uses
 Nebula's existing launch contract; the model is not selected by this server.
 Wait until Nebula reports knowledge ready. Keep its files unchanged during a run.
+To use both benchmarks, load `hotpotqa` with the same `/benchmarks` POST endpoint
+and copy the exported Markdown passages from both snapshots into a dedicated
+combined corpus. Preserve filenames and bytes, keep the snapshots immutable, and
+point Nebula at the combined directory. Each runner selects only its benchmark's
+sources; HotpotQA further selects each question's supplied candidates.
 Then restart this benchmark server with:
 
 ```sh
@@ -206,8 +263,9 @@ cargo run --locked
 ```
 
 Previously loaded benchmarks survive restart. Both Nebula settings are optional
-for loading/browsing, but both are required for running. Remote generation is not
-needed: this version calls `/retrieve`, not `/query`.
+for loading/browsing, but both are required for running. Retrieval-only RAGTruth
+runs call `/retrieve` and do not need remote generation. HotpotQA is available
+through `/answer-runs`; `/runs` rejects answer-only benchmarks.
 
 ```sh
 curl -sS http://127.0.0.1:4319/api/benchmarks/v1/runs \
@@ -225,7 +283,8 @@ Nebula workspace are not selected.
 The loader permits up to 10000 cases, but the current Nebula protocol limits a
 source-selection request to 64 KiB (roughly 880 distinct documents). Oversized
 selections fail explicitly before querying; use a smaller load `limit` until
-Nebula supports larger selections.
+Nebula supports larger selections. HotpotQA validates each question's smaller
+candidate selection separately.
 
 ## HTTP interface
 

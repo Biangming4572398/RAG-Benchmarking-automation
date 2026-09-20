@@ -98,10 +98,13 @@ export function RetrievalDashboard({
     );
   }, [workspace.runs]);
 
+  const retrievalBenchmarks = workspace.benchmarks.filter(
+    (item) => item.metric_kind === 'paired_context_recovery_v1',
+  );
   const selectedBenchmark =
-    workspace.benchmarks.find((item) => item.id === state.benchmarkId) ??
-    workspace.benchmarks.find((item) => item.configuration?.key === 'ragtruth-qa') ??
-    workspace.benchmarks[0];
+    retrievalBenchmarks.find((item) => item.id === state.benchmarkId) ??
+    retrievalBenchmarks.find((item) => item.configuration?.key === 'ragtruth-qa') ??
+    retrievalBenchmarks[0];
   const activeRuns = workspace.runs.filter((run) => run.status === 'running');
   const canRun = workspace.connected && !!selectedBenchmark && !pending && activeRuns.length === 0;
   const byId = new Map(workspace.benchmarks.map((item) => [item.id, item]));
@@ -429,7 +432,7 @@ export function RetrievalDashboard({
             <h2>Run an architecture</h2>
             <span>Existing Nebula runtime</span>
           </div>
-          {!workspace.benchmarks.length && (
+          {!retrievalBenchmarks.length && (
             <p className={styles.muted}>
               No prepared snapshots yet. RAGTruth QA is defined in the team’s Git-managed YAML.
               Follow the backend README to prepare its snapshot and index the corpus in Nebula.
@@ -444,12 +447,12 @@ export function RetrievalDashboard({
                 setTopK('');
                 setSnapshot(null);
               }}
-              disabled={!!pending || !workspace.benchmarks.length}
+              disabled={!!pending || !retrievalBenchmarks.length}
             >
               <option value="" disabled>
                 No prepared snapshots
               </option>
-              {workspace.benchmarks.map((item) => (
+              {retrievalBenchmarks.map((item) => (
                 <option key={item.id} value={item.id}>
                   {benchmarkName(item)} · {item.case_count} cases · {item.id.slice(0, 8)}
                 </option>

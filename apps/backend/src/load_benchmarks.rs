@@ -26,6 +26,22 @@ pub struct Case {
     pub document_id: String,
     // Annotations describe these historical outputs, never a new Nebula response.
     pub reference_outputs: Vec<ReferenceOutput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_reference: Option<AnswerReference>,
+}
+
+/// Gold labels stay in the snapshot and never enter the exported retrieval corpus.
+#[derive(Clone, Deserialize, Serialize)]
+pub struct AnswerReference {
+    pub answer: String,
+    pub candidate_document_ids: Vec<String>,
+    pub supporting_facts: Vec<SupportingFact>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub struct SupportingFact {
+    pub title: String,
+    pub sentence_index: usize,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -58,6 +74,7 @@ pub fn load_benchmarks(request: &ResolvedBenchmark) -> Result<Benchmark> {
     request.definition.validate()?;
     match request.definition.adapter {
         Adapter::RagtruthQa => load_ragtruth(request),
+        Adapter::HotpotqaDistractor => crate::hotpotqa::load(request),
     }
 }
 
@@ -153,6 +170,7 @@ fn load_ragtruth(request: &ResolvedBenchmark) -> Result<Benchmark> {
                 query: query.into(),
                 document_id,
                 reference_outputs: vec![],
+                answer_reference: None,
             });
             position
         };

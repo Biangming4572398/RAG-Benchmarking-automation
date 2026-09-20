@@ -537,3 +537,14 @@
     grid-template-columns: 1fr;
   }
 }
+.automaticTable table {
+  min-width: 1620px;
+}
+
+.referenceAnswer {
+  margin: 16px 0;
+  padding: 16px;
+  border: 1px solid #d8dad1;
+  border-radius: 6px;
+  background: #f0f2eb;
+}

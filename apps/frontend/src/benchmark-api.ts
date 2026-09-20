@@ -39,6 +39,11 @@ export interface BenchmarkSnapshot {
     id: string;
     query: string;
     document_id: string;
+    answer_reference?: {
+      answer: string;
+      candidate_document_ids: string[];
+      supporting_facts: Array<{ title: string; sentence_index: number }>;
+    };
     reference_outputs: Array<{
       id: string;
       output: string;
@@ -172,6 +177,14 @@ function isSnapshot(value: unknown): value is BenchmarkSnapshot {
       (item) =>
         isRecord(item) &&
         hasStrings(item, ['id', 'query', 'document_id']) &&
+        (item.answer_reference === undefined ||
+          (isRecord(item.answer_reference) &&
+            isText(item.answer_reference.answer) &&
+            isList(isText)(item.answer_reference.candidate_document_ids) &&
+            Array.isArray(item.answer_reference.supporting_facts) &&
+            item.answer_reference.supporting_facts.every(
+              (fact) => isRecord(fact) && isText(fact.title) && isCount(fact.sentence_index),
+            ))) &&
         Array.isArray(item.reference_outputs) &&
         item.reference_outputs.every(
           (output) =>

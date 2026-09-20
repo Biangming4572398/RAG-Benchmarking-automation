@@ -1,4 +1,5 @@
-//! Generated answers and explicit human review. Historical RAGTruth labels never score new answers.
+//! Generated answers, reference-answer scoring, and explicit human review.
+//! Historical RAGTruth labels never score new answers.
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::Arc,
@@ -11,8 +12,9 @@ use uuid::Uuid;
 
 use crate::{
     Error, Result,
+    answer_scores::{AnswerScores, HOTPOTQA_EVALUATION, score_answer},
     config::NebulaConfig,
-    load_benchmarks::Benchmark,
+    load_benchmarks::{Benchmark, Case},
     storage::Store,
     trials::{RunStatus, now_ms},
 };
@@ -94,6 +96,10 @@ pub struct AnswerRunSummary {
     pub answered: usize,
     pub reviewed: usize,
     pub means: Option<AnswerMeans>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automatic_scores: Option<AnswerScores>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub scored: usize,
     pub error: Option<String>,
     pub scope: Value,
     pub watermark: Value,
@@ -178,6 +184,14 @@ pub struct AnswerCase {
     pub latency_ms: u64,
     pub error: Option<String>,
     pub review: Option<AnswerReview>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_answer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automatic_scores: Option<AnswerScores>,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 pub enum StartFailure {
@@ -371,7 +385,10 @@ pub async fn runtime(config: Option<&NebulaConfig>) -> AnswerRuntime {
     }
 }
 
-fn selected_sources(workspace: &Workspace, benchmark: &Benchmark) -> Result<Vec<String>> {
+fn selected_sources(
+    workspace: &Workspace,
+    benchmark: &Benchmark,
+) -> Result<BTreeMap<String, String>> {
     let mut selected = BTreeMap::new();
     for document in &benchmark.documents {
         let matching = workspace
@@ -391,19 +408,57 @@ fn selected_sources(workspace: &Workspace, benchmark: &Benchmark) -> Result<Vec<
         }
         selected.insert(document.id.clone(), matching[0].id.clone());
     }
-    let ids: Vec<_> = selected.into_values().collect();
+    let ids: Vec<_> = selected.values().collect();
     if ids.is_empty() || ids.iter().collect::<HashSet<_>>().len() != ids.len() {
         return Err(Error(
             "Nebula returned an invalid benchmark source selection".into(),
         ));
     }
-    let selection = json!({"scope":workspace.scope, "sourceIds":ids});
+    Ok(selected)
+}
+
+fn case_sources(
+    case: &Case,
+    benchmark: &Benchmark,
+    sources: &BTreeMap<String, String>,
+) -> Result<Vec<String>> {
+    if benchmark.metric_kind != HOTPOTQA_EVALUATION {
+        return Ok(sources.values().cloned().collect());
+    }
+    let reference = case
+        .answer_reference
+        .as_ref()
+        .ok_or_else(|| Error("HotpotQA case is missing its answer reference".into()))?;
+    if reference.answer.trim().is_empty()
+        || !(2..=10).contains(&reference.candidate_document_ids.len())
+        || reference
+            .candidate_document_ids
+            .iter()
+            .collect::<HashSet<_>>()
+            .len()
+            != reference.candidate_document_ids.len()
+    {
+        return Err(Error("HotpotQA requires a reference answer and 2–10 distinct candidate documents per question".into()));
+    }
+    reference
+        .candidate_document_ids
+        .iter()
+        .map(|id| {
+            sources.get(id).cloned().ok_or_else(|| {
+                Error("HotpotQA candidate document is absent from the prepared corpus".into())
+            })
+        })
+        .collect()
+}
+
+fn validate_selection(scope: &Value, ids: &[String]) -> Result<()> {
+    let selection = json!({"scope":scope, "sourceIds":ids});
     if serde_json::to_vec(&selection)?.len() > 64 * 1024 {
         return Err(Error(
             "Corpus selection exceeds Nebula's 64 KiB request limit".into(),
         ));
     }
-    Ok(ids)
+    Ok(())
 }
 
 pub async fn prepare(
@@ -416,6 +471,12 @@ pub async fn prepare(
         .validate()
         .map_err(|error| StartFailure::Invalid(error.to_string()))?;
     request.architecture_label = request.architecture_label.trim().to_owned();
+    let automatic = benchmark.metric_kind == HOTPOTQA_EVALUATION;
+    if !automatic && benchmark.metric_kind != "paired_context_recovery_v1" {
+        return Err(StartFailure::Invalid(
+            "Unsupported benchmark answer evaluation".into(),
+        ));
+    }
     let workspace = workspace(config)
         .await
         .map_err(|error| StartFailure::Unavailable(error.to_string()))?;
@@ -432,8 +493,14 @@ pub async fn prepare(
         .ok_or_else(|| {
             StartFailure::Invalid("Select an enabled Nebula generation profile".into())
         })?;
-    let source_ids = selected_sources(&workspace, benchmark)
+    let sources = selected_sources(&workspace, benchmark)
         .map_err(|error| StartFailure::Invalid(error.to_string()))?;
+    for case in &benchmark.cases {
+        let ids = case_sources(case, benchmark, &sources)
+            .map_err(|error| StartFailure::Invalid(error.to_string()))?;
+        validate_selection(&workspace.scope, &ids)
+            .map_err(|error| StartFailure::Invalid(error.to_string()))?;
+    }
     if !workspace.scope.is_object() || benchmark.cases.is_empty() {
         return Err(StartFailure::Invalid(
             "Benchmark or Nebula scope is empty".into(),
@@ -448,7 +515,12 @@ pub async fn prepare(
             },
             request,
             benchmark_fingerprint: fingerprint,
-            evaluation: EVALUATION.into(),
+            evaluation: if automatic {
+                HOTPOTQA_EVALUATION
+            } else {
+                EVALUATION
+            }
+            .into(),
             embedding_model: runtime
                 .embedding_model
                 .expect("available runtime has model"),
@@ -462,13 +534,15 @@ pub async fn prepare(
             answered: 0,
             reviewed: 0,
             means: None,
+            automatic_scores: automatic.then(AnswerScores::default),
+            scored: 0,
             error: None,
             scope: workspace.scope,
             watermark: workspace
                 .status
                 .watermark
                 .expect("available runtime has watermark"),
-            source_ids,
+            source_ids: sources.into_values().collect(),
         },
         cases: vec![],
     })
@@ -501,11 +575,12 @@ async fn execute_inner(
 ) -> Result<()> {
     let workspace = workspace(config).await?;
     let runtime = describe_runtime(&workspace);
+    let sources = selected_sources(&workspace, benchmark)?;
     if !runtime.available
         || runtime.embedding_model.as_ref() != Some(&run.summary.embedding_model)
         || workspace.scope != run.summary.scope
         || workspace.status.watermark.as_ref() != Some(&run.summary.watermark)
-        || selected_sources(&workspace, benchmark)? != run.summary.source_ids
+        || sources.values().cloned().collect::<Vec<_>>() != run.summary.source_ids
         || !runtime.profiles.iter().any(|profile| {
             profile.enabled
                 && profile.id == run.summary.generation_model.profile_id
@@ -540,15 +615,31 @@ async fn execute_inner(
             latency_ms: 0,
             error: None,
             review: None,
+            reference_answer: (run.summary.evaluation == HOTPOTQA_EVALUATION)
+                .then(|| {
+                    case.answer_reference
+                        .as_ref()
+                        .map(|reference| reference.answer.clone())
+                })
+                .flatten(),
+            automatic_scores: (run.summary.evaluation == HOTPOTQA_EVALUATION)
+                .then(AnswerScores::default),
         };
         let result: Result<()> = async {
+            let source_ids = case_sources(case, benchmark, &sources)?;
+            validate_selection(&run.summary.scope, &source_ids)?;
+            let selected_revisions = revisions
+                .iter()
+                .filter(|(id, _)| source_ids.contains(id))
+                .map(|(id, revision)| (id.clone(), revision.clone()))
+                .collect();
             // A fresh conversation isolates every question from provider history. Nebula evicts
             // old conversations after 32; cases persist the full answers and citations here.
             let conversation: Conversation = response(
                 client
                     .post(format!("{base}/conversations"))
                     .bearer_auth(&config.token)
-                    .json(&json!({"scope":run.summary.scope,"sourceIds":run.summary.source_ids})),
+                    .json(&json!({"scope":run.summary.scope,"sourceIds":source_ids})),
             )
             .await?;
             if !conversation.source_scope.r#ref.is_object()
@@ -586,7 +677,7 @@ async fn execute_inner(
             captured.evidence = generated.evidence.clone();
             captured.lineage = generated.lineage.clone();
             captured.model_receipt = generated.model_receipt.clone();
-            validate_answer(&generated, &conversation, &run.summary, &revisions)?;
+            validate_answer(&generated, &conversation, &run.summary, &selected_revisions)?;
             Ok(())
         }
         .await;
@@ -597,20 +688,37 @@ async fn execute_inner(
                 run.summary.completed += 1;
                 if captured.outcome == "answered" {
                     run.summary.answered += 1;
+                    if let Some(reference) = &captured.reference_answer {
+                        captured.automatic_scores = Some(score_answer(
+                            captured.answer.as_deref().unwrap_or_default(),
+                            reference,
+                        ));
+                    }
                 }
             }
             Err(error) => {
                 captured.error = Some(error.to_string());
                 run.summary.failed += 1;
+                record_scores(&mut run.summary, &captured);
                 run.cases.push(captured);
                 store.save_answer_run(run)?;
                 return Err(error);
             }
         }
+        record_scores(&mut run.summary, &captured);
         run.cases.push(captured);
         store.save_answer_run(run)?;
     }
     Ok(())
+}
+
+fn record_scores(summary: &mut AnswerRunSummary, case: &AnswerCase) {
+    if let (Some(means), Some(scores)) = (&mut summary.automatic_scores, case.automatic_scores) {
+        summary.scored += 1;
+        means.exact_match =
+            (means.exact_match + scores.exact_match / summary.total as f64).min(1.0);
+        means.f1 = (means.f1 + scores.f1 / summary.total as f64).min(1.0);
+    }
 }
 
 fn validate_answer(
@@ -763,6 +871,14 @@ impl AnswerRun {
             "citation_accuracy",
             "review_notes",
             "reviewed_at_ms",
+            "reference_answer",
+            "exact_match",
+            "f1",
+            "run_status",
+            "run_total",
+            "run_scored",
+            "run_exact_match",
+            "run_f1",
         ])?;
         for case in &self.cases {
             let review = case.review.as_ref();
@@ -805,6 +921,30 @@ impl AnswerRun {
                     .unwrap_or_default(),
                 review
                     .map(|review| review.reviewed_at_ms.to_string())
+                    .unwrap_or_default(),
+                case.reference_answer.clone().unwrap_or_default(),
+                case.automatic_scores
+                    .map(|scores| scores.exact_match.to_string())
+                    .unwrap_or_default(),
+                case.automatic_scores
+                    .map(|scores| scores.f1.to_string())
+                    .unwrap_or_default(),
+                match self.summary.status {
+                    RunStatus::Running => "running",
+                    RunStatus::Completed => "completed",
+                    RunStatus::Failed => "failed",
+                    RunStatus::Interrupted => "interrupted",
+                }
+                .to_owned(),
+                self.summary.total.to_string(),
+                self.summary.scored.to_string(),
+                self.summary
+                    .automatic_scores
+                    .map(|scores| scores.exact_match.to_string())
+                    .unwrap_or_default(),
+                self.summary
+                    .automatic_scores
+                    .map(|scores| scores.f1.to_string())
                     .unwrap_or_default(),
             ])?;
         }

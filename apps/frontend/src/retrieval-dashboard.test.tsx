@@ -158,6 +158,40 @@ describe('Live benchmarking dashboard', () => {
     expect(api.startRun).toHaveBeenCalledTimes(1);
   });
 
+  it('keeps generation-only HotpotQA snapshots out of retrieval, including a saved HotpotQA selection', async () => {
+    const hotpot: BenchmarkInfo = {
+      ...benchmark,
+      id: 'snapshot-hotpot',
+      metric_kind: 'hotpotqa_answer_v1',
+      configuration: {
+        key: 'hotpotqa',
+        definition: {
+          ...catalog.benchmarks['ragtruth-qa'],
+          name: 'HotpotQA',
+          adapter: 'hotpotqa',
+          evaluation: 'hotpotqa_answer_v1',
+        },
+      },
+    };
+    const api = apiWith();
+    api.listBenchmarks.mockResolvedValue([hotpot, benchmark]);
+    const user = userEvent.setup();
+    render(<BenchmarkDashboard api={api} initialState={{ benchmarkId: hotpot.id }} />);
+    await connected();
+    const snapshots = screen.getByLabelText('Loaded snapshot');
+    expect(snapshots).toHaveValue(benchmark.id);
+    expect(within(snapshots).getByRole('option', { name: /RAGTruth QA/ })).toBeInTheDocument();
+    expect(within(snapshots).queryByRole('option', { name: /HotpotQA/ })).not.toBeInTheDocument();
+    await user.type(screen.getByLabelText('Architecture label'), 'Retrieval baseline');
+    await user.click(screen.getByRole('button', { name: 'Start run' }));
+    await waitFor(() =>
+      expect(api.startRun).toHaveBeenCalledWith(
+        { benchmark_id: benchmark.id, label: 'Retrieval baseline' },
+        expect.any(AbortSignal),
+      ),
+    );
+  });
+
   it('leaves preparation to the YAML workflow when no saved snapshot exists', async () => {
     const api = apiWith();
     api.listBenchmarks.mockResolvedValue([]);

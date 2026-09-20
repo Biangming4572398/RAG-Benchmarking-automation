@@ -15,7 +15,9 @@ use backend::{
     answers::AnswerRun,
     catalog::Catalog,
     config::NebulaConfig,
-    load_benchmarks::{Benchmark, Case, Document, ReferenceOutput, digest},
+    load_benchmarks::{
+        AnswerReference, Benchmark, Case, Document, ReferenceOutput, SupportingFact, digest,
+    },
     server::router,
     storage::Store,
 };
@@ -54,6 +56,7 @@ fn benchmark() -> Benchmark {
                 quality: "bad".into(),
                 hallucination_labels: json!([{"text":"historical hallucination"}]),
             }],
+            answer_reference: None,
         })
         .collect();
     Benchmark {
@@ -65,6 +68,45 @@ fn benchmark() -> Benchmark {
         cases,
         documents,
     }
+}
+
+fn hotpot_benchmark() -> Benchmark {
+    let mut benchmark = benchmark();
+    benchmark.source = "local-scripted-hotpotqa.json".into();
+    benchmark.split = "dev".into();
+    benchmark.metric_kind = "hotpotqa_answer_v1".into();
+    benchmark.documents = (0..11)
+        .map(|index| {
+            let text = match index {
+                0 => "London".to_owned(),
+                1 => "Paris".to_owned(),
+                _ => format!("Distractor {index}"),
+            };
+            let id = digest(text.as_bytes());
+            Document {
+                filename: format!("hotpotqa-{id}.md"),
+                revision: id.clone(),
+                id,
+                text,
+            }
+        })
+        .collect();
+    for (index, case) in benchmark.cases.iter_mut().enumerate() {
+        case.document_id.clear();
+        case.reference_outputs.clear();
+        case.answer_reference = Some(AnswerReference {
+            answer: benchmark.documents[index].text.clone(),
+            candidate_document_ids: benchmark.documents[index..index + 10]
+                .iter()
+                .map(|doc| doc.id.clone())
+                .collect(),
+            supporting_facts: vec![SupportingFact {
+                title: "GOLD SUPPORT LABEL MUST NOT ENTER REQUESTS".into(),
+                sentence_index: 7,
+            }],
+        });
+    }
+    benchmark
 }
 
 struct TestServer {
@@ -109,6 +151,7 @@ enum Outcome {
     Answered,
     FailSecond,
     EvidenceOnly,
+    Refused,
     MissingReceipt,
     ChangedWatermark,
     ChangedModel,
@@ -117,6 +160,8 @@ enum Outcome {
     ReusedConversation,
     UnreadyEmbedding,
     DisabledProfile,
+    ConciseAnswer,
+    OtherCaseEvidence,
 }
 
 struct Script {
@@ -183,18 +228,27 @@ async fn conversation(
     assert_eq!(body["scope"], scope());
     let mut actual = body["sourceIds"].as_array().unwrap().clone();
     actual.sort_by_key(Value::to_string);
-    let mut expected = script
-        .benchmark
-        .documents
-        .iter()
-        .map(|doc| json!(doc.id))
-        .collect::<Vec<_>>();
+    let mut conversations = script.conversations.lock().unwrap();
+    let case = &script.benchmark.cases[conversations.len() % script.benchmark.cases.len()];
+    let mut expected = if let Some(reference) = &case.answer_reference {
+        reference
+            .candidate_document_ids
+            .iter()
+            .map(|id| json!(id))
+            .collect::<Vec<_>>()
+    } else {
+        script
+            .benchmark
+            .documents
+            .iter()
+            .map(|doc| json!(doc.id))
+            .collect::<Vec<_>>()
+    };
     expected.sort_by_key(Value::to_string);
     assert_eq!(
         actual, expected,
-        "every case must use the complete candidate corpus"
+        "each case must use its complete candidate corpus"
     );
-    let mut conversations = script.conversations.lock().unwrap();
     conversations.push(body);
     let id = if matches!(script.outcome, Outcome::ReusedConversation) {
         "conversation-reused".into()
@@ -250,8 +304,20 @@ async fn query(
         "route":{"collectionIds":[],"fallback":true}
     });
     match script.outcome {
-        Outcome::EvidenceOnly => {
-            result["outcome"] = json!("evidence-only");
+        Outcome::ConciseAnswer => {
+            result["answer"] = json!(document.text);
+        }
+        Outcome::OtherCaseEvidence => {
+            let foreign = script.benchmark.documents.last().unwrap();
+            result["evidence"][0]["sourceId"] = json!(foreign.id);
+            result["evidence"][0]["sourceRevision"] = json!(foreign.revision);
+        }
+        Outcome::EvidenceOnly | Outcome::Refused => {
+            result["outcome"] = json!(if matches!(script.outcome, Outcome::Refused) {
+                "refused"
+            } else {
+                "evidence-only"
+            });
             result["reason"] = json!("No supported answer");
             result["answer"] = json!("");
             result["lineage"] = json!([]);
@@ -998,4 +1064,214 @@ async fn summary_polling_uses_cache_updated_only_by_successful_persistence_and_r
             .reviewer,
         "Test reviewer"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hotpot_answers_use_per_question_candidates_keep_gold_private_and_score_full_answers() {
+    let dir = TempDir::new().unwrap();
+    let benchmark = hotpot_benchmark();
+    let store = Arc::new(Store::open(dir.path()).unwrap());
+    store.save_benchmark(&benchmark).unwrap();
+    let (nebula, script) = scripted_nebula(&benchmark, Outcome::Answered, false).await;
+    let server = benchmark_server(store, Some(&nebula)).await;
+    let client = client();
+    let created = start(&client, &server, &benchmark).await;
+    assert_eq!(created["evaluation"], "hotpotqa_answer_v1");
+    assert_eq!(
+        created["automatic_scores"],
+        json!({"exact_match":0.0,"f1":0.0})
+    );
+    let id = created["id"].as_str().unwrap();
+    let run = wait_run(&client, &server, id).await;
+    assert_eq!(run["status"], "completed");
+    assert_eq!(run["scored"], 2);
+    assert_eq!(run["automatic_scores"], json!({"exact_match":0.0,"f1":0.5}));
+    assert!(run["means"].is_null());
+    assert_eq!(run["reviewed"], 0);
+    assert_eq!(run["cases"][0]["reference_answer"], "London");
+    assert_eq!(run["cases"][0]["answer"], "Generated answer: London");
+    for body in script
+        .queries
+        .lock()
+        .unwrap()
+        .iter()
+        .chain(script.conversations.lock().unwrap().iter())
+    {
+        let encoded = body.to_string();
+        for private in [
+            "London",
+            "Paris",
+            "GOLD SUPPORT",
+            "supporting_facts",
+            "answer_reference",
+        ] {
+            assert!(
+                !encoded.contains(private),
+                "Gold data leaked to generation: {private}"
+            );
+        }
+    }
+    let rows = csv_rows(&csv(&client, &server, id).await);
+    assert_eq!(rows[0]["evaluation"], "hotpotqa_answer_v1");
+    assert_eq!(rows[0]["reference_answer"], "London");
+    assert_eq!(rows[0]["exact_match"], "0");
+    assert_eq!(rows[0]["f1"], "0.5");
+    let reviewed = response(
+        client
+            .post(format!(
+                "{}/answer-runs/{id}/cases/case-0/review",
+                base(&server)
+            ))
+            .json(&review(true)),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(reviewed["automatic_scores"], run["automatic_scores"]);
+    assert_eq!(reviewed["means"]["correctness"], 1.0);
+    response(
+        client
+            .post(format!("{}/runs", base(&server)))
+            .json(&json!({"benchmark_id":benchmark.id})),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hotpot_scores_use_all_selected_cases_as_denominator_while_running() {
+    let dir = TempDir::new().unwrap();
+    let benchmark = hotpot_benchmark();
+    let store = Arc::new(Store::open(dir.path()).unwrap());
+    store.save_benchmark(&benchmark).unwrap();
+    let (nebula, script) = scripted_nebula(&benchmark, Outcome::ConciseAnswer, true).await;
+    let server = benchmark_server(store, Some(&nebula)).await;
+    let client = client();
+    let created = start(&client, &server, &benchmark).await;
+    let id = created["id"].as_str().unwrap();
+    script.query_started.notified().await;
+    script.release_query.as_ref().unwrap().notify_one();
+    script.query_started.notified().await;
+    let partial = response(
+        client.get(format!("{}/answer-runs/{id}", base(&server))),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(partial["status"], "running");
+    assert_eq!(partial["scored"], 1);
+    assert_eq!(
+        partial["automatic_scores"],
+        json!({"exact_match":0.5,"f1":0.5})
+    );
+    script.release_query.as_ref().unwrap().notify_one();
+    let run = wait_run(&client, &server, id).await;
+    assert_eq!(run["scored"], 2);
+    assert_eq!(run["automatic_scores"], json!({"exact_match":1.0,"f1":1.0}));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hotpot_nonanswers_and_errors_score_zero_without_inflating_partial_results() {
+    for (outcome, status, completed, failed, scored, f1) in [
+        (Outcome::EvidenceOnly, "completed", 2, 0, 2, 0.0),
+        (Outcome::Refused, "completed", 2, 0, 2, 0.0),
+        (Outcome::FailSecond, "failed", 1, 1, 2, 0.005),
+        (Outcome::OtherCaseEvidence, "failed", 0, 1, 1, 0.0),
+    ] {
+        let dir = TempDir::new().unwrap();
+        let mut benchmark = hotpot_benchmark();
+        if matches!(outcome, Outcome::FailSecond) {
+            for index in 2..100 {
+                let mut unprocessed = benchmark.cases[0].clone();
+                unprocessed.id = format!("unprocessed-{index}");
+                unprocessed.query = format!("Unprocessed question {index}?");
+                benchmark.cases.push(unprocessed);
+            }
+        }
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        store.save_benchmark(&benchmark).unwrap();
+        let (nebula, _) = scripted_nebula(&benchmark, outcome, false).await;
+        let server = benchmark_server(store, Some(&nebula)).await;
+        let client = client();
+        let created = start(&client, &server, &benchmark).await;
+        let run = wait_run(&client, &server, created["id"].as_str().unwrap()).await;
+        assert_eq!(run["status"], status);
+        assert_eq!(run["completed"], completed);
+        assert_eq!(run["failed"], failed);
+        assert_eq!(run["scored"], scored);
+        assert_eq!(run["automatic_scores"]["exact_match"], 0.0);
+        assert_eq!(run["automatic_scores"]["f1"], f1);
+        let rows = csv_rows(&csv(&client, &server, created["id"].as_str().unwrap()).await);
+        for row in &rows {
+            assert_eq!(row["run_status"], status);
+            assert_eq!(row["run_total"], benchmark.cases.len().to_string());
+            assert_eq!(row["run_scored"], scored.to_string());
+            assert_eq!(row["run_exact_match"], "0");
+            assert_eq!(row["run_f1"].parse::<f64>().unwrap(), f1);
+        }
+        if matches!(outcome, Outcome::FailSecond) {
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0]["f1"], "0.5");
+            assert_eq!(rows[0]["run_total"], "100");
+            assert_eq!(rows[0]["run_f1"], "0.005");
+        }
+        assert_eq!(
+            run["cases"].as_array().unwrap().last().unwrap()["automatic_scores"],
+            json!({"exact_match":0.0,"f1":0.0})
+        );
+        if matches!(outcome, Outcome::OtherCaseEvidence) {
+            assert!(
+                run["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("outside the pinned")
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hotpot_validates_candidate_selections_individually_instead_of_the_large_union() {
+    let mut benchmark = hotpot_benchmark();
+    // A realistic large distractor union exceeds Nebula's per-request 64 KiB cap.
+    // Each question still sends only its ten candidates.
+    for index in 11..1100 {
+        let id = digest(format!("large-union-document-{index}").as_bytes());
+        benchmark.documents.push(Document {
+            id: id.clone(),
+            filename: format!("hotpotqa-{id}.md"),
+            revision: id,
+            text: format!("Document {index}"),
+        });
+    }
+    let (nebula, _) = scripted_nebula(&benchmark, Outcome::Answered, false).await;
+    let config = NebulaConfig {
+        base_url: format!("{}/api/nebula/v1", nebula.base),
+        token: TOKEN.into(),
+    };
+    let request = backend::answers::StartAnswerRunRequest {
+        benchmark_id: benchmark.id,
+        architecture_label: "Large candidate union".into(),
+        profile_id: PROFILE.into(),
+    };
+    let run =
+        backend::answers::prepare(&config, request.clone(), &benchmark, "fingerprint".into()).await;
+    assert!(
+        run.is_ok(),
+        "A large union must not reject a small per-case selection"
+    );
+    assert_eq!(
+        run.unwrap_or_else(|_| unreachable!())
+            .summary
+            .source_ids
+            .len(),
+        1100
+    );
+    benchmark.cases[0]
+        .answer_reference
+        .as_mut()
+        .unwrap()
+        .candidate_document_ids[0] = "missing-candidate".into();
+    assert!(matches!(
+        backend::answers::prepare(&config, request, &benchmark, "fingerprint".into()).await,
+        Err(backend::answers::StartFailure::Invalid(_))
+    ));
 }

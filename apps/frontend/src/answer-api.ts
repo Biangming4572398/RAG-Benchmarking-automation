@@ -32,11 +32,16 @@ export interface AnswerMeans {
   citation_accuracy: number;
 }
 
+export interface AutomaticAnswerScores {
+  exact_match: number;
+  f1: number;
+}
+
 export interface AnswerRunSummary {
   id: string;
   request: StartAnswerRunRequest;
   benchmark_fingerprint: string;
-  evaluation: 'manual_review_v1';
+  evaluation: 'manual_review_v1' | 'hotpotqa_answer_v1';
   embedding_model: AnswerEmbeddingModel;
   generation_model: { profile_id: string; label: string };
   top_k: 8;
@@ -49,6 +54,8 @@ export interface AnswerRunSummary {
   answered: number;
   reviewed: number;
   means: AnswerMeans | null;
+  scored?: number;
+  automatic_scores?: AutomaticAnswerScores;
   error: string | null;
   scope: unknown;
   watermark: unknown;
@@ -103,6 +110,8 @@ export interface AnswerCase {
   latency_ms: number;
   error: string | null;
   review: AnswerReview | null;
+  reference_answer?: string;
+  automatic_scores?: AutomaticAnswerScores;
 }
 
 export interface AnswerRun extends AnswerRunSummary {
@@ -192,13 +201,51 @@ function isMeans(value: unknown): value is AnswerMeans {
   );
 }
 
+function isAutomaticScores(value: unknown): value is AutomaticAnswerScores {
+  return (
+    isRecord(value) &&
+    ['exact_match', 'f1'].every(
+      (key) =>
+        typeof value[key] === 'number' &&
+        Number.isFinite(value[key]) &&
+        value[key] >= 0 &&
+        value[key] <= 1,
+    )
+  );
+}
+
+function hasEvaluationScores(value: ValueRecord): boolean {
+  if (value.evaluation === 'manual_review_v1') {
+    return (
+      value.automatic_scores === undefined && (value.scored === undefined || value.scored === 0)
+    );
+  }
+  if (
+    value.evaluation !== 'hotpotqa_answer_v1' ||
+    !isCount(value.completed) ||
+    !isCount(value.failed) ||
+    !isCount(value.total) ||
+    !isAutomaticScores(value.automatic_scores)
+  ) {
+    return false;
+  }
+  const scored = value.scored === undefined ? 0 : value.scored;
+  const ceiling = value.total === 0 ? 0 : (value.completed + value.failed) / value.total;
+  return (
+    isCount(scored) &&
+    scored === value.completed + value.failed &&
+    value.automatic_scores.exact_match <= ceiling + 1e-9 &&
+    value.automatic_scores.f1 <= ceiling + 1e-9
+  );
+}
+
 function isSummary(value: unknown): value is AnswerRunSummary {
   return (
     isRecord(value) &&
     isNonemptyText(value.id) &&
     isStartRequest(value.request) &&
     isText(value.benchmark_fingerprint) &&
-    value.evaluation === 'manual_review_v1' &&
+    hasEvaluationScores(value) &&
     isEmbeddingModel(value.embedding_model) &&
     isRecord(value.generation_model) &&
     isNonemptyText(value.generation_model.profile_id) &&
@@ -300,6 +347,35 @@ function isCase(value: unknown): value is AnswerCase {
 
 function isRun(value: unknown): value is AnswerRun {
   if (!isSummary(value) || !('cases' in value) || !isList(isCase)(value.cases)) return false;
+  if (value.evaluation === 'hotpotqa_answer_v1') {
+    if (
+      value.cases.length !== (value.scored ?? 0) ||
+      !value.cases.every(
+        (item) =>
+          isNonemptyText(item.reference_answer) &&
+          isAutomaticScores(item.automatic_scores) &&
+          (item.automatic_scores.exact_match === 0 || item.automatic_scores.exact_match === 1) &&
+          ((item.status === 'ok' && item.outcome === 'answered') ||
+            (item.automatic_scores.exact_match === 0 && item.automatic_scores.f1 === 0)),
+      )
+    ) {
+      return false;
+    }
+    for (const metric of ['exact_match', 'f1'] as const) {
+      const mean =
+        value.total === 0
+          ? 0
+          : value.cases.reduce((sum, item) => sum + item.automatic_scores![metric], 0) /
+            value.total;
+      if (Math.abs(mean - value.automatic_scores![metric]) > 1e-9) return false;
+    }
+  } else if (
+    value.cases.some(
+      (item) => item.automatic_scores !== undefined || item.reference_answer !== undefined,
+    )
+  ) {
+    return false;
+  }
   return (
     value.cases.length === value.completed + value.failed &&
     new Set(value.cases.map((item) => item.case_id)).size === value.cases.length &&
@@ -407,7 +483,7 @@ export function createAnswerApi(fetchImpl: typeof fetch = globalThis.fetch): Ans
   };
 }
 
-/** Compare fully answered, fully reviewed runs only; model/architecture choices may differ. */
+/** Compare complete runs under the same evaluator; model/architecture choices may differ. */
 export function answerComparabilityKey(run: AnswerRunSummary): string | null {
   if (
     !isSummary(run) ||
@@ -415,9 +491,9 @@ export function answerComparabilityKey(run: AnswerRunSummary): string | null {
     run.total < 1 ||
     run.completed !== run.total ||
     run.failed !== 0 ||
-    run.answered !== run.total ||
-    run.reviewed !== run.answered ||
-    run.means === null ||
+    (run.evaluation === 'manual_review_v1'
+      ? run.answered !== run.total || run.reviewed !== run.answered || run.means === null
+      : run.scored !== run.total || run.automatic_scores === undefined) ||
     !run.benchmark_fingerprint.trim() ||
     run.source_ids.length === 0 ||
     run.source_ids.some((id) => !id.trim())

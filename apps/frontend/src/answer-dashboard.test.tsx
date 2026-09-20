@@ -36,6 +36,25 @@ const benchmark: BenchmarkInfo = {
     },
   },
 };
+const hotpotBenchmark: BenchmarkInfo = {
+  ...benchmark,
+  id: 'snapshot-hotpot',
+  source: 'hotpot-dev.json',
+  split: 'dev',
+  metric_kind: 'hotpotqa_answer_v1',
+  fingerprint: 'hotpot-fingerprint',
+  configuration: {
+    key: 'hotpotqa',
+    definition: {
+      name: 'HotpotQA',
+      source: 'hotpot-dev.json',
+      split: 'dev',
+      adapter: 'hotpotqa',
+      evaluation: 'hotpotqa_answer_v1',
+      defaults: { limit: 2, top_k: 8 },
+    },
+  },
+};
 const runtime: AnswerRuntime = {
   available: true,
   reason: null,
@@ -120,6 +139,24 @@ function detail(changes: Partial<AnswerRun> = {}): AnswerRun {
     ...changes,
   };
 }
+function hotpotRun(changes: Partial<AnswerRunSummary> = {}): AnswerRunSummary {
+  return run({
+    id: 'hotpot-baseline',
+    request: {
+      ...run().request,
+      benchmark_id: hotpotBenchmark.id,
+      architecture_label: 'Hotpot baseline',
+    },
+    benchmark_fingerprint: hotpotBenchmark.fingerprint,
+    evaluation: 'hotpotqa_answer_v1',
+    answered: 1,
+    reviewed: 0,
+    means: null,
+    scored: 2,
+    automatic_scores: { exact_match: 0.5, f1: 0.5 },
+    ...changes,
+  });
+}
 function setup(runs: AnswerRunSummary[] = []) {
   const api = {
     getRuntime: vi.fn<AnswerApi['getRuntime']>().mockResolvedValue(runtime),
@@ -165,21 +202,25 @@ describe('Generated answer dashboard', () => {
   it('starts only the selected saved snapshot, architecture label and enabled runtime profile', async () => {
     const user = userEvent.setup();
     const { api, benchmarkApi } = setup();
-    benchmarkApi.listBenchmarks.mockResolvedValue([benchmark, { ...benchmark, id: 'snapshot-b' }]);
+    benchmarkApi.listBenchmarks.mockResolvedValue([benchmark, hotpotBenchmark]);
     render(<AnswerDashboard api={api} benchmarkApi={benchmarkApi} />);
     await connected();
     expect(screen.getByRole('main').firstElementChild).toBe(
       screen.getByRole('region', { name: 'Generated answer results' }),
     );
     expect(screen.queryByRole('option', { name: 'Unavailable generator' })).not.toBeInTheDocument();
-    await user.selectOptions(screen.getByLabelText('Benchmark snapshot'), 'snapshot-b');
+    const snapshots = within(screen.getByLabelText('Benchmark snapshot'));
+    expect(snapshots.getByRole('option', { name: /RAGTruth QA/ })).toBeInTheDocument();
+    expect(snapshots.getByRole('option', { name: /HotpotQA/ })).toBeInTheDocument();
+    await user.selectOptions(screen.getByLabelText('Benchmark snapshot'), hotpotBenchmark.id);
+    expect(screen.getByText('HotpotQA EM/F1 v1')).toBeVisible();
     await user.selectOptions(screen.getByLabelText('Generation model'), 'generator-b');
     await user.type(screen.getByLabelText('Architecture label'), '  Hybrid candidate  ');
     await user.click(screen.getByRole('button', { name: 'Generate answers' }));
     await waitFor(() =>
       expect(api.startRun).toHaveBeenCalledWith(
         {
-          benchmark_id: 'snapshot-b',
+          benchmark_id: hotpotBenchmark.id,
           architecture_label: 'Hybrid candidate',
           profile_id: 'generator-b',
         },
@@ -191,6 +232,106 @@ describe('Generated answer dashboard', () => {
     expect(api.startRun.mock.calls[0][0]).not.toHaveProperty('token');
     expect(benchmarkApi.loadBenchmark).not.toHaveBeenCalled();
     expect(benchmarkApi.getCatalog).not.toHaveBeenCalled();
+  });
+
+  it('shows automatic scores over all HotpotQA cases before optional human review and keeps reference answers separate', async () => {
+    const hotpot: AnswerRun = {
+      ...hotpotRun(),
+      cases: [
+        answer({
+          query: 'Which city is described?',
+          answer: 'London',
+          reference_answer: 'London',
+          automatic_scores: { exact_match: 1, f1: 1 },
+        }),
+        answer({
+          case_id: 'case-b',
+          query: 'Which country is described?',
+          outcome: 'refused',
+          answer: null,
+          model_receipt: null,
+          reason: 'The evidence is insufficient.',
+          reference_answer: 'France',
+          automatic_scores: { exact_match: 0, f1: 0 },
+        }),
+      ],
+    };
+    const { api, benchmarkApi } = setup([hotpot]);
+    api.getRun.mockResolvedValue(hotpot);
+    benchmarkApi.listBenchmarks.mockResolvedValue([benchmark, hotpotBenchmark]);
+    const user = userEvent.setup();
+    render(<AnswerDashboard api={api} benchmarkApi={benchmarkApi} />);
+    await connected();
+    const table = within(screen.getByRole('table'));
+    expect(table.getByRole('columnheader', { name: 'Answer EM' })).toBeVisible();
+    expect(table.getByRole('columnheader', { name: 'Answer F1' })).toBeVisible();
+    const row = within(table.getByRole('row', { name: /Hotpot baseline/ }));
+    expect(row.getAllByRole('cell', { name: '50.0% 2 / 2 scored' })).toHaveLength(2);
+    expect(row.getByText('1 / 2 answered')).toBeVisible();
+    expect(row.getByText('Optional review')).toBeVisible();
+    expect(row.getAllByRole('cell', { name: '—' })).toHaveLength(4);
+    expect(table.getByText(/HotpotQA EM\/F1 cover all cases/)).toBeVisible();
+
+    await user.click(row.getByRole('button', { name: 'Review answers for hotpot-b' }));
+    const panel = within(await screen.findByRole('region', { name: 'Answer run details' }));
+    const automatic = within(panel.getByRole('region', { name: 'Automatic answer assessment' }));
+    expect(automatic.getByRole('heading', { name: 'Reference answer' })).toBeVisible();
+    expect(automatic.getByText('London')).toBeVisible();
+    expect(automatic.getByText('Exact match: 100.0% · Token F1: 100.0%')).toBeVisible();
+    expect(automatic.getByText(/Human review below is separate/)).toBeVisible();
+    const reviewForm = within(panel.getByRole('form', { name: 'Review generated answer' }));
+    for (const select of reviewForm.getAllByRole('combobox')) expect(select).toHaveValue('');
+
+    await user.click(panel.getByRole('button', { name: 'Next answer' }));
+    const refusalScores = within(
+      panel.getByRole('region', { name: 'Automatic answer assessment' }),
+    );
+    expect(refusalScores.getByText('France')).toBeVisible();
+    expect(refusalScores.getByText('Exact match: 0.0% · Token F1: 0.0%')).toBeVisible();
+    expect(panel.getByText(/automatic answer scores are zero/)).toBeVisible();
+    expect(panel.queryByRole('form', { name: 'Review generated answer' })).not.toBeInTheDocument();
+    expect(api.saveReview).not.toHaveBeenCalled();
+  });
+
+  it('compares completed HotpotQA runs without human reviews and highlights automatic scores only', async () => {
+    const candidate = hotpotRun({
+      id: 'hotpot-candidate',
+      request: { ...hotpotRun().request, architecture_label: 'Hotpot candidate' },
+      answered: 2,
+      automatic_scores: { exact_match: 1, f1: 1 },
+    });
+    const partial = hotpotRun({
+      id: 'hotpot-partial',
+      request: { ...hotpotRun().request, architecture_label: 'Incomplete Hotpot run' },
+      status: 'failed',
+      completed: 1,
+      failed: 1,
+    });
+    const manual = run({ benchmark_fingerprint: hotpotBenchmark.fingerprint });
+    const { api, benchmarkApi } = setup([hotpotRun(), candidate, partial, manual]);
+    benchmarkApi.listBenchmarks.mockResolvedValue([benchmark, hotpotBenchmark]);
+    const user = userEvent.setup();
+    render(<AnswerDashboard api={api} benchmarkApi={benchmarkApi} />);
+    await connected();
+    expect(
+      screen.queryByRole('button', { name: 'Compare answer setup for hotpot-p' }),
+    ).not.toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Compare answer setup for hotpot-b' }));
+    const table = within(screen.getByRole('table'));
+    expect(table.getAllByRole('row')).toHaveLength(3);
+    const candidateRow = within(table.getByRole('row', { name: /Hotpot candidate/ }));
+    for (const cell of candidateRow.getAllByRole('cell', { name: '100.0% 2 / 2 scored' })) {
+      expect(cell).toHaveAttribute('data-best', 'true');
+    }
+    expect(candidateRow.getAllByRole('cell', { name: '—' })).toHaveLength(4);
+    const baselineRow = within(table.getByRole('row', { name: /Hotpot baseline/ }));
+    expect(baselineRow.getByText('1 / 2 answered')).toBeVisible();
+    for (const cell of baselineRow.getAllByRole('cell', { name: '50.0% 2 / 2 scored' })) {
+      expect(cell).not.toHaveAttribute('data-best');
+    }
+    expect(table.queryByText('Dense baseline')).not.toBeInTheDocument();
+    expect(table.queryByText('Incomplete Hotpot run')).not.toBeInTheDocument();
+    expect(screen.getByText(/Comparing 2 completed automatically scored runs/)).toBeVisible();
   });
 
   it('disables generation when runtime is unavailable while displaying saved results and missing review scores', async () => {

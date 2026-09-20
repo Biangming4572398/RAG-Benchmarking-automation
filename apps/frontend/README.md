@@ -5,13 +5,13 @@ contracts, styling, and the Genesis SDK adapter belong to this submodule. Genesi
 only discovers the module, displays it, and supplies generic development proxy
 support. The results table is the first content in each dashboard tab: Retrieval and Generated answers. Benchmark
 definitions live in Git-managed [`apps/backend/benchmarks.yaml`](../backend/benchmarks.yaml),
-starting with RAGTruth QA; the frontend does not create or edit them.
+including RAGTruth QA and HotpotQA (development/distractor); the frontend does not create or edit them.
 
 ## Connect and open
 
 Follow the [backend instructions](../../README.md#start) to start the server,
-load the `ragtruth-qa` snapshot using the documented curl command, and connect
-Nebula to its exported corpus. The YAML catalog is read at startup; it does not
+load `ragtruth-qa` and/or `hotpotqa` using the documented curl command, and connect
+Nebula to their exported passages. The YAML catalog is read at startup; it does not
 automatically load snapshots.
 
 The local benchmark server does not require a token. `NEBULA_API_TOKEN` still
@@ -79,7 +79,18 @@ shows unavailable runtimes honestly and still displays saved results. Retrieval
 and answer generation share the server's single active-run limit. Starting a run
 can incur charges through the configured model provider.
 
-Select **Answers & review** after a run stops. Read each question, generated answer,
+HotpotQA appears in **Generated answers**. Its **Answer EM** and **Answer F1**
+columns are scored automatically against reference answers, with the denominator
+fixed to all cases in the selected snapshot. Each question selects its supplied candidate passages (typically ten); gold answers never enter the index or model request. Refused,
+failed and unprocessed cases contribute zero, and partial runs remain labelled.
+The v1 evaluator scores the entire returned answer using HotpotQA normalization,
+without extracting text using the gold answer. Nebula currently quotes full
+evidence lines, so exact match can be low even when a passage contains the right
+short answer. These are development subset results, not official leaderboard
+scores. Supporting-fact and joint metrics are not implemented.
+
+Select **Answers & review** after a run stops. HotpotQA details also show the
+reference answer and per-case automatic scores. Read each question, generated answer,
 evidence and citation map, then explicitly assess correctness, groundedness,
 hallucination presence and citation accuracy. Supply a reviewer name; notes are
 optional. A saved review can be replaced. These are **human review v1** judgements,
@@ -87,9 +98,9 @@ not an automatic model-judge evaluation. Correctness, groundedness and citation
 accuracy show the fraction of reviewed answers marked as passing; hallucinations
 show the fraction marked present, so lower is better.
 
-Unreviewed scores stay blank. Answer coverage and review coverage remain visible;
-refusals, evidence-only responses and failures are not assigned fabricated scores.
-Only completed runs with every case answered and reviewed can use Compare setup.
+Unreviewed human scores stay blank. Answer coverage and review coverage remain visible.
+Completed HotpotQA runs with every case processed can use Compare setup without
+human review; RAGTruth requires every case answered and reviewed.
 Comparisons require the same snapshot fingerprint, top-k, evaluator version and
 candidate source set. Architecture and model pairings may vary. Partial runs can
 still be inspected, reviewed where answers exist, and exported as CSV.

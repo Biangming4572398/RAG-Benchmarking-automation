@@ -204,6 +204,7 @@ dependencies = [
  "axum",
  "csv",
  "polars",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

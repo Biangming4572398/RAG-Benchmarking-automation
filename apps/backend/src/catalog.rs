@@ -15,6 +15,8 @@ pub struct Catalog {
 pub struct BenchmarkDefinition {
     pub name: String,
     pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_sha256: Option<String>,
     pub split: String,
     pub adapter: Adapter,
     pub evaluation: Evaluation,
@@ -25,18 +27,21 @@ pub struct BenchmarkDefinition {
 #[serde(rename_all = "snake_case")]
 pub enum Adapter {
     RagtruthQa,
+    HotpotqaDistractor,
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Evaluation {
     PairedContextRecoveryV1,
+    HotpotqaAnswerV1,
 }
 
 impl Evaluation {
     pub fn metric_kind(self) -> &'static str {
         match self {
             Self::PairedContextRecoveryV1 => "paired_context_recovery_v1",
+            Self::HotpotqaAnswerV1 => "hotpotqa_answer_v1",
         }
     }
 }
@@ -132,8 +137,43 @@ impl BenchmarkDefinition {
         if self.name.trim().is_empty() || self.source.trim().is_empty() {
             return Err(Error("name and source must not be empty".into()));
         }
-        if !["train", "test"].contains(&self.split.as_str()) {
-            return Err(Error("RAGTruth split must be train or test".into()));
+        match (self.adapter, self.evaluation) {
+            (Adapter::RagtruthQa, Evaluation::PairedContextRecoveryV1) => {
+                if !["train", "test"].contains(&self.split.as_str()) {
+                    return Err(Error("RAGTruth split must be train or test".into()));
+                }
+                if self.source_sha256.is_some() {
+                    return Err(Error(
+                        "source_sha256 is supported for HotpotQA JSON only".into(),
+                    ));
+                }
+            }
+            (Adapter::HotpotqaDistractor, Evaluation::HotpotqaAnswerV1) => {
+                if self.split != "dev" {
+                    return Err(Error("HotpotQA distractor split must be dev".into()));
+                }
+                if let Some(checksum) = &self.source_sha256
+                    && (checksum.len() != 64
+                        || !checksum.bytes().all(|byte| byte.is_ascii_hexdigit()))
+                {
+                    return Err(Error(
+                        "source_sha256 must be a 64-digit SHA-256 checksum".into(),
+                    ));
+                }
+                if self.source.contains("://") {
+                    let url = reqwest::Url::parse(&self.source).map_err(|_| {
+                        Error("HotpotQA source must be a local path or public HTTP(S) URL".into())
+                    })?;
+                    if !["http", "https"].contains(&url.scheme())
+                        || !url.username().is_empty()
+                        || url.password().is_some()
+                        || url.fragment().is_some()
+                    {
+                        return Err(Error("HotpotQA source must be a local path or public HTTP(S) URL without credentials or fragments".into()));
+                    }
+                }
+            }
+            _ => return Err(Error("Adapter and evaluation do not match".into())),
         }
         if !(1..=10_000).contains(&self.defaults.limit) {
             return Err(Error(

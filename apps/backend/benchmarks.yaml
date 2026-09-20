@@ -8,3 +8,14 @@ benchmarks:
     defaults:
       limit: 100
       top_k: 8
+  hotpotqa:
+    name: HotpotQA (distractor dev)
+    # Byte-identical mirror of the authors' official development distractor JSON.
+    source: "https://huggingface.co/datasets/RAGLAB/data/resolve/c33b09b7fa5099b89830e84f9bdff78329268d9b/eval_datasets/HotPotQA/hotpot_dev_distractor_v1.json"
+    source_sha256: "4e9ecb5c8d3b719f624d66b60f8d56bf227f03914f5f0753d6fa1b359d7104ea"
+    split: dev
+    adapter: hotpotqa_distractor
+    evaluation: hotpotqa_answer_v1
+    defaults:
+      limit: 100
+      top_k: 8

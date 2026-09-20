@@ -37,6 +37,12 @@ fn invalid_catalogs_fail_before_loading_any_dataset() {
         YAML.replace("limit: 100", "limit: 0"),
         YAML.replace("top_k: 8", "top_k: 101"),
         YAML.replace("split: test", "split: other"),
+        YAML.replace("split: dev", "split: train"),
+        YAML.replace(
+            "evaluation: hotpotqa_answer_v1",
+            "evaluation: paired_context_recovery_v1",
+        ),
+        YAML.replace("adapter: ragtruth_qa", "adapter: hotpotqa_distractor"),
         YAML.replace("name: RAGTruth QA", "name: ''"),
         YAML.replace("top_k: 8", "top_k: 8\n      typo: 1"),
         format!("{YAML}\nbenchmarks: {{}}"),
@@ -47,6 +53,38 @@ fn invalid_catalogs_fail_before_loading_any_dataset() {
             "accepted invalid YAML: {yaml}"
         );
     }
+}
+
+#[test]
+fn hotpotqa_catalog_uses_pinned_distractor_dev_and_validates_sources() {
+    let catalog = Catalog::from_yaml(YAML).unwrap();
+    let request = LoadRequest {
+        benchmark: "hotpotqa".into(),
+        limit: None,
+    };
+    let settings = catalog.resolve(&request).unwrap();
+    assert_eq!(settings.definition.split, "dev");
+    assert_eq!(settings.definition.defaults.limit, 100);
+    assert_eq!(
+        settings.definition.evaluation.metric_kind(),
+        "hotpotqa_answer_v1"
+    );
+    assert_eq!(
+        settings.definition.source_sha256.as_deref(),
+        Some("4e9ecb5c8d3b719f624d66b60f8d56bf227f03914f5f0753d6fa1b359d7104ea")
+    );
+    for source in [
+        "hf://bad/path",
+        "https://name:secret@example.org/data",
+        "https://example.org/data#fragment",
+    ] {
+        let mut invalid = settings.clone();
+        invalid.definition.source = source.into();
+        assert!(invalid.definition.validate().is_err());
+    }
+    let mut invalid = settings;
+    invalid.definition.source_sha256 = Some("wrong".into());
+    assert!(invalid.definition.validate().is_err());
 }
 
 #[test]

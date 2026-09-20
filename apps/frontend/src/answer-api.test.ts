@@ -97,6 +97,30 @@ function detail(changes: Partial<AnswerRun> = {}): AnswerRun {
   return { ...summary(), cases: [answerCase()], ...changes };
 }
 
+function hotpotSummary(changes: Partial<AnswerRunSummary> = {}): AnswerRunSummary {
+  return summary({
+    evaluation: 'hotpotqa_answer_v1',
+    reviewed: 0,
+    means: null,
+    scored: 1,
+    automatic_scores: { exact_match: 1, f1: 1 },
+    ...changes,
+  });
+}
+
+function hotpotCase(changes: Partial<AnswerCase> = {}): AnswerCase {
+  return answerCase({
+    review: null,
+    reference_answer: 'The source provides the evidence.',
+    automatic_scores: { exact_match: 1, f1: 1 },
+    ...changes,
+  });
+}
+
+function hotpotDetail(changes: Partial<AnswerRun> = {}): AnswerRun {
+  return { ...hotpotSummary(), cases: [hotpotCase()], ...changes };
+}
+
 function response(value: unknown, status = 200): Response {
   return new Response(JSON.stringify(value), {
     status,
@@ -432,5 +456,164 @@ describe('answer-quality comparability', () => {
     { source_ids: ['source-a', 'source-c'] },
   ])('separates different datasets or candidate source sets: %j', (changes) => {
     expect(answerComparabilityKey(summary(changes))).not.toBe(answerComparabilityKey(summary()));
+  });
+});
+
+describe('HotpotQA answer scoring contract', () => {
+  it('accepts an unstarted run with omitted zero coverage and completed automatic scores', async () => {
+    const initial = hotpotSummary({
+      status: 'running',
+      completed: 0,
+      answered: 0,
+      scored: undefined,
+      automatic_scores: { exact_match: 0, f1: 0 },
+      finished_at_ms: null,
+    });
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(response(initial, 202))
+      .mockResolvedValueOnce(response(hotpotDetail()));
+    const api = createAnswerApi(fetcher);
+    await expect(api.startRun(startRequest)).resolves.toEqual(initial);
+    await expect(api.getRun('run-a')).resolves.toEqual(hotpotDetail());
+  });
+
+  it('keeps partial automatic means over the full dataset denominator', async () => {
+    const partial = hotpotDetail({
+      total: 2,
+      status: 'running',
+      automatic_scores: { exact_match: 0.5, f1: 0.5 },
+      finished_at_ms: null,
+    });
+    const api = createAnswerApi(vi.fn<typeof fetch>().mockResolvedValue(response(partial)));
+    await expect(api.getRun('run-a')).resolves.toEqual(partial);
+    expect(answerComparabilityKey(partial)).toBeNull();
+  });
+
+  it.each(['running', 'interrupted'] as const)(
+    'accepts floating-point rounding at the partial %s scoring ceiling',
+    async (status) => {
+      const partial = hotpotSummary({
+        status,
+        total: 10,
+        completed: 3,
+        answered: 3,
+        scored: 3,
+        automatic_scores: { exact_match: 0.30000000000000004, f1: 0.30000000000000004 },
+      });
+      const fetcher = vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(response([partial]))
+        .mockResolvedValueOnce(
+          response([
+            {
+              ...partial,
+              automatic_scores: { exact_match: 0.30001, f1: 0.3 },
+            },
+          ]),
+        );
+      const api = createAnswerApi(fetcher);
+      await expect(api.listRuns()).resolves.toEqual([partial]);
+      await expect(api.listRuns()).rejects.toBeInstanceOf(ApiError);
+    },
+  );
+
+  it.each(['refused', 'evidence-only', 'not-ready', 'error'] as const)(
+    'counts an attempted %s case with automatic zero scores',
+    async (outcome) => {
+      const failed = outcome === 'error';
+      const run = hotpotDetail({
+        status: failed ? 'failed' : 'completed',
+        completed: failed ? 0 : 1,
+        failed: failed ? 1 : 0,
+        answered: 0,
+        automatic_scores: { exact_match: 0, f1: 0 },
+        cases: [
+          hotpotCase({
+            status: failed ? 'error' : 'ok',
+            outcome,
+            answer: null,
+            model_receipt: null,
+            automatic_scores: { exact_match: 0, f1: 0 },
+          }),
+        ],
+      });
+      const api = createAnswerApi(vi.fn<typeof fetch>().mockResolvedValue(response(run)));
+      await expect(api.getRun('run-a')).resolves.toEqual(run);
+      if (failed) expect(answerComparabilityKey(run)).toBeNull();
+      else expect(answerComparabilityKey(run)).toBe(answerComparabilityKey(hotpotSummary()));
+    },
+  );
+
+  it('keeps human review metrics separate from automatic answer scores', async () => {
+    const run = hotpotDetail({
+      reviewed: 1,
+      means: { correctness: 0, groundedness: 1, hallucination_rate: 0, citation_accuracy: 1 },
+      cases: [hotpotCase({ review: { ...review, correctness: false, reviewed_at_ms: 12 } })],
+    });
+    const api = createAnswerApi(vi.fn<typeof fetch>().mockResolvedValue(response(run)));
+    await expect(api.getRun('run-a')).resolves.toEqual(run);
+    expect(answerComparabilityKey(run)).toBe(answerComparabilityKey(hotpotSummary()));
+  });
+
+  it.each([
+    { ...hotpotSummary(), automatic_scores: undefined },
+    { ...hotpotSummary(), automatic_scores: { exact_match: 1 } },
+    { ...hotpotSummary(), automatic_scores: { exact_match: -0.1, f1: 1 } },
+    { ...hotpotSummary(), automatic_scores: { exact_match: 1, f1: 1.01 } },
+    { ...hotpotSummary(), automatic_scores: { exact_match: 1, f1: '1' } },
+    { ...hotpotSummary(), scored: 0 },
+    { ...hotpotSummary(), scored: undefined },
+    { ...hotpotSummary(), scored: 2 },
+    { ...hotpotSummary(), scored: 0.5 },
+    { ...hotpotSummary(), scored: null },
+    { ...hotpotSummary(), total: 2 },
+    { ...summary(), scored: 1 },
+    { ...summary(), automatic_scores: { exact_match: 1, f1: 1 } },
+    { ...hotpotSummary(), evaluation: 'unknown_evaluator' },
+  ])('rejects inconsistent automatic summary scores or evaluator fields: %j', async (value) => {
+    const api = createAnswerApi(vi.fn<typeof fetch>().mockResolvedValue(response([value])));
+    await expect(api.listRuns()).rejects.toBeInstanceOf(ApiError);
+  });
+
+  it.each([
+    { ...hotpotCase(), reference_answer: undefined },
+    { ...hotpotCase(), reference_answer: '' },
+    { ...hotpotCase(), reference_answer: 1 },
+    { ...hotpotCase(), automatic_scores: undefined },
+    { ...hotpotCase(), automatic_scores: { exact_match: 0.5, f1: 1 } },
+    { ...hotpotCase(), automatic_scores: { exact_match: 1, f1: -1 } },
+    { ...hotpotCase(), automatic_scores: { exact_match: 0, f1: 0 } },
+    { ...hotpotCase(), status: 'error', outcome: 'error' },
+    { ...hotpotCase(), outcome: 'refused' },
+  ])('rejects invalid case scores, references, or aggregate disagreement: %j', async (value) => {
+    const api = createAnswerApi(
+      vi.fn<typeof fetch>().mockResolvedValue(response({ ...hotpotDetail(), cases: [value] })),
+    );
+    await expect(api.getRun('run-a')).rejects.toBeInstanceOf(ApiError);
+  });
+
+  it('rejects automatic case fields in legacy manual runs', async () => {
+    const api = createAnswerApi(
+      vi.fn<typeof fetch>().mockResolvedValue(
+        response(
+          detail({
+            cases: [
+              answerCase({
+                reference_answer: 'A reference',
+                automatic_scores: { exact_match: 1, f1: 1 },
+              }),
+            ],
+          }),
+        ),
+      ),
+    );
+    await expect(api.getRun('run-a')).rejects.toBeInstanceOf(ApiError);
+  });
+
+  it('separates automatic and manual evaluators while comparing fully scored refusals', () => {
+    expect(answerComparabilityKey(hotpotSummary())).not.toBeNull();
+    expect(answerComparabilityKey(hotpotSummary())).not.toBe(answerComparabilityKey(summary()));
+    expect(answerComparabilityKey(hotpotSummary({ scored: undefined }))).toBeNull();
   });
 });

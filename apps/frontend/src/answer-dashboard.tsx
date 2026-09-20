@@ -39,6 +39,13 @@ const METRICS: { key: keyof AnswerMeans; label: string; lower?: boolean }[] = [
   { key: 'hallucination_rate', label: 'Hallucinations', lower: true },
   { key: 'citation_accuracy', label: 'Citation accuracy' },
 ];
+const AUTOMATIC_METRICS = [
+  { key: 'exact_match', label: 'Answer EM' },
+  { key: 'f1', label: 'Answer F1' },
+] as const;
+function evaluationLabel(evaluation: string) {
+  return evaluation === 'hotpotqa_answer_v1' ? 'HotpotQA EM/F1 v1' : 'Human review v1';
+}
 function restore(saved: unknown): AnswerState {
   const value = saved && typeof saved === 'object' ? (saved as Partial<AnswerState>) : {};
   return {
@@ -110,6 +117,10 @@ export function AnswerDashboard({
     benchmarks.find((item) => item.id === state.benchmarkId) ??
     benchmarks.find((item) => item.configuration?.key === 'ragtruth-qa') ??
     benchmarks[0];
+  const selectedHotpot = selected?.metric_kind === 'hotpotqa_answer_v1';
+  const showAutomatic =
+    benchmarks.some((item) => item.metric_kind === 'hotpotqa_answer_v1') ||
+    runs.some((run) => run.evaluation === 'hotpotqa_answer_v1');
   const profiles = runtime?.profiles.filter((item) => item.enabled) ?? [];
   const profile = profiles.find((item) => item.id === profileId) ?? profiles[0];
   const active = [...runs, ...retrieval].some((run) => run.status === 'running');
@@ -133,7 +144,21 @@ export function AnswerDashboard({
   const best = Object.fromEntries(
     METRICS.map(({ key, lower }) => [
       key,
-      (lower ? Math.min : Math.max)(...comparison.map((run) => run.means![key])),
+      (lower ? Math.min : Math.max)(
+        ...comparison
+          .filter((run) => run.evaluation === 'manual_review_v1' && run.means)
+          .map((run) => run.means![key]),
+      ),
+    ]),
+  );
+  const bestAutomatic = Object.fromEntries(
+    AUTOMATIC_METRICS.map(({ key }) => [
+      key,
+      Math.max(
+        ...comparison
+          .filter((run) => run.automatic_scores)
+          .map((run) => run.automatic_scores![key]),
+      ),
     ]),
   );
   const selectedCase = detail?.cases[Math.min(caseIndex, detail.cases.length - 1)];
@@ -181,7 +206,9 @@ export function AnswerDashboard({
       if (signal.aborted) return;
       update({ query: '', status: 'all', comparison: '' });
       setNotice(
-        `Answer run ${run.id.slice(0, 8)} started. Review the generated answers when it finishes.`,
+        run.evaluation === 'hotpotqa_answer_v1'
+          ? `Answer run ${run.id.slice(0, 8)} started. Exact match and F1 are scored automatically.`
+          : `Answer run ${run.id.slice(0, 8)} started. Review the generated answers when it finishes.`,
       );
       await workspace.reload();
     });
@@ -251,21 +278,31 @@ export function AnswerDashboard({
           </select>
         </div>
         <div
-          className={`${styles.tableScroll} ${styles.answerTable}`}
+          className={`${styles.tableScroll} ${styles.answerTable} ${showAutomatic ? styles.automaticTable : ''}`}
           role="region"
           tabIndex={0}
           aria-label="Generated answer comparison table, scroll for more results"
         >
           <table>
             <caption>
-              Generated answer quality by architecture, embedding model and generation model. Scores
-              cover reviewed answers only.
+              Generated answer quality by architecture, embedding model and generation model.
+              HotpotQA EM/F1 cover all cases; human review scores cover reviewed answers only.
             </caption>
             <thead>
               <tr>
                 <th scope="col">Benchmark / run</th>
                 <th scope="col">Architecture</th>
                 <th scope="col">Model pairing</th>
+                {showAutomatic &&
+                  AUTOMATIC_METRICS.map(({ key, label }) => (
+                    <th
+                      scope="col"
+                      key={key}
+                      title="Automatic answer matching against the reference; denominator is all cases"
+                    >
+                      {label}
+                    </th>
+                  ))}
                 <th scope="col">Status / answers</th>
                 <th scope="col">Reviewed</th>
                 {METRICS.map(({ key, label, lower }) => (
@@ -295,12 +332,35 @@ export function AnswerDashboard({
                   </th>
                   <td>
                     <strong>{run.request.architecture_label}</strong>
-                    <small>Human review v1 · top k {run.top_k}</small>
+                    <small>
+                      {evaluationLabel(run.evaluation)} · top k {run.top_k}
+                    </small>
                   </td>
                   <td>
                     <strong>{run.generation_model.label}</strong>
                     <small>Embedding: {run.embedding_model.id}</small>
                   </td>
+                  {showAutomatic &&
+                    AUTOMATIC_METRICS.map(({ key }) => (
+                      <td
+                        className={styles.score}
+                        key={key}
+                        data-best={
+                          (!!state.comparison &&
+                            comparison.length > 1 &&
+                            run.automatic_scores?.[key] === bestAutomatic[key]) ||
+                          undefined
+                        }
+                      >
+                        {percent(run.automatic_scores?.[key])}
+                        {run.automatic_scores && (
+                          <small>
+                            {run.scored ?? 0} / {run.total} scored
+                            {run.status !== 'completed' ? ' · partial run' : ''}
+                          </small>
+                        )}
+                      </td>
+                    ))}
                   <td>
                     <span className={styles.badge} data-state={run.status}>
                       {run.status}
@@ -309,7 +369,8 @@ export function AnswerDashboard({
                       {run.answered} / {run.total} answered
                     </small>
                     <small>
-                      {run.completed} processed{run.failed ? ` · ${run.failed} failed` : ''}
+                      {run.completed + run.failed} processed
+                      {run.failed ? ` · ${run.failed} failed` : ''}
                     </small>
                     {run.status === 'running' && (
                       <progress
@@ -323,7 +384,9 @@ export function AnswerDashboard({
                     {run.reviewed} / {run.answered}
                     <small>
                       {run.reviewed < run.answered
-                        ? 'Review pending'
+                        ? run.evaluation === 'hotpotqa_answer_v1'
+                          ? 'Optional review'
+                          : 'Review pending'
                         : run.answered
                           ? 'Reviewed answers'
                           : 'No answers to review'}
@@ -335,13 +398,19 @@ export function AnswerDashboard({
                       key={key}
                       data-best={
                         (!!state.comparison &&
+                          run.evaluation === 'manual_review_v1' &&
                           comparison.length > 1 &&
                           run.means?.[key] === best[key]) ||
                         undefined
                       }
                     >
                       {percent(run.means?.[key])}
-                      {run.means && !answerComparabilityKey(run) && <small>partial coverage</small>}
+                      {run.means &&
+                        (run.evaluation === 'manual_review_v1'
+                          ? !answerComparabilityKey(run)
+                          : run.reviewed < run.answered || run.answered < run.total) && (
+                          <small>partial coverage</small>
+                        )}
                     </td>
                   ))}
                   <td>
@@ -392,7 +461,7 @@ export function AnswerDashboard({
               <p>
                 {runs.length
                   ? 'Change the search or run filters.'
-                  : 'Start an architecture and model pairing below. Quality scores appear after review.'}
+                  : 'Start an architecture and model pairing below. HotpotQA scores automatically; RAGTruth uses human review.'}
               </p>
             </div>
           )}
@@ -424,8 +493,11 @@ export function AnswerDashboard({
         {state.comparison ? (
           <div className={styles.comparison}>
             <span>
-              Comparing {comparison.length} fully answered and reviewed runs with the same snapshot,
-              top-k, evaluator and candidate sources.
+              Comparing {comparison.length}{' '}
+              {comparison[0]?.evaluation === 'hotpotqa_answer_v1'
+                ? 'completed automatically scored'
+                : 'fully answered and reviewed'}{' '}
+              runs with the same snapshot, top-k, evaluator and candidate sources.
             </span>
             <button className={styles.button} onClick={() => update({ comparison: '' })}>
               Show all answer runs
@@ -433,8 +505,10 @@ export function AnswerDashboard({
           </div>
         ) : (
           <p className={styles.tableNote}>
-            Scores cover human-reviewed answers. Hallucinations: lower is better. Other scores:
-            higher is better. Refusals and evidence-only responses remain visible in answer
+            {showAutomatic &&
+              'HotpotQA EM/F1 score the full returned answer against the reference over all cases, including zeros for missing answers. '}
+            Human review scores cover reviewed answers only. Hallucinations: lower is better. Other
+            scores: higher is better. Refusals and evidence-only responses remain visible in answer
             coverage.
           </p>
         )}
@@ -462,7 +536,7 @@ export function AnswerDashboard({
       >
         <div className={styles.panelHeading}>
           <h2>Run an architecture + model pairing</h2>
-          <span>Human review v1</span>
+          <span>{evaluationLabel(selectedHotpot ? 'hotpotqa_answer_v1' : 'manual_review_v1')}</span>
         </div>
         {runtime && !runtime.available && (
           <p className={styles.notice}>
@@ -539,6 +613,15 @@ export function AnswerDashboard({
             {pending === 'start' ? 'Starting…' : active ? 'Run in progress' : 'Generate answers'}
           </button>
         </div>
+        {selectedHotpot && (
+          <p className={styles.explanation}>
+            HotpotQA uses each question’s supplied candidate passages (typically ten). Reference
+            answers are kept out of retrieval and generation. EM/F1 score the full returned answer
+            without extracting a shorter answer. Nebula’s strict evidence quotations can therefore
+            score low against short references. These are subset scores, not an official leaderboard
+            result.
+          </p>
+        )}
         <small>
           Uses the configured Nebula model and retrieval settings (top k 8). Generation may use your
           configured provider and incur its charges. Each question gets a fresh conversation.
@@ -557,7 +640,7 @@ export function AnswerDashboard({
           </p>
           <small>
             {detail.embedding_model.id} · revision {detail.embedding_model.revision} · snapshot{' '}
-            {detail.benchmark_fingerprint} · human review v1
+            {detail.benchmark_fingerprint} · {evaluationLabel(detail.evaluation)}
           </small>
           {detail.error && <p className={styles.error}>{detail.error}</p>}
           {!selectedCase ? (
@@ -604,6 +687,22 @@ export function AnswerDashboard({
               <span className={styles.badge}>{selectedCase.outcome}</span>
               {selectedCase.answer && (
                 <blockquote className={styles.answerText}>{selectedCase.answer}</blockquote>
+              )}
+              {selectedCase.reference_answer !== undefined && (
+                <section
+                  className={styles.referenceAnswer}
+                  aria-label="Automatic answer assessment"
+                >
+                  <h3>Reference answer</h3>
+                  <p>{selectedCase.reference_answer}</p>
+                  <p>
+                    Exact match: {percent(selectedCase.automatic_scores?.exact_match)} · Token F1:{' '}
+                    {percent(selectedCase.automatic_scores?.f1)}
+                  </p>
+                  <small>
+                    Compared with the full returned answer. Human review below is separate.
+                  </small>
+                </section>
               )}
               {selectedCase.reason && <p>{selectedCase.reason}</p>}
               {selectedCase.error && <p className={styles.error}>{selectedCase.error}</p>}
@@ -656,7 +755,10 @@ export function AnswerDashboard({
               ) : (
                 <p className={styles.explanation}>
                   This case produced no generated answer to review. It remains part of the run’s
-                  coverage; no quality scores are assigned.
+                  coverage;{' '}
+                  {detail.evaluation === 'hotpotqa_answer_v1'
+                    ? 'automatic answer scores are zero.'
+                    : 'no quality scores are assigned.'}
                 </p>
               )}
               {detail.status === 'running' && (
@@ -669,8 +771,8 @@ export function AnswerDashboard({
         </section>
       )}
       <footer className={styles.footer}>
-        Benchmark definitions stay in YAML. RAGTruth’s historical annotations are not reused as
-        scores for newly generated answers.
+        Benchmark definitions stay in YAML. HotpotQA uses reference-answer matching; RAGTruth’s
+        historical annotations are not reused as scores for newly generated answers.
       </footer>
     </main>
   );

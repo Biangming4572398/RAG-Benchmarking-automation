@@ -80,6 +80,9 @@ pub enum RunStatus {
 
 impl Run {
     pub fn new(request: RunRequest, benchmark: &Benchmark, fingerprint: String) -> Result<Self> {
+        if benchmark.metric_kind != "paired_context_recovery_v1" {
+            return Err(Error("This benchmark evaluates generated answers; use Generated answers instead of Retrieval".into()));
+        }
         if !(1..=100).contains(&request.top_k) || request.label.len() > 256 {
             return Err(Error(
                 "top_k must be 1–100 and label at most 256 bytes".into(),

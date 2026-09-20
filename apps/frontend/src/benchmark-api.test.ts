@@ -155,6 +155,62 @@ describe('benchmark HTTP contract', () => {
     await expect(api.listRuns()).resolves.toEqual(rows);
   });
 
+  it('reads HotpotQA answer references alongside the existing RAGTruth snapshot schema', async () => {
+    const hotpot = {
+      ...snapshot,
+      metric_kind: 'hotpotqa_answer_v1',
+      cases: [
+        {
+          ...snapshot.cases[0],
+          reference_outputs: [],
+          answer_reference: {
+            answer: 'London',
+            candidate_document_ids: ['document-a', 'document-b'],
+            supporting_facts: [{ title: 'Alpha', sentence_index: 0 }],
+          },
+        },
+      ],
+    };
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse(snapshot))
+      .mockResolvedValueOnce(jsonResponse(hotpot));
+    const api = createBenchmarkApi(fetcher);
+    await expect(api.getBenchmark('ragtruth')).resolves.toEqual(snapshot);
+    await expect(api.getBenchmark('hotpotqa')).resolves.toEqual(hotpot);
+  });
+
+  it.each([
+    null,
+    { answer: 1, candidate_document_ids: [], supporting_facts: [] },
+    { answer: 'London', candidate_document_ids: [1], supporting_facts: [] },
+    {
+      answer: 'London',
+      candidate_document_ids: [],
+      supporting_facts: [{ title: 'Alpha', sentence_index: -1 }],
+    },
+    {
+      answer: 'London',
+      candidate_document_ids: [],
+      supporting_facts: [{ title: 'Alpha', sentence_index: 0.5 }],
+    },
+    {
+      answer: 'London',
+      candidate_document_ids: [],
+      supporting_facts: [{ title: 1, sentence_index: 0 }],
+    },
+  ])('rejects malformed optional answer references: %j', async (answer_reference) => {
+    const api = createBenchmarkApi(
+      vi.fn<typeof fetch>().mockResolvedValue(
+        jsonResponse({
+          ...snapshot,
+          cases: [{ ...snapshot.cases[0], answer_reference }],
+        }),
+      ),
+    );
+    await expect(api.getBenchmark('hotpotqa')).rejects.toBeInstanceOf(ApiError);
+  });
+
   it.each([
     ['catalog arrays', [], 'catalog'],
     ['summary wrapper', { benchmarks: [benchmark] }, 'benchmarks'],
