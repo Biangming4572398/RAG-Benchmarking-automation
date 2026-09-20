@@ -1,4 +1,4 @@
-import React, { useEffect, useId, useMemo, useState } from 'react';
+import React, { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { createBenchmarkApi, type BenchmarkApi } from './benchmark-api';
 import { createAnswerApi, type AnswerApi } from './answer-api';
 import { AnswerDashboard } from './answer-dashboard';
@@ -37,6 +37,7 @@ export function BenchmarkDashboard({
   pollInterval,
 }: BenchmarkDashboardProps) {
   const id = useId();
+  const answersTab = useRef<HTMLButtonElement>(null);
   const [state, setState] = useState(() => restore(initialState));
   const benchmarkApi = useMemo(() => api ?? createBenchmarkApi(), [api]);
   const generatedApi = useMemo(() => answerApi ?? createAnswerApi(), [answerApi]);
@@ -49,6 +50,18 @@ export function BenchmarkDashboard({
     [],
   );
   useEffect(() => onStateChange?.(state), [state, onStateChange]);
+
+  function openAnswers(benchmarkId: string) {
+    setState((current) => ({
+      ...current,
+      view: 'answers',
+      answers: {
+        ...(current.answers && typeof current.answers === 'object' ? current.answers : {}),
+        benchmarkId,
+      },
+    }));
+    answersTab.current?.focus();
+  }
 
   const views: { id: DashboardState['view']; label: string }[] = [
     { id: 'retrieval', label: 'Retrieval' },
@@ -70,6 +83,7 @@ export function BenchmarkDashboard({
         {views.map((view, index) => (
           <button
             key={view.id}
+            ref={view.id === 'answers' ? answersTab : undefined}
             id={`${id}-${view.id}-tab`}
             role="tab"
             aria-selected={state.view === view.id}
@@ -93,6 +107,7 @@ export function BenchmarkDashboard({
             api={benchmarkApi}
             initialState={state.retrieval}
             onStateChange={retainRetrieval}
+            onOpenAnswers={openAnswers}
             pollInterval={pollInterval}
           />
         ) : (

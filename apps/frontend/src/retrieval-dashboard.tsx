@@ -21,6 +21,7 @@ interface DashboardState {
 export interface RetrievalDashboardProps {
   initialState?: unknown;
   onStateChange?: (state: unknown) => void;
+  onOpenAnswers?: (benchmarkId: string) => void;
   api?: BenchmarkApi;
   pollInterval?: number;
 }
@@ -75,6 +76,7 @@ function download(blob: Blob, name: string): void {
 export function RetrievalDashboard({
   initialState,
   onStateChange,
+  onOpenAnswers,
   api: providedApi,
   pollInterval = 3000,
 }: RetrievalDashboardProps) {
@@ -100,6 +102,9 @@ export function RetrievalDashboard({
 
   const retrievalBenchmarks = workspace.benchmarks.filter(
     (item) => item.metric_kind === 'paired_context_recovery_v1',
+  );
+  const answerBenchmarks = workspace.benchmarks.filter(
+    (item) => item.metric_kind === 'hotpotqa_answer_v1',
   );
   const selectedBenchmark =
     retrievalBenchmarks.find((item) => item.id === state.benchmarkId) ??
@@ -402,6 +407,32 @@ export function RetrievalDashboard({
           </p>
         )}
       </section>
+      {!!answerBenchmarks.length && (
+        <section className={styles.answerBenchmarks} aria-label="Generated-answer benchmarks">
+          <div>
+            <strong>Generated-answer benchmarks</strong>
+            <small>Automatic exact match and token F1. Open a benchmark to configure a run.</small>
+          </div>
+          <div className={styles.actions}>
+            {answerBenchmarks.map((benchmark) =>
+              onOpenAnswers ? (
+                <button
+                  key={benchmark.id}
+                  className={styles.button}
+                  aria-label={`Open ${benchmarkName(benchmark)} in Generated answers`}
+                  onClick={() => onOpenAnswers(benchmark.id)}
+                >
+                  {benchmarkName(benchmark)} · {benchmark.case_count} questions →
+                </button>
+              ) : (
+                <span key={benchmark.id}>
+                  {benchmarkName(benchmark)} · {benchmark.case_count} questions · Generated answers
+                </span>
+              ),
+            )}
+          </div>
+        </section>
+      )}
       {workspace.error && (
         <div className={styles.error} role="alert">
           <strong>Could not refresh benchmark data.</strong> {workspace.error}

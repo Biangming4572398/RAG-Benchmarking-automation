@@ -5,7 +5,7 @@ import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { BenchmarkDashboard } from './benchmark-dashboard';
-import type { BenchmarkApi } from './benchmark-api';
+import type { BenchmarkApi, BenchmarkInfo } from './benchmark-api';
 import type { AnswerApi } from './answer-api';
 
 function setup() {
@@ -40,6 +40,60 @@ afterEach(() => {
 });
 
 describe('Benchmark evaluation tabs', () => {
+  it('shows prepared HotpotQA on the default view and opens its answer setup without starting a run', async () => {
+    const { api, answerApi } = setup();
+    const user = userEvent.setup();
+    const snapshot: BenchmarkInfo = {
+      id: 'hotpot-snapshot',
+      source: 'HotpotQA',
+      split: 'dev',
+      metric_kind: 'hotpotqa_answer_v1',
+      case_count: 100,
+      document_count: 991,
+      corpus_path: '/corpus/hotpotqa',
+      fingerprint: 'hotpot-fingerprint',
+    };
+    api.listBenchmarks.mockResolvedValue([
+      {
+        ...snapshot,
+        id: 'ragtruth-snapshot',
+        source: 'RAGTruth QA',
+        metric_kind: 'paired_context_recovery_v1',
+      },
+      snapshot,
+    ]);
+    render(
+      <BenchmarkDashboard
+        api={api}
+        answerApi={answerApi}
+        initialState={{ answers: { benchmarkId: 'ragtruth-snapshot', query: 'Saved filter' } }}
+      />,
+    );
+    const shortcut = await screen.findByRole('button', {
+      name: 'Open HotpotQA in Generated answers',
+    });
+    expect(shortcut).toBeVisible();
+    expect(screen.getByRole('combobox', { name: 'Loaded snapshot' })).toHaveValue(
+      'ragtruth-snapshot',
+    );
+    await user.click(shortcut);
+    expect(screen.getByRole('tab', { name: 'Generated answers' })).toHaveAttribute(
+      'aria-selected',
+      'true',
+    );
+    await waitFor(() =>
+      expect(screen.getByRole('combobox', { name: 'Benchmark snapshot' })).toHaveValue(
+        'hotpot-snapshot',
+      ),
+    );
+    expect(screen.getByRole('searchbox', { name: 'Search answer runs' })).toHaveValue(
+      'Saved filter',
+    );
+    expect(screen.getByText('HotpotQA EM/F1 v1')).toBeVisible();
+    expect(api.startRun).not.toHaveBeenCalled();
+    expect(answerApi.startRun).not.toHaveBeenCalled();
+  });
+
   it('opens each real panel on click and retains legacy retrieval filters and answer filters separately', async () => {
     const { api, answerApi } = setup();
     const user = userEvent.setup();

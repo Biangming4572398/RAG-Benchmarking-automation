@@ -99,6 +99,18 @@
 .setup {
   margin-top: 24px;
 }
+.answerBenchmarks {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-top: 16px;
+  padding: 14px 16px;
+  border: 1px solid var(--bench-line);
+  border-radius: 7px;
+  background: var(--bench-surface);
+}
 .actions {
   display: flex;
   gap: 12px;
