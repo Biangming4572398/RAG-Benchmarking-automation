@@ -13,10 +13,12 @@ use axum::{
 };
 use backend::{
     AnswerRun, Benchmark, Case, Document,
+    benchmarks::{
+        hotpotqa::{AnswerReference, SupportingFact},
+        ragtruth::ReferenceOutput,
+    },
     config::{Catalog, NebulaConfig},
     digest,
-    hotpotqa::{AnswerReference, SupportingFact},
-    ragtruth::ReferenceOutput,
     server::{Store, router},
 };
 use serde_json::{Value, json};

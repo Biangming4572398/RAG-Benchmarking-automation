@@ -69,7 +69,7 @@ impl BenchmarkModule for HotpotQa {
         review: AnswerReviewRequest,
     ) -> std::result::Result<(), ReviewFailure> {
         // Human assessment is supplementary; it never replaces official answer scores.
-        crate::ragtruth::review_answer(run, case_id, review)
+        crate::benchmarks::ragtruth::review_answer(run, case_id, review)
     }
 }
 
@@ -149,7 +149,7 @@ impl AnswerEvaluation for HotpotQa {
                 .map(ToString::to_string)
                 .unwrap_or_default()
         };
-        let mut values = crate::ragtruth::review_csv_values(case);
+        let mut values = crate::benchmarks::ragtruth::review_csv_values(case);
         values.extend([
             case.reference_answer.clone().unwrap_or_default(),
             score(&case.automatic_scores, "exact_match"),
@@ -544,7 +544,7 @@ pub fn score_answer(prediction: &str, reference: &str) -> AnswerScores {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::benchmarks::hotpotqa::{AnswerScores, normalize, score_answer};
 
     #[test]
     fn official_normalization_preserves_unicode_and_only_removes_ascii_punctuation() {

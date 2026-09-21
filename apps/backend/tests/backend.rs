@@ -404,7 +404,7 @@ async fn failed_queries_and_index_drift_are_recorded_without_fake_zero_scores() 
         )
         .unwrap();
         store.create_run(&run).unwrap();
-        backend::ragtruth::execute_retrieval(
+        backend::benchmarks::ragtruth::execute_retrieval(
             store.clone(),
             NebulaConfig {
                 base_url: format!("{}/api/nebula/v1", nebula.base),
@@ -455,7 +455,7 @@ async fn oversized_corpus_selection_fails_before_querying() {
     )
     .unwrap();
     store.create_run(&run).unwrap();
-    backend::ragtruth::execute_retrieval(
+    backend::benchmarks::ragtruth::execute_retrieval(
         store.clone(),
         NebulaConfig {
             base_url: format!("{}/api/nebula/v1", nebula.base),

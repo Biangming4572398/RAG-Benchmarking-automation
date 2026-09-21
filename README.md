@@ -28,7 +28,7 @@ The benchmark backend uses files only; Nebula manages its own index separately.
 
 ## Backend layout
 
-Each benchmark has one named module in `apps/backend/src` that owns its
+Each benchmark has one named module in `apps/backend/src/benchmarks` that owns its
 definition validation, snapshot initialization/loading, supported run modes,
 evaluation policy, and benchmark-specific CSV columns:
 
@@ -38,7 +38,10 @@ evaluation policy, and benchmark-specific CSV columns:
 | `hotpotqa.rs` | Distractor JSON loading/checksums, per-question candidate selection, answer exact match/token F1, and supplementary human review |
 | `longmemeval.rs`, `temprageval.rs`, `qasper.rs`, `abstentionbench.rs`, `multihop_rag.rs`, `ragbench.rs` | Named registration and preparation boundaries; loading and evaluation remain unavailable |
 
-The remaining files assemble the backend and provide shared infrastructure:
+`benchmarks/mod.rs` declares these modules. Use explicit internal paths such as
+`crate::benchmarks::ragtruth` when importing benchmark implementations.
+The files directly under `apps/backend/src` assemble the backend and provide
+shared infrastructure:
 
 - `main.rs` reads configuration, opens storage, and starts the HTTP server.
 - `lib.rs` declares the benchmark contracts, shared snapshot/run envelopes, and
@@ -53,8 +56,9 @@ The remaining files assemble the backend and provide shared infrastructure:
   No first-run setup wizard or benchmark CRUD mechanism is implemented. A named
   module's `initialize()` prepares a snapshot; it does not initialize the dashboard.
 
-To add a benchmark, create its named Rust module and implement `BenchmarkModule`,
-including validation, snapshot preparation, and its supported run handlers.
+To add a benchmark, create `apps/backend/src/benchmarks/<name>.rs`, declare it in
+`benchmarks/mod.rs`, and implement `BenchmarkModule`, including validation,
+snapshot preparation, and its supported run handlers.
 For the shared Nebula generation executor, implement `AnswerEvaluation` to
 select candidates, capture reference metadata, score cases, aggregate results,
 and declare CSV columns/values. Register the instance in `lib::BENCHMARKS` and

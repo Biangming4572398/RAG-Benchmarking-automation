@@ -12,13 +12,13 @@ use serde_json::json;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
+pub use crate::server::persistence::{BenchmarkInfo, Store};
 use crate::{
     AnswerReviewRequest, Error, Result, ReviewFailure, RunStatus, StartAnswerRunRequest,
     StartFailure, StartRunRequest,
     config::{Catalog, LoadRequest, NebulaConfig},
     initialize_benchmark, module_for_snapshot,
 };
-pub use persistence::{BenchmarkInfo, Store};
 
 struct AppState {
     store: Arc<Store>,
@@ -601,7 +601,7 @@ mod persistence {
                 .answer_module(run)?
                 .answer_evaluation()
                 .ok_or_else(|| Error("Answer run has no registered evaluator".into()))?;
-            super::generation::csv(run, evaluation)
+            crate::server::generation::csv(run, evaluation)
         }
 
         pub fn review_answer(
@@ -674,7 +674,7 @@ mod persistence {
 /// Shared Nebula transport and batch executor; benchmark modules supply every evaluation policy.
 pub mod generation {
 
-    use super::Store;
+    use crate::server::Store;
     use crate::{
         AnswerCase, AnswerEvaluation, AnswerEvidence, AnswerFailure, AnswerLineage, AnswerProfile,
         AnswerRun, AnswerRunSummary, AnswerRuntime, Benchmark, Case, EmbeddingModel, Error,

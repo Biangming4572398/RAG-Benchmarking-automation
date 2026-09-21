@@ -10,7 +10,8 @@ Its frontend and backend live together in this submodule; Genesis is a thin host
   they are absent from release builds, rather than merely hiding navigation.
 - Read `README.md` for the existing HTTP interface and metric interpretation.
   Use `apps/backend/src/lib.rs`, `config.rs`, `server.rs`, and the relevant named
-  benchmark module as the source of truth for request shapes and responses.
+  module under `apps/backend/src/benchmarks` as the source of truth for request
+  shapes and responses.
   Backend changes continue independently;
   coordinate contract changes rather than inventing endpoints.
 - Keep result tables first. Benchmark definitions and dataset preparation are
@@ -36,7 +37,7 @@ Its frontend and backend live together in this submodule; Genesis is a thin host
 
 ## Backend direction and isolation
 
-Keep benchmark policy in its named `apps/backend/src/<benchmark>.rs` module:
+Keep benchmark policy in `apps/backend/src/benchmarks/<benchmark>.rs`:
 definition validation, snapshot initialization/loading, run support, candidate
 selection, evaluation, and benchmark-specific CSV columns. `ragtruth.rs` and
 `hotpotqa.rs` are the working implementations. LongMemEval, TempRAGEval, QASPER,
@@ -46,8 +47,10 @@ catalog-only; do not imply their loaders or official evaluators are implemented.
 `main.rs`, `lib.rs`, `config.rs`, and `server.rs` assemble common infrastructure.
 The inline `server::persistence` and `server::generation` modules own storage and
 Nebula execution mechanics, with policy supplied through `BenchmarkModule` and
-`AnswerEvaluation`, not benchmark-name branches. Register new modules in
-`lib::BENCHMARKS` and add matching YAML entries. Use `MetricValues` for
+`AnswerEvaluation`, not benchmark-name branches. Declare new modules in
+`benchmarks/mod.rs`, register their instances in `lib::BENCHMARKS`, and add matching
+YAML entries. Internal imports use explicit paths such as
+`crate::benchmarks::ragtruth`. Use `MetricValues` for
 evaluator-specific numeric metrics; each evaluator owns their interpretation and
 CSV output. Keep the existing API, YAML, saved snapshots/runs, and fingerprints
 compatible. The existing `Case` fields preserve the current wire format; new

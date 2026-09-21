@@ -747,7 +747,7 @@ pub async fn execute_answers(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::benchmarks::ragtruth::score_context;
 
     #[test]
     fn ranks_are_not_promoted_when_a_document_has_multiple_chunks() {

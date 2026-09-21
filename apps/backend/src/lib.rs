@@ -11,22 +11,16 @@ use std::{
 };
 use uuid::Uuid;
 
-pub mod abstentionbench;
+pub mod benchmarks;
 pub mod config;
-pub mod hotpotqa;
 pub mod init;
-pub mod longmemeval;
-pub mod multihop_rag;
-pub mod qasper;
-pub mod ragbench;
-pub mod ragtruth;
 pub mod server;
-pub mod temprageval;
 
-use config::{BenchmarkDefinition, NebulaConfig, ResolvedBenchmark};
-use hotpotqa::AnswerReference;
-use ragtruth::ReferenceOutput;
-use server::Store;
+use crate::{
+    benchmarks::{hotpotqa::AnswerReference, ragtruth::ReferenceOutput},
+    config::{BenchmarkDefinition, NebulaConfig, ResolvedBenchmark},
+    server::Store,
+};
 
 /// Result columns are declared by the evaluator, not by the shared runner.
 pub type MetricValues = BTreeMap<String, f64>;
@@ -132,14 +126,14 @@ pub trait AnswerEvaluation: Sync {
 }
 
 pub static BENCHMARKS: &[&dyn BenchmarkModule] = &[
-    &ragtruth::RAGTRUTH,
-    &hotpotqa::HOTPOTQA,
-    &longmemeval::LONGMEMEVAL,
-    &temprageval::TEMPRAGEVAL,
-    &qasper::QASPER,
-    &abstentionbench::ABSTENTIONBENCH,
-    &multihop_rag::MULTIHOP_RAG,
-    &ragbench::RAGBENCH,
+    &crate::benchmarks::ragtruth::RAGTRUTH,
+    &crate::benchmarks::hotpotqa::HOTPOTQA,
+    &crate::benchmarks::longmemeval::LONGMEMEVAL,
+    &crate::benchmarks::temprageval::TEMPRAGEVAL,
+    &crate::benchmarks::qasper::QASPER,
+    &crate::benchmarks::abstentionbench::ABSTENTIONBENCH,
+    &crate::benchmarks::multihop_rag::MULTIHOP_RAG,
+    &crate::benchmarks::ragbench::RAGBENCH,
 ];
 
 pub fn module_for_definition(
@@ -238,7 +232,7 @@ impl AnswerRun {
         let evaluation = module_for_answer_run(self)?
             .answer_evaluation()
             .ok_or_else(|| Error("Answer run has no registered evaluator".into()))?;
-        server::generation::csv(self, evaluation)
+        crate::server::generation::csv(self, evaluation)
     }
 }
 
