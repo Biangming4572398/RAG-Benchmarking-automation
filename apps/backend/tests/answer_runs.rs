@@ -1400,6 +1400,7 @@ async fn hotpot_validates_candidate_selections_individually_instead_of_the_large
         token: TOKEN.into(),
     };
     let request = backend::StartAnswerRunRequest {
+        description: String::new(),
         benchmark_id: benchmark.id,
         architecture_label: "Large candidate union".into(),
         profile_id: PROFILE.into(),
@@ -1776,6 +1777,7 @@ async fn shared_generation_runs_an_independent_evaluation_policy_with_new_result
         token: TOKEN.into(),
     };
     let request = backend::StartAnswerRunRequest {
+        description: String::new(),
         benchmark_id: benchmark.id,
         architecture_label: "Independent evaluator".into(),
         profile_id: PROFILE.into(),

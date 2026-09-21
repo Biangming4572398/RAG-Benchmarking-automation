@@ -315,6 +315,9 @@ pub fn prepare_retrieval(
     if benchmark.metric_kind != METRIC_KIND {
         return Err(Error("This benchmark evaluates generated answers; use Generated answers instead of Retrieval".into()));
     }
+    if request.description.len() > 4000 {
+        return Err(Error("description must be at most 4000 bytes".into()));
+    }
     if !(1..=100).contains(&request.top_k) || request.label.len() > 256 {
         return Err(Error(
             "top_k must be 1–100 and label at most 256 bytes".into(),

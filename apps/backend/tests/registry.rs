@@ -177,6 +177,7 @@ fn each_external_module_rejects_initialization_and_retrieval_explicitly() {
             module
                 .prepare_retrieval(
                     RunRequest {
+                        description: String::new(),
                         benchmark_id: benchmark.id,
                         top_k: 8,
                         label: String::new()

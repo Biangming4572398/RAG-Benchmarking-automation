@@ -275,6 +275,8 @@ pub struct RunRequest {
     pub top_k: usize,
     #[serde(default)]
     pub label: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
 }
 
 #[derive(Deserialize)]
@@ -284,6 +286,8 @@ pub struct StartRunRequest {
     pub top_k: Option<usize>,
     #[serde(default)]
     pub label: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
 }
 
 impl StartRunRequest {
@@ -298,6 +302,7 @@ impl StartRunRequest {
                     .unwrap_or(8)
             }), // Snapshots written before the catalog used 8.
             label: self.label,
+            description: self.description,
         }
     }
 }
@@ -358,10 +363,15 @@ pub struct StartAnswerRunRequest {
     pub benchmark_id: Uuid,
     pub architecture_label: String,
     pub profile_id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub description: String,
 }
 
 impl StartAnswerRunRequest {
     pub fn validate(&self) -> Result<()> {
+        if self.description.len() > 4000 {
+            return Err(Error("description must be at most 4000 bytes".into()));
+        }
         if !valid_label(self.architecture_label.trim(), 256) || !valid_label(&self.profile_id, 128)
         {
             return Err(Error(

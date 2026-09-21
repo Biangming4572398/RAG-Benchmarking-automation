@@ -56,6 +56,22 @@ CSV output. Keep the existing API, YAML, saved snapshots/runs, and fingerprints
 compatible. The existing `Case` fields preserve the current wire format; new
 data shapes may require explicit versioned extensions.
 
+Keep benchmark comparison results in `BENCHMARK_DATA_DIR/results/<module-key>.csv`
+with one row per execution, using global run numbers, architecture names, mode,
+status, snapshot fingerprint and settings. `metric.*` columns hold retrieval or
+automatic scores; `review.*` columns hold manual scores. Build each table's metric
+union and leave unavailable values blank. Preserve the existing detailed per-run
+JSON, retrieval CSV, answer exports and failure logs.
+
+`results/runs.json` owns the next run number and the number-to-run references,
+including descriptions. Requests accept an optional description up to 4000 UTF-8
+bytes. Preserve registry descriptions edited while the backend is stopped. Keep
+run numbers stable across restarts; legacy runs receive numbers in start-time/UUID
+order. The comparison CSVs are derived and rebuilt at startup after interrupted
+runs are marked. Files are atomic individually, not as a multi-file transaction;
+recovery uses saved run details and the registry. Do not discard the registry or
+introduce a database stack for this mapping.
+
 Leave `init.rs` to the user. It is unchanged and does not implement a first-run
 wizard or CRUD. Benchmark-module `initialize()` functions prepare snapshots;
 they are separate from application initialization.

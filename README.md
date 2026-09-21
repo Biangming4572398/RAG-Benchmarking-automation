@@ -32,11 +32,11 @@ Each benchmark has one named module in `apps/backend/src/benchmarks` that owns i
 definition validation, snapshot initialization/loading, supported run modes,
 evaluation policy, and benchmark-specific CSV columns:
 
-| Module | Responsibility |
-| --- | --- |
-| `ragtruth.rs` | Parquet QA loading, paired-context retrieval/scoring, generated-answer candidate selection, and human review |
-| `hotpotqa.rs` | Distractor JSON loading/checksums, per-question candidate selection, answer exact match/token F1, and supplementary human review |
-| `longmemeval.rs`, `temprageval.rs`, `qasper.rs`, `abstentionbench.rs`, `multihop_rag.rs`, `ragbench.rs` | Named registration and preparation boundaries; loading and evaluation remain unavailable |
+| Module                                                                                                  | Responsibility                                                                                                                   |
+| ------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `ragtruth.rs`                                                                                           | Parquet QA loading, paired-context retrieval/scoring, generated-answer candidate selection, and human review                     |
+| `hotpotqa.rs`                                                                                           | Distractor JSON loading/checksums, per-question candidate selection, answer exact match/token F1, and supplementary human review |
+| `longmemeval.rs`, `temprageval.rs`, `qasper.rs`, `abstentionbench.rs`, `multihop_rag.rs`, `ragbench.rs` | Named registration and preparation boundaries; loading and evaluation remain unavailable                                         |
 
 `benchmarks/mod.rs` declares these modules. Use explicit internal paths such as
 `crate::benchmarks::ragtruth` when importing benchmark implementations.
@@ -49,7 +49,7 @@ shared infrastructure:
 - `config.rs` reads environment settings and YAML, validates common metadata,
   resolves catalog entries, and delegates benchmark-specific validation.
 - `server.rs` assembles HTTP routes. Its inline `persistence` and `generation`
-  modules provide atomic storage, recovery, Nebula transport, provenance checks,
+  modules provide atomic file writes, recovery, Nebula transport, provenance checks,
   bounded request batches, and failure logging. Benchmark modules supply the
   selection/scoring/export policy; shared mechanics do not branch on benchmark names.
 - `init.rs` remains unchanged and reserved for the user's initialization work.
@@ -218,7 +218,7 @@ Start a run with a profile ID returned by `/answer-runtime`:
 ```sh
 curl -sS http://127.0.0.1:4319/api/benchmarks/v1/answer-runs \
   -H 'Content-Type: application/json' \
-  -d '{"benchmark_id":"UUID-FROM-LOAD","architecture_label":"Nebula baseline","profile_id":"moonshot-kimi-k3"}'
+  -d '{"benchmark_id":"UUID-FROM-LOAD","architecture_label":"Nebula baseline","profile_id":"moonshot-kimi-k3","description":"Kimi K3 with the original local embedding configuration"}'
 ```
 
 The runner creates a fresh conversation for every question, calls Nebula's
@@ -359,8 +359,14 @@ through `/answer-runs`; `/runs` rejects answer-only benchmarks.
 ```sh
 curl -sS http://127.0.0.1:4319/api/benchmarks/v1/runs \
   -H 'Content-Type: application/json' \
-  -d '{"benchmark_id":"UUID-FROM-LOAD","label":"baseline"}'
+  -d '{"benchmark_id":"UUID-FROM-LOAD","label":"baseline","description":"Original indexing configuration"}'
 ```
+
+Both retrieval and answer-run requests accept an optional `description` of at
+most 4000 UTF-8 bytes, including multiline text. It defaults to an empty string
+and records the experiment notes in the run reference registry. Retrieval
+`label` and generation `architecture_label` become the result table
+`architecture_name`.
 
 This returns HTTP 202 with a run ID. Poll its status, then download `scores.csv`.
 Only one run is active per server, keeping latency measurements free from
@@ -400,12 +406,23 @@ All paths have prefix `/api/benchmarks/v1`.
 Run states are `running`, `completed`, `failed`, and `interrupted`. Startup marks
 unfinished runs interrupted rather than silently resuming against a new index.
 Network/protocol failures stop the run and retain earlier results. A run that
-fails during setup has a summary but may have no CSV. Requests use snake_case;
+fails during setup has a summary but may have no per-question CSV. Requests use
+snake_case;
 Nebula protocol objects preserved in summaries retain their original camelCase.
+
+## Result storage
+
+All artifacts live under `BENCHMARK_DATA_DIR`. Benchmark comparison tables have
+one row per execution, updated as progress or human reviews are saved. Repeating
+an architecture creates another row with a new run number.
 
 ```text
 experiment-data/
   .server.lock
+  results/
+    ragtruth-qa.csv
+    hotpotqa.csv
+    runs.json
   benchmarks/<uuid>/
     benchmark.json
     corpus/ragtruth-<sha256>.md
@@ -414,20 +431,62 @@ experiment-data/
     scores.csv
   answer-runs/<uuid>/
     run.json
+    failures.jsonl          # Created when request failures occur
 ```
 
-CSV includes run/case/source identifiers, query, top_k, status, latency,
-individual metrics, retrieved evidence as a JSON cell, and error. JSON metadata
-is replaced atomically; CSV is flushed/synced after each question. A hard kill
-during a row write can leave the final row incomplete; interrupted results are
-partial artifacts. There is no database dependency or schema migration.
+The CSV filename uses the registered benchmark module key, such as
+`ragtruth-qa.csv` or `hotpotqa.csv`. A benchmark's retrieval and generation runs
+share its table; the `mode` and `evaluation` columns identify how each row was
+measured. Columns include `run_number`, `run_id`, `architecture_name`, status,
+snapshot ID/fingerprint, top-k, completion counts, timestamps, and available
+model identities. Retrieval and automatic answer scores use `metric.<name>`
+columns; human review scores use `review.<name>`. Each table contains the union
+of metrics recorded by its runs. Unavailable metrics stay blank rather than
+becoming zero. Check evaluation, snapshot fingerprint and settings before
+comparing scores; failed or partial runs remain visible.
 
-Answer runs persist their summary and all finished cases in one atomically
-replaced `run.json`. Their CSV is generated on download from the current saved
-answers/reviews, so it reflects the latest human judgments. Pending review cells
-remain blank. Startup also marks unfinished answer runs interrupted; previously
-generated answers remain available for review and export. Concurrent review
-updates are serialized to preserve other cases' reviews.
+`results/runs.json` assigns run numbers starting at 1 across all benchmarks and
+both run modes in this data directory. It maps each number to the detailed run
+UUID, benchmark, mode, architecture name, and description:
+
+```json
+{
+  "next_run_number": 2,
+  "runs": {
+    "1": {
+      "run_id": "4d293026-ea7a-44bf-9446-cd2ec804df37",
+      "benchmark": "ragtruth-qa",
+      "mode": "retrieval",
+      "architecture_name": "baseline",
+      "description": "Original indexing configuration"
+    }
+  }
+}
+```
+
+The registry owns run numbers and descriptions. To amend notes, stop the backend
+and edit the relevant `description` in `results/runs.json`; it is preserved when
+the backend restarts. Keep the registry with the detailed run artifacts: deleting
+it loses the assigned numbering and edited descriptions. The comparison CSVs
+are derived files and are rebuilt from saved runs and the registry at startup.
+On the first startup with older runs, unregistered runs receive numbers in start
+time order, with UUID as the tie-breaker. Existing registered numbers are retained.
+Unfinished runs become `interrupted`, and the rebuilt tables reflect that status.
+
+The per-run files retain detailed evidence. Retrieval `scores.csv` includes
+run/case/source identifiers, query, top-k, status, latency, individual metrics,
+retrieved evidence as a JSON cell, and error. It is flushed/synced after each
+question; a hard kill during a row write can leave its final row incomplete.
+Answer runs persist their summary and finished cases in `run.json`. Their
+per-case CSV is generated on download from saved answers and current reviews;
+pending review cells stay blank. Concurrent review updates are serialized to
+preserve other cases' reviews.
+
+JSON files and benchmark comparison CSVs are each replaced atomically. Updates
+across the detailed run, registry, and comparison CSV are not one transaction;
+startup rebuilds comparison tables from the saved artifacts after an interruption.
+There is no database dependency. This storage change adds no frontend controls
+or first-run initialization behavior.
 
 ## Verification
 

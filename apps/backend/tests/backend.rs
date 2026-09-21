@@ -143,6 +143,7 @@ fn store_rejects_second_owner_and_recovers_interrupted_runs() {
     assert!(Store::open(&root).is_err());
     let run = Run::new(
         RunRequest {
+            description: "Baseline architecture\nOriginal indexing configuration".into(),
             benchmark_id: benchmark.id,
             top_k: 8,
             label: "test".into(),
@@ -157,6 +158,7 @@ fn store_rejects_second_owner_and_recovers_interrupted_runs() {
     drop(store);
     let store = Store::open(&root).unwrap();
     let recovered = store.run(run.id).unwrap();
+    assert_eq!(recovered.request.description, run.request.description);
     assert_eq!(recovered.status, RunStatus::Interrupted);
     assert!(recovered.finished_at_ms.is_some());
 }
@@ -171,6 +173,7 @@ fn run_overrides_and_pre_catalog_snapshots_remain_supported() {
     let dir = TempDir::new().unwrap();
     let benchmark = load_fixture(&dir);
     let request = |top_k| StartRunRequest {
+        description: String::new(),
         benchmark_id: benchmark.id,
         top_k,
         label: String::new(),
@@ -189,6 +192,59 @@ fn run_overrides_and_pre_catalog_snapshots_remain_supported() {
     old.as_object_mut().unwrap().remove("configuration");
     let legacy: Benchmark = serde_json::from_value(old).unwrap();
     assert_eq!(request(None).resolve(&legacy).top_k, 8);
+}
+
+#[test]
+fn run_descriptions_default_to_empty_and_accept_bounded_multiline_text() {
+    let dir = TempDir::new().unwrap();
+    let benchmark = load_fixture(&dir);
+    let legacy = json!({
+        "benchmark_id": benchmark.id,
+        "top_k": 2,
+        "label": "Baseline"
+    });
+    let request: RunRequest = serde_json::from_value(legacy.clone()).unwrap();
+    assert!(request.description.is_empty());
+    assert_eq!(serde_json::to_value(&request).unwrap(), legacy);
+    let start: StartRunRequest = serde_json::from_value(legacy.clone()).unwrap();
+    assert!(start.resolve(&benchmark).description.is_empty());
+
+    let description = "Line one\nLine two, with \"quotes\".\n";
+    let mut described = legacy;
+    described["description"] = description.into();
+    let start: StartRunRequest = serde_json::from_value(described).unwrap();
+    let mut request = start.resolve(&benchmark);
+    assert_eq!(request.description, description);
+    request.description = "é".repeat(2000);
+    assert!(Run::new(request.clone(), &benchmark, "fp".into()).is_ok());
+    request.description.push('x');
+    let error = Run::new(request, &benchmark, "fp".into()).err().unwrap();
+    assert!(error.to_string().contains("description"));
+
+    let legacy_answer = json!({
+        "benchmark_id": benchmark.id,
+        "architecture_label": "Baseline",
+        "profile_id": "kimi"
+    });
+    let mut answer: backend::StartAnswerRunRequest =
+        serde_json::from_value(legacy_answer.clone()).unwrap();
+    assert!(answer.description.is_empty());
+    assert_eq!(serde_json::to_value(&answer).unwrap(), legacy_answer);
+    answer.description = description.into();
+    assert!(answer.validate().is_ok());
+    let saved = serde_json::to_value(&answer).unwrap();
+    let restored: backend::StartAnswerRunRequest = serde_json::from_value(saved).unwrap();
+    assert_eq!(restored.description, description);
+    answer.description = "é".repeat(2000);
+    assert!(answer.validate().is_ok());
+    answer.description.push('x');
+    assert!(
+        answer
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("description")
+    );
 }
 impl Drop for TestServer {
     fn drop(&mut self) {
@@ -395,6 +451,7 @@ async fn failed_queries_and_index_drift_are_recorded_without_fake_zero_scores() 
         let store = Arc::new(Store::open(&dir.path().join("data")).unwrap());
         let run = Run::new(
             RunRequest {
+                description: String::new(),
                 benchmark_id: benchmark.id,
                 top_k: 2,
                 label: "".into(),
@@ -446,6 +503,7 @@ async fn oversized_corpus_selection_fails_before_querying() {
     let store = Arc::new(Store::open(&dir.path().join("data")).unwrap());
     let run = Run::new(
         RunRequest {
+            description: String::new(),
             benchmark_id: benchmark.id,
             top_k: 8,
             label: "".into(),
