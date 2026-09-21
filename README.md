@@ -62,9 +62,9 @@ shared infrastructure:
   executes supported retrieval/generation modes serially through module contracts.
   The same server run slot covers the entire suite.
 
-- `init.rs` remains unchanged and reserved for the user's initialization work.
-  No first-run setup wizard or benchmark CRUD mechanism is implemented. A named
-  module's `initialize()` prepares a snapshot; it does not initialize the dashboard.
+Application initialization is handled by `main.rs`. The bundled benchmark YAML
+must exist at startup. A named module's `initialize()` prepares a dataset snapshot
+when requested; startup does not create snapshots.
 
 To add a benchmark, create `apps/backend/src/benchmarks/<name>.rs`, declare it in
 `benchmarks/mod.rs`, and implement `BenchmarkModule`, including validation,

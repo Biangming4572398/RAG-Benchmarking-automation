@@ -72,9 +72,9 @@ runs are marked. Files are atomic individually, not as a multi-file transaction;
 recovery uses saved run details and the registry. Do not discard the registry or
 introduce a database stack for this mapping.
 
-Leave `init.rs` to the user. It is unchanged and does not implement a first-run
-wizard or CRUD. Benchmark-module `initialize()` functions prepare snapshots;
-they are separate from application initialization.
+Application initialization belongs in `main.rs`. The bundled benchmark YAML must
+exist at startup; do not generate a replacement when it is missing.
+Benchmark-module `initialize()` functions prepare snapshots only when requested.
 
 Use the actual Genesis storage and Nebula implementations in experimental
 checkouts, with separate storage roots and backend processes. Successful changes

@@ -13,7 +13,6 @@ use uuid::Uuid;
 
 pub mod benchmarks;
 pub mod config;
-pub mod init;
 pub mod server;
 pub mod suite;
 
@@ -209,7 +208,7 @@ pub fn module_for_answer_run(run: &AnswerRun) -> Result<&'static dyn BenchmarkMo
     }
 }
 
-/// Prepare an immutable snapshot. Startup initialization remains reserved for init.rs.
+/// Prepare an immutable snapshot. Application startup is handled by main.rs.
 pub fn initialize_benchmark(request: &ResolvedBenchmark) -> Result<Benchmark> {
     request.definition.validate_for(&request.key)?;
     module_for_definition(Some(&request.key), &request.definition)?.initialize(request)
