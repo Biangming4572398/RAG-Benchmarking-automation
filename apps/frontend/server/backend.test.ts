@@ -32,6 +32,13 @@ async function fixture() {
 if (process.argv[2] === '--version') {
   console.log('rag-benchmark-backend 0.1.0');
 } else {
+  if (process.env.RECORD_NEBULA_CONNECTION) {
+    require('node:fs').writeFileSync(process.env.RECORD_NEBULA_CONNECTION, JSON.stringify({
+      base: process.env.NEBULA_API_BASE,
+      token: process.env.NEBULA_API_TOKEN,
+    }));
+  }
+  if (process.env.FAIL_BENCHMARK_STARTUP) process.exit(23);
   const http = require('node:http');
   const [host, port] = process.env.BENCHMARK_ADDR.split(':');
   const server = http.createServer((request, response) => {
@@ -55,7 +62,38 @@ fs.writeFileSync(path.join(process.cwd(), 'target/debug/backend'), ${JSON.string
 `,
     { mode: 0o755 },
   );
-  return { backendDirectory: directory, env: { ...process.env, CARGO: cargo }, log: vi.fn() };
+  return { backendDirectory: directory, env: { ...process.env, CARGO: cargo } as NodeJS.ProcessEnv, log: vi.fn() };
+}
+
+async function withNebula(options: Awaited<ReturnType<typeof fixture>>) {
+  const directory = join(options.backendDirectory, 'fixture-nebula');
+  await mkdir(directory);
+  await writeFile(join(directory, 'package.json'), JSON.stringify({
+    name: '@genesis/nebula',
+    type: 'module',
+    exports: { './benchmarking': './launch.mjs' },
+  }));
+  await writeFile(join(directory, 'launch.mjs'), `
+import { appendFileSync } from 'node:fs';
+export async function startBenchmarkNebula() {
+  const events = new URL('./events', import.meta.url);
+  appendFileSync(events, 'start\\n');
+  let stopped = false;
+  return {
+    baseUrl: 'http://127.0.0.1:54321/api/nebula/v1',
+    token: 'fixture-nebula-runtime-token',
+    stop() {
+      if (stopped) return;
+      stopped = true;
+      appendFileSync(events, 'stop\\n');
+    },
+  };
+}
+`);
+  options.env.BENCHMARK_NEBULA_ROOT = directory;
+  delete options.env.NEBULA_API_BASE;
+  delete options.env.NEBULA_API_TOKEN;
+  return join(directory, 'events');
 }
 
 async function availableTarget() {
@@ -165,6 +203,47 @@ describe('automatic Rust backend build', () => {
     stopOther();
     expect((await fetch(`${target}/api/benchmarks/v1/health`)).ok).toBe(true);
     expect(options.log).toHaveBeenCalledTimes(2);
+  });
+
+  it('passes the managed Nebula connection to the backend and stops both on shutdown', async () => {
+    const options = await fixture();
+    const events = await withNebula(options);
+    const connectionFile = join(options.backendDirectory, 'connection.json');
+    options.env.RECORD_NEBULA_CONNECTION = connectionFile;
+    const target = await availableTarget();
+    const stop = await startBackend({ ...options, target });
+    stops.push(stop);
+    expect(JSON.parse(await readFile(connectionFile, 'utf8'))).toEqual({
+      base: 'http://127.0.0.1:54321/api/nebula/v1',
+      token: 'fixture-nebula-runtime-token',
+    });
+    expect(await readFile(events, 'utf8')).toBe('start\n');
+    stop();
+    stop();
+    await vi.waitFor(async () => {
+      await expect(fetch(`${target}/api/benchmarks/v1/health`)).rejects.toThrow();
+    });
+    expect(await readFile(events, 'utf8')).toBe('start\nstop\n');
+  });
+
+  it('stops its Nebula when the benchmark backend fails during startup', async () => {
+    const options = await fixture();
+    const events = await withNebula(options);
+    options.env.FAIL_BENCHMARK_STARTUP = '1';
+    await expect(startBackend({ ...options, target: await availableTarget() }))
+      .rejects.toThrow('exit 23');
+    expect(await readFile(events, 'utf8')).toBe('start\nstop\n');
+  });
+
+  it('does not start Nebula when reusing an existing compatible benchmark backend', async () => {
+    const options = await fixture();
+    const target = await availableTarget();
+    stops.push(await startBackend({ ...options, target }));
+    const events = await withNebula(options);
+    const stopOther = await startBackend({ ...options, target });
+    stopOther();
+    await expect(readFile(events, 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+    expect((await fetch(`${target}/api/benchmarks/v1/health`)).ok).toBe(true);
   });
 
   it('supports an ephemeral backend port reported by the Rust startup handshake', async () => {

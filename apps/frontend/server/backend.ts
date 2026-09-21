@@ -9,6 +9,7 @@ export function benchmarkBackendPlugin(): Plugin {
     name: 'benchmark-backend',
     apply: 'serve',
     async configureServer(server) {
+      if (!server.httpServer) return;
       if (process.env.BENCHMARK_API_TARGET?.trim()) return;
       const declaration = packageJson.genesisDevelopment.proxy;
       const proxy = server.config.server.proxy?.[declaration.path];

@@ -18,7 +18,7 @@ frontend does not create or edit them.
 From the Genesis repository root:
 
 ```sh
-git submodule update --init genesis/Modules/dev/RAG-Banchmarks
+git submodule update --init genesis/Modules/dev/RAG-Banchmarks genesis/Modules/native/Nebula
 pnpm install
 pnpm benchmark:ui
 ```
@@ -26,7 +26,10 @@ pnpm benchmark:ui
 The development server validates the local Rust binary, compiles it when missing,
 stale, damaged, or not previously validated, and starts the API on loopback port 4319. The first build requires Rust 1.95 or newer and can take several minutes.
 Build output and startup errors appear in the terminal. A healthy existing API is
-reused. Closing the development server stops only the backend process it started.
+reused. On Genesis's `benchmarking` branch, it also builds and starts Nebula with
+the private module's shared Kimi settings. Go and the local embedding bundle are
+required for this automatic Nebula path. Closing the development server stops
+the backend processes it started.
 
 `pnpm start` supplies the same automatic backend lifecycle through Genesis's
 `genesisDevelopment.backend` hook; select **Benchmarking** in the dock. A
@@ -63,11 +66,14 @@ enter renderer state or bundles. The benchmark API itself requires no token;
 `NEBULA_API_TOKEN` authenticates its calls to Nebula and must stay in backend
 configuration, outside Git and `VITE_` variables.
 
-Automatic startup does not prepare datasets or launch Nebula. Follow the
-[backend instructions](../../README.md#start) to load snapshots and connect
-Nebula to their exported passages. To run both RAGTruth and HotpotQA, index the
+Automatic startup leaves the snapshot store and dedicated corpus empty. Follow
+the [backend instructions](../../README.md#automatic-nebula-startup-on-the-benchmarking-branch)
+to select model/corpus paths and prepare snapshots. Copy exported passages into
+the configured benchmark corpus. To run both RAGTruth and HotpotQA, index the
 combined exported corpus while preserving its filenames and bytes. The YAML
-catalog is read at startup and does not automatically load snapshots.
+catalog is read at startup and does not automatically load snapshots. Restart the
+dashboard development server after copying or changing corpus passages; Nebula
+indexes them during startup. Wait for indexing before running benchmarks.
 
 Release packaging excludes development module registrations, frontend assets,
 backend resources, and lifecycle hooks. `pnpm --filter @genesis/benchmarking build`

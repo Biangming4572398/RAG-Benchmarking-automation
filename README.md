@@ -4,6 +4,8 @@ The experimental architecture comparison dashboard lives in
 [`apps/frontend`](apps/frontend/README.md). Open it with `pnpm benchmark:ui` from
 the Genesis repository root, or use the Benchmarking dock item in development
 Genesis. The development server compiles and starts the Rust backend when needed.
+With Nebula's `benchmarking` branch installed, it also builds and starts Nebula
+using that module's private Kimi configuration.
 The dashboard uses a macOS-style sidebar to select one benchmark, with separate
 Retrieval and Generated answers tables showing saved executions by run number.
 It supports search, status filters, notes, CSV exports, evidence inspection, and
@@ -28,8 +30,9 @@ proxy, and backend build/lifecycle script live inside this submodule.
 
 Developer-only Rust HTTP server for loading benchmark data with Polars, running
 Nebula retrieval and answer generation, and retaining results and human reviews.
-It does not register with the Genesis release build, install models, launch
-Nebula, or modify your normal Genesis storage.
+It does not register with the Genesis release build, install models, or modify
+your normal Genesis storage. The development launcher can supervise a separate
+Nebula process for benchmarks.
 The benchmark backend uses files only; Nebula manages its own index separately.
 
 ## Backend layout
@@ -354,9 +357,43 @@ pnpm benchmark:ui
 processes run with `apps/backend` as their working directory, so the defaults are
 `apps/backend/benchmark-data` for data and `apps/backend/benchmarks.yaml` for the
 catalog. Set an absolute `BENCHMARK_DATA_DIR` to isolate an experiment. The process
-inherits backend-only Nebula settings; automatic startup does not launch Nebula,
-load datasets, or prepare an index. Restart the managed server after changing its
-configuration or Rust sources.
+inherits backend-only Nebula connection settings. Restart the managed server
+after changing its configuration or backend sources.
+
+### Automatic Nebula startup on the benchmarking branch
+
+When no `NEBULA_API_BASE` / `NEBULA_API_TOKEN` pair is supplied, the launcher looks
+for the sibling `Modules/native/Nebula` checkout and uses its public
+`@genesis/nebula/benchmarking` entry point. Genesis's `benchmarking` branch pins a
+Nebula revision providing that entry point. For a standalone checkout, set
+`BENCHMARK_NEBULA_ROOT` to the absolute path of Nebula's `benchmarking` checkout.
+Without any Nebula checkout, the standalone dashboard still supports browsing
+and dataset preparation. A checkout lacking the entry point reports an update error.
+
+Nebula builds its Go executable when absent, damaged, or changed since the last
+build, then loads the shared Kimi settings from its own private repository.
+Go must be installed; the first build can download dependencies. The launcher
+waits for authenticated loopback health and passes the generated local connection
+token directly to the Rust child. The Kimi key is neither copied into this
+repository nor supplied to the dashboard. Closing the development server stops
+both owned processes. Reusing an existing benchmark server leaves that server's
+Nebula connection under its existing owner's control.
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `BENCHMARK_NEBULA_CORPUS` | `<BENCHMARK_DATA_DIR>/nebula/corpus` | Dedicated Markdown corpus for benchmark passages |
+| `BENCHMARK_NEBULA_STORAGE` | `<BENCHMARK_DATA_DIR>/nebula/storage` | Nebula's separate mutable index and state |
+| `BENCHMARK_NEBULA_MODEL_DIR` | `~/.genesis/storage/.genesis/modules/nebula/models/intfloat-multilingual-e5-small` | Existing E5 model bundle, reused without changing Genesis's index |
+
+The corpus and state directories are created if absent; the corpus is initially
+empty. Snapshots are still prepared explicitly through the API. Copy their
+exported Markdown passages into the configured corpus, preserving filenames and
+bytes, then restart the dashboard development server so Nebula indexes them.
+Restart after each corpus change and wait for indexing to finish before running benchmarks. Never
+point Nebula at the whole benchmark data directory: snapshot JSON includes
+answers and evaluation labels. Models are not downloaded by the launcher. Install
+the embedding bundle first, or set `BENCHMARK_NEBULA_MODEL_DIR` to an existing
+compatible bundle. No paid generation request is made merely by opening the dashboard.
 
 You can also run directly in `apps/backend` using Rust 1.95 or newer:
 

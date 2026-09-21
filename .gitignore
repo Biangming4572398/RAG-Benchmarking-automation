@@ -9,3 +9,4 @@ dist/
 
 # Rust compilation outputs
 /apps/backend/target/
+/apps/backend/benchmark-data/

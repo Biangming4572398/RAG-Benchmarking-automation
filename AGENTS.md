@@ -31,7 +31,9 @@ Its frontend and backend live together in this submodule; Genesis is a thin host
   which requires no authentication. Nebula credentials stay in backend/host
   configuration, outside renderer state and bundles.
   Model selection, Nebula launch, and experiment orchestration remain backend/host
-  responsibilities; the current benchmark server does not launch Nebula.
+  responsibilities. The module-owned development launcher may build and start
+  Nebula through its public `@genesis/nebula/benchmarking` entry point; the Rust
+  server consumes only its loopback connection.
 - In the Genesis checkout, inspect `genesis/scripts/generate-registry.ts` and
   `pnpm-workspace.yaml` when wiring the dashboard. They discover `Modules/dev` for development only; keep it excluded from release builds.
 
@@ -81,5 +83,8 @@ checkouts, with separate storage roots and backend processes. Successful changes
 should merge directly into production code. Genesis storage extraction/reuse is
 planned, not implemented here: the current Rust backend exports its own Markdown
 corpus and calls an already-running standalone Nebula through `/retrieve` or `/query`.
-Generation requires a configured remote-enabled Nebula; benchmark code does not
-launch it or store provider credentials in frontend state.
+Generation requires a configured remote-enabled Nebula. The development launcher
+can supervise a separate Nebula using the private module's shared configuration;
+provider credentials remain there and never enter frontend state. Reuse only the
+model bundle from normal Genesis storage, keeping benchmark corpus/index state
+separate. Automatic startup does not prepare snapshots or download models.

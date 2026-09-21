@@ -7,6 +7,8 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
+import { connectNebula } from './nebula.mjs';
+
 const execute = promisify(execFile);
 const backendRoot = fileURLToPath(new URL('../apps/backend/', import.meta.url));
 const builds = new Map();
@@ -219,14 +221,21 @@ export async function startBackend({
   if (await reuseExistingBackend(target)) return () => {};
   const binary = await ensureBackendBinary({ backendDirectory, env, log });
   if (await reuseExistingBackend(target)) return () => {};
-  const child = spawn(binary, [], {
-    cwd: backendDirectory,
-    env: {
-      ...env,
-      BENCHMARK_ADDR: `${address.hostname === 'localhost' ? '127.0.0.1' : address.hostname}:${address.port || '80'}`,
-    },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
+  const nebula = await connectNebula({ backendDirectory, env, log });
+  let child;
+  try {
+    child = spawn(binary, [], {
+      cwd: backendDirectory,
+      env: {
+        ...nebula.env,
+        BENCHMARK_ADDR: `${address.hostname === 'localhost' ? '127.0.0.1' : address.hostname}:${address.port || '80'}`,
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch (error) {
+    nebula.stop();
+    throw error;
+  }
   let failure;
   let stderr = '';
   let stdout = '';
@@ -248,6 +257,7 @@ export async function startBackend({
     failure = error;
   });
   child.once('exit', (code, signal) => {
+    nebula.stop();
     failure = new Error(
       `Benchmark backend stopped (${signal || `exit ${code}`}). ${stderr.trim()}`,
     );
@@ -257,6 +267,7 @@ export async function startBackend({
     if (stopped) return;
     stopped = true;
     process.off('exit', stop);
+    nebula.stop();
     child.kill('SIGINT');
     const force = setTimeout(() => child.kill('SIGKILL'), 5000);
     force.unref();
