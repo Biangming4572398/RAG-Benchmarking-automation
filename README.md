@@ -26,6 +26,51 @@ It does not register with the Genesis release build, install models, launch
 Nebula, or modify your normal Genesis storage.
 The benchmark backend uses files only; Nebula manages its own index separately.
 
+## Backend layout
+
+Each benchmark has one named module in `apps/backend/src` that owns its
+definition validation, snapshot initialization/loading, supported run modes,
+evaluation policy, and benchmark-specific CSV columns:
+
+| Module | Responsibility |
+| --- | --- |
+| `ragtruth.rs` | Parquet QA loading, paired-context retrieval/scoring, generated-answer candidate selection, and human review |
+| `hotpotqa.rs` | Distractor JSON loading/checksums, per-question candidate selection, answer exact match/token F1, and supplementary human review |
+| `longmemeval.rs`, `temprageval.rs`, `qasper.rs`, `abstentionbench.rs`, `multihop_rag.rs`, `ragbench.rs` | Named registration and preparation boundaries; loading and evaluation remain unavailable |
+
+The remaining files assemble the backend and provide shared infrastructure:
+
+- `main.rs` reads configuration, opens storage, and starts the HTTP server.
+- `lib.rs` declares the benchmark contracts, shared snapshot/run envelopes, and
+  the `BENCHMARKS` registry. Dispatch selects registered implementations.
+- `config.rs` reads environment settings and YAML, validates common metadata,
+  resolves catalog entries, and delegates benchmark-specific validation.
+- `server.rs` assembles HTTP routes. Its inline `persistence` and `generation`
+  modules provide atomic storage, recovery, Nebula transport, provenance checks,
+  bounded request batches, and failure logging. Benchmark modules supply the
+  selection/scoring/export policy; shared mechanics do not branch on benchmark names.
+- `init.rs` remains unchanged and reserved for the user's initialization work.
+  No first-run setup wizard or benchmark CRUD mechanism is implemented. A named
+  module's `initialize()` prepares a snapshot; it does not initialize the dashboard.
+
+To add a benchmark, create its named Rust module and implement `BenchmarkModule`,
+including validation, snapshot preparation, and its supported run handlers.
+For the shared Nebula generation executor, implement `AnswerEvaluation` to
+select candidates, capture reference metadata, score cases, aggregate results,
+and declare CSV columns/values. Register the instance in `lib::BENCHMARKS` and
+add its YAML definition with matching adapter/evaluation identifiers. Unsupported
+run modes reject requests by default; YAML alone does not implement a benchmark.
+
+`MetricValues` is a map from metric names to numeric values, so evaluators can
+declare different result metrics without extending a shared fixed score struct.
+Metric meaning and denominators remain evaluator-owned. This backend contract
+does not automatically teach the frontend how to present a new evaluator.
+
+This reorganization preserves the existing HTTP API, YAML definitions, saved
+snapshot/run formats, and snapshot fingerprint calculation. `Case` deliberately
+retains its existing serialized fields; it is not a universal dataset schema.
+Benchmarks requiring new data shapes may need versioned snapshot extensions.
+
 ## Datasets
 
 The included `ragtruth-qa` catalog entry uses

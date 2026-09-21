@@ -6,9 +6,10 @@ use std::{
 };
 
 use backend::{
-    catalog::{Catalog, LoadRequest, ResolvedBenchmark},
-    load_benchmarks::{Case, digest, load_benchmarks},
-    storage::Store,
+    Case,
+    config::{Catalog, LoadRequest, ResolvedBenchmark},
+    digest, initialize_benchmark,
+    server::Store,
 };
 use serde_json::{Value, json};
 
@@ -49,7 +50,7 @@ fn preserves_per_question_distractors_deduplicates_passages_and_never_indexes_la
         &dir.path().join("hotpot.json"),
         &[example("first"), example("second")],
     );
-    let benchmark = load_benchmarks(&request).unwrap();
+    let benchmark = initialize_benchmark(&request).unwrap();
     assert_eq!(benchmark.metric_kind, "hotpotqa_answer_v1");
     assert_eq!(benchmark.cases.len(), 2);
     assert_eq!(benchmark.documents.len(), 10);
@@ -72,7 +73,7 @@ fn preserves_per_question_distractors_deduplicates_passages_and_never_indexes_la
         assert!(!text.contains("supporting_facts"));
         assert_eq!(digest(text.as_bytes()), document.revision);
     }
-    let repeated = load_benchmarks(&request).unwrap();
+    let repeated = initialize_benchmark(&request).unwrap();
     assert_eq!(
         store.save_benchmark(&repeated).unwrap().fingerprint,
         info.fingerprint
@@ -90,7 +91,7 @@ fn preserves_per_question_distractors_deduplicates_passages_and_never_indexes_la
     );
     let mut limited_request = request;
     limited_request.definition.defaults.limit = 1;
-    let limited = load_benchmarks(&limited_request).unwrap();
+    let limited = initialize_benchmark(&limited_request).unwrap();
     assert_eq!(limited.cases.len(), 1);
     assert_eq!(limited.cases[0].id, "first");
 }
@@ -102,7 +103,7 @@ fn passage_identity_includes_title_and_exact_sentence_boundaries() {
     let mut changed = example("second");
     changed["context"][0][1][0] = json!("A changed sentence under the same title.");
     let request = write_fixture(&dir.path().join("hotpot.json"), &[original, changed]);
-    let benchmark = load_benchmarks(&request).unwrap();
+    let benchmark = initialize_benchmark(&request).unwrap();
     assert_eq!(benchmark.documents.len(), 11);
     assert_ne!(
         benchmark.cases[0]
@@ -145,7 +146,7 @@ fn rejects_missing_labels_bad_supports_duplicate_ids_and_wrong_distractor_counts
     for rows in bad {
         let request = write_fixture(&dir.path().join("hotpot.json"), &rows);
         assert!(
-            load_benchmarks(&request).is_err(),
+            initialize_benchmark(&request).is_err(),
             "accepted invalid fixture {rows:?}"
         );
     }
@@ -157,7 +158,7 @@ fn preserves_original_unresolved_support_annotations_without_using_them_as_candi
     let mut row = example("first");
     row["supporting_facts"] = json!([["Missing title", 902], ["Passage 0", 902]]);
     let request = write_fixture(&dir.path().join("hotpot.json"), &[row]);
-    let benchmark = load_benchmarks(&request).unwrap();
+    let benchmark = initialize_benchmark(&request).unwrap();
     let reference = benchmark.cases[0].answer_reference.as_ref().unwrap();
     assert_eq!(reference.supporting_facts[0].title, "Missing title");
     assert_eq!(reference.supporting_facts[1].sentence_index, 902);
@@ -171,10 +172,10 @@ fn verifies_optional_source_checksum_and_bounds_local_input() {
     let path = dir.path().join("hotpot.json");
     let mut request = write_fixture(&path, &[example("first")]);
     request.definition.source_sha256 = Some(digest(&fs::read(&path).unwrap()));
-    assert!(load_benchmarks(&request).is_ok());
+    assert!(initialize_benchmark(&request).is_ok());
     request.definition.source_sha256 = Some("0".repeat(64));
     assert!(
-        load_benchmarks(&request)
+        initialize_benchmark(&request)
             .err()
             .unwrap()
             .to_string()
@@ -185,7 +186,7 @@ fn verifies_optional_source_checksum_and_bounds_local_input() {
         .set_len(64 * 1024 * 1024 + 1)
         .unwrap();
     assert!(
-        load_benchmarks(&request)
+        initialize_benchmark(&request)
             .err()
             .unwrap()
             .to_string()
@@ -217,7 +218,7 @@ fn downloads_public_http_and_sanitizes_remote_errors() {
             .unwrap();
             stream.write_all(&body).unwrap();
         });
-        let result = load_benchmarks(&settings(
+        let result = initialize_benchmark(&settings(
             &format!("http://{address}/private?signature=not-for-errors"),
             1,
         ));
@@ -255,7 +256,7 @@ fn live_hotpotqa_development_snapshot() {
     if let Ok(source) = std::env::var("HOTPOTQA_SOURCE") {
         request.definition.source = source;
     }
-    let benchmark = load_benchmarks(&request).unwrap();
+    let benchmark = initialize_benchmark(&request).unwrap();
     assert_eq!(benchmark.cases.len(), 100);
     assert!(benchmark.documents.len() >= 10);
     assert!(benchmark.cases.iter().all(|case| {

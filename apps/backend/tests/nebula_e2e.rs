@@ -7,7 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use backend::load_benchmarks::Benchmark;
+use backend::Benchmark;
 use polars::prelude::*;
 use serde_json::{Value, json};
 

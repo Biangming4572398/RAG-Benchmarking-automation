@@ -1,4 +1,4 @@
-use backend::catalog::{Catalog, LoadRequest};
+use backend::config::{Catalog, LoadRequest};
 
 const YAML: &str = include_str!("../benchmarks.yaml");
 
@@ -137,7 +137,7 @@ fn external_suites_are_visible_once_but_cannot_be_loaded_as_supported_benchmarks
             resolved.definition.evaluation.metric_kind(),
             "external_evaluation"
         );
-        let error = match backend::load_benchmarks::load_benchmarks(&resolved) {
+        let error = match backend::initialize_benchmark(&resolved) {
             Ok(_) => panic!("External suite became a runnable snapshot"),
             Err(error) => error,
         };
@@ -156,10 +156,10 @@ fn external_catalog_metadata_and_evaluation_pairs_are_validated() {
     let original = &catalog.benchmarks["qasper"];
     let mut definition = original.clone();
     definition.preparation = None;
-    assert!(definition.validate().is_err());
+    assert!(definition.validate_for("qasper").is_err());
     definition = original.clone();
-    definition.evaluation = backend::catalog::Evaluation::HotpotqaAnswerV1;
-    assert!(definition.validate().is_err());
+    definition.evaluation = "hotpotqa_answer_v1".into();
+    assert!(definition.validate_for("qasper").is_err());
     for url in [
         "javascript:alert(1)",
         "https://name:secret@example.org",
@@ -167,14 +167,14 @@ fn external_catalog_metadata_and_evaluation_pairs_are_validated() {
     ] {
         definition = original.clone();
         definition.homepage = Some(url.into());
-        assert!(definition.validate().is_err());
+        assert!(definition.validate_for("qasper").is_err());
         definition = original.clone();
         definition.source = url.into();
-        assert!(definition.validate().is_err());
+        assert!(definition.validate_for("qasper").is_err());
     }
     for description in ["".into(), "x".repeat(2001)] {
         definition = original.clone();
         definition.description = Some(description);
-        assert!(definition.validate().is_err());
+        assert!(definition.validate_for("qasper").is_err());
     }
 }

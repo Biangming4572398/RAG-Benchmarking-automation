@@ -6,12 +6,10 @@ use axum::{
     routing::{get, post},
 };
 use backend::{
-    catalog::{Catalog, LoadRequest, ResolvedBenchmark},
-    config::NebulaConfig,
-    load_benchmarks::{Benchmark, load_benchmarks},
-    server::router,
-    storage::Store,
-    trials::{Run, RunRequest, RunStatus, StartRunRequest},
+    Benchmark, Run, RunRequest, RunStatus, StartRunRequest,
+    config::{Catalog, LoadRequest, NebulaConfig, ResolvedBenchmark},
+    initialize_benchmark,
+    server::{Store, router},
 };
 use polars::prelude::*;
 use serde_json::{Value, json};
@@ -36,7 +34,7 @@ fn fixture(dir: &TempDir) -> String {
 }
 
 fn load_fixture(dir: &TempDir) -> Benchmark {
-    load_benchmarks(&load_settings(&fixture(dir), 10)).unwrap()
+    initialize_benchmark(&load_settings(&fixture(dir), 10)).unwrap()
 }
 
 fn catalog_for(source: &str, limit: usize) -> Catalog {
@@ -80,10 +78,7 @@ fn parquet_loading_preserves_annotations_but_exports_only_deduplicated_qa_contex
         let text = std::fs::read_to_string(info.corpus_path.join(&document.filename)).unwrap();
         assert_eq!(text, document.text);
         assert!(!text.contains("Mars"));
-        assert_eq!(
-            backend::load_benchmarks::digest(text.as_bytes()),
-            document.revision
-        );
+        assert_eq!(backend::digest(text.as_bytes()), document.revision);
     }
     let id = benchmark.id;
     drop(store);
@@ -96,15 +91,15 @@ fn limit_applies_to_unique_cases_and_invalid_input_is_rejected() {
     let dir = TempDir::new().unwrap();
     let source = fixture(&dir);
     let mut settings = load_settings(&source, 1);
-    let benchmark = load_benchmarks(&settings).unwrap();
+    let benchmark = initialize_benchmark(&settings).unwrap();
     assert_eq!(benchmark.cases.len(), 1);
     assert_eq!(benchmark.cases[0].reference_outputs.len(), 2);
     settings.definition.defaults.limit = 0;
-    assert!(load_benchmarks(&settings).is_err());
+    assert!(initialize_benchmark(&settings).is_err());
     settings.definition.defaults.limit = 1;
     settings.definition.split = "../../bad".into();
-    assert!(load_benchmarks(&settings).is_err());
-    assert!(load_benchmarks(&load_settings("missing.parquet", 1)).is_err());
+    assert!(initialize_benchmark(&settings).is_err());
+    assert!(initialize_benchmark(&load_settings("missing.parquet", 1)).is_err());
 }
 
 #[test]
@@ -117,7 +112,7 @@ fn live_hugging_face_ragtruth() {
             limit: None,
         })
         .unwrap();
-    let benchmark = load_benchmarks(&settings).unwrap();
+    let benchmark = initialize_benchmark(&settings).unwrap();
     assert_eq!(benchmark.cases.len(), 100);
     assert!(!benchmark.documents.is_empty());
     assert!(
@@ -274,7 +269,7 @@ async fn wait_run(client: &reqwest::Client, base: &str, id: &str) -> Value {
 async fn api_loads_runs_scores_and_reopens_without_a_database() {
     let dir = TempDir::new().unwrap();
     let source = fixture(&dir);
-    let reference = load_benchmarks(&load_settings(&source, 10)).unwrap();
+    let reference = initialize_benchmark(&load_settings(&source, 10)).unwrap();
     let nebula = nebula(&reference, false, false).await;
     let store = Arc::new(Store::open(&dir.path().join("data")).unwrap());
     let server = serve(
@@ -409,7 +404,7 @@ async fn failed_queries_and_index_drift_are_recorded_without_fake_zero_scores() 
         )
         .unwrap();
         store.create_run(&run).unwrap();
-        backend::trials::execute(
+        backend::ragtruth::execute_retrieval(
             store.clone(),
             NebulaConfig {
                 base_url: format!("{}/api/nebula/v1", nebula.base),
@@ -443,7 +438,7 @@ async fn oversized_corpus_selection_fails_before_querying() {
     let original = benchmark.documents[0].clone();
     for index in 0..1000 {
         let mut document = original.clone();
-        document.id = backend::load_benchmarks::digest(index.to_string().as_bytes());
+        document.id = backend::digest(index.to_string().as_bytes());
         document.filename = format!("ragtruth-{}.md", document.id);
         benchmark.documents.push(document);
     }
@@ -460,7 +455,7 @@ async fn oversized_corpus_selection_fails_before_querying() {
     )
     .unwrap();
     store.create_run(&run).unwrap();
-    backend::trials::execute(
+    backend::ragtruth::execute_retrieval(
         store.clone(),
         NebulaConfig {
             base_url: format!("{}/api/nebula/v1", nebula.base),

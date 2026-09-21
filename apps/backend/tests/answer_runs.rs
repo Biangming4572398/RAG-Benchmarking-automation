@@ -12,14 +12,12 @@ use axum::{
     routing::{get, post},
 };
 use backend::{
-    answers::AnswerRun,
-    catalog::Catalog,
-    config::NebulaConfig,
-    load_benchmarks::{
-        AnswerReference, Benchmark, Case, Document, ReferenceOutput, SupportingFact, digest,
-    },
-    server::router,
-    storage::Store,
+    AnswerRun, Benchmark, Case, Document,
+    config::{Catalog, NebulaConfig},
+    digest,
+    hotpotqa::{AnswerReference, SupportingFact},
+    ragtruth::ReferenceOutput,
+    server::{Store, router},
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -1108,6 +1106,20 @@ async fn review_validation_and_interrupted_recovery_preserve_successful_answers(
         csv_rows(&csv(&client, &recovered_server, id).await).len(),
         1
     );
+    let reviewed = response(
+        client
+            .post(format!(
+                "{}/answer-runs/{id}/cases/case-0/review",
+                base(&recovered_server)
+            ))
+            .json(&review(true)),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        reviewed["reviewed"], 1,
+        "A standalone recovered run can use an unambiguous evaluator"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1385,13 +1397,15 @@ async fn hotpot_validates_candidate_selections_individually_instead_of_the_large
         base_url: format!("{}/api/nebula/v1", nebula.base),
         token: TOKEN.into(),
     };
-    let request = backend::answers::StartAnswerRunRequest {
+    let request = backend::StartAnswerRunRequest {
         benchmark_id: benchmark.id,
         architecture_label: "Large candidate union".into(),
         profile_id: PROFILE.into(),
     };
-    let run =
-        backend::answers::prepare(&config, request.clone(), &benchmark, "fingerprint".into()).await;
+    let run = backend::module_for_snapshot(&benchmark)
+        .unwrap()
+        .prepare_answers(&config, request.clone(), &benchmark, "fingerprint".into())
+        .await;
     assert!(
         run.is_ok(),
         "A large union must not reject a small per-case selection"
@@ -1409,8 +1423,11 @@ async fn hotpot_validates_candidate_selections_individually_instead_of_the_large
         .unwrap()
         .candidate_document_ids[0] = "missing-candidate".into();
     assert!(matches!(
-        backend::answers::prepare(&config, request, &benchmark, "fingerprint".into()).await,
-        Err(backend::answers::StartFailure::Invalid(_))
+        backend::module_for_snapshot(&benchmark)
+            .unwrap()
+            .prepare_answers(&config, request, &benchmark, "fingerprint".into())
+            .await,
+        Err(backend::StartFailure::Invalid(_))
     ));
 }
 
@@ -1681,5 +1698,247 @@ async fn automatic_scores_are_identical_for_forward_and_reverse_completion_order
     assert_eq!(
         aggregates[0]["f1"],
         (1.0 + 2.0 / 3.0 + 0.5 + 2.0 / 7.0) / 4.0
+    );
+}
+
+struct WordCountEvaluation;
+static WORD_COUNT_EVALUATION: WordCountEvaluation = WordCountEvaluation;
+
+impl backend::AnswerEvaluation for WordCountEvaluation {
+    fn id(&self) -> &'static str {
+        "test_word_count_v1"
+    }
+
+    fn initial_scores(&self) -> Option<backend::MetricValues> {
+        Some(BTreeMap::from([("word_count".into(), 0.0)]))
+    }
+
+    fn candidate_sources(
+        &self,
+        _case: &Case,
+        sources: &BTreeMap<String, String>,
+    ) -> backend::Result<Vec<String>> {
+        Ok(sources.values().cloned().collect())
+    }
+
+    fn initialize_case(&self, case: &Case, captured: &mut backend::AnswerCase) {
+        captured.reference_answer = Some(format!("PRIVATE_TEST_LABEL_{}", case.id));
+        captured.automatic_scores = self.initial_scores();
+    }
+
+    fn score_case(&self, captured: &mut backend::AnswerCase) {
+        if captured.outcome == "answered" {
+            captured.automatic_scores = Some(BTreeMap::from([(
+                "word_count".into(),
+                captured
+                    .answer
+                    .as_deref()
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .count() as f64,
+            )]));
+        }
+    }
+
+    fn aggregate(&self, summary: &mut backend::AnswerRunSummary, cases: &[backend::AnswerCase]) {
+        summary.scored = cases.len();
+        summary.automatic_scores = Some(BTreeMap::from([(
+            "word_count".into(),
+            cases
+                .iter()
+                .map(|case| case.automatic_scores.as_ref().unwrap()["word_count"])
+                .sum::<f64>()
+                / summary.total as f64,
+        )]));
+    }
+
+    fn csv_columns(&self) -> &'static [&'static str] {
+        &["word_count"]
+    }
+
+    fn csv_values(&self, _run: &AnswerRun, case: &backend::AnswerCase) -> Vec<String> {
+        vec![case.automatic_scores.as_ref().unwrap()["word_count"].to_string()]
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shared_generation_runs_an_independent_evaluation_policy_with_new_result_columns() {
+    let dir = TempDir::new().unwrap();
+    let mut benchmark = benchmark();
+    benchmark.metric_kind = "test_word_count_v1".into();
+    let store = Arc::new(Store::open(dir.path()).unwrap());
+    let info = store.save_benchmark(&benchmark).unwrap();
+    let (nebula, script) = scripted_nebula(&benchmark, Outcome::Answered, false).await;
+    let config = NebulaConfig {
+        base_url: format!("{}/api/nebula/v1", nebula.base),
+        token: TOKEN.into(),
+    };
+    let request = backend::StartAnswerRunRequest {
+        benchmark_id: benchmark.id,
+        architecture_label: "Independent evaluator".into(),
+        profile_id: PROFILE.into(),
+    };
+    let run = backend::server::generation::prepare(
+        &config,
+        request,
+        &benchmark,
+        info.fingerprint,
+        &WORD_COUNT_EVALUATION,
+    )
+    .await
+    .unwrap_or_else(|_| panic!("Shared generation must accept the supplied evaluator"));
+    assert_eq!(run.summary.evaluation, "test_word_count_v1");
+    assert_eq!(
+        run.summary.automatic_scores.as_ref().unwrap()["word_count"],
+        0.0
+    );
+    let run_id = run.summary.id;
+    store.create_answer_run(&run).unwrap();
+    backend::server::generation::execute(
+        store.clone(),
+        config,
+        benchmark,
+        run,
+        &WORD_COUNT_EVALUATION,
+    )
+    .await;
+    let saved = store.answer_run(run_id).unwrap();
+    assert_eq!(saved.summary.status, backend::RunStatus::Completed);
+    assert_eq!(saved.summary.completed, 2);
+    assert_eq!(saved.summary.scored, 2);
+    assert_eq!(
+        saved.summary.automatic_scores.as_ref().unwrap()["word_count"],
+        6.0
+    );
+    for case in &saved.cases {
+        assert_eq!(case.automatic_scores.as_ref().unwrap()["word_count"], 6.0);
+        assert_eq!(
+            case.reference_answer.as_deref(),
+            Some(format!("PRIVATE_TEST_LABEL_{}", case.case_id).as_str())
+        );
+    }
+    for body in script
+        .queries
+        .lock()
+        .unwrap()
+        .iter()
+        .chain(script.conversations.lock().unwrap().iter())
+    {
+        assert!(!body.to_string().contains("PRIVATE_TEST_LABEL"));
+    }
+    let encoded = serde_json::to_value(&saved).unwrap();
+    assert_eq!(encoded["automatic_scores"], json!({"word_count": 6.0}));
+    assert!(encoded["automatic_scores"].get("exact_match").is_none());
+    assert!(encoded["automatic_scores"].get("f1").is_none());
+    let csv = backend::server::generation::csv(&saved, &WORD_COUNT_EVALUATION).unwrap();
+    let rows = csv_rows(std::str::from_utf8(&csv).unwrap());
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["word_count"], "6");
+    assert_eq!(rows[0]["evaluation"], "test_word_count_v1");
+    assert!(!rows[0].contains_key("exact_match"));
+    assert!(!rows[0].contains_key("f1"));
+    for field in [
+        "reviewer",
+        "correctness",
+        "groundedness",
+        "hallucination",
+        "citation_accuracy",
+        "review_notes",
+        "reviewed_at_ms",
+    ] {
+        assert!(
+            !rows[0].contains_key(field),
+            "unrelated review column: {field}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn review_and_csv_require_the_saved_snapshot_to_match_the_answer_run() {
+    let dir = TempDir::new().unwrap();
+    let mut benchmark = benchmark();
+    benchmark.configuration = Some(
+        Catalog::from_yaml(include_str!("../benchmarks.yaml"))
+            .unwrap()
+            .resolve(&backend::config::LoadRequest {
+                benchmark: "ragtruth-qa".into(),
+                limit: None,
+            })
+            .unwrap(),
+    );
+    let store = Arc::new(Store::open(dir.path()).unwrap());
+    store.save_benchmark(&benchmark).unwrap();
+    let (nebula, _) = scripted_nebula(&benchmark, Outcome::Answered, false).await;
+    let server = benchmark_server(store.clone(), Some(&nebula)).await;
+    let client = client();
+    let created = start(&client, &server, &benchmark).await;
+    let id = created["id"].as_str().unwrap();
+    assert_eq!(wait_run(&client, &server, id).await["status"], "completed");
+    let review_url = format!("{}/answer-runs/{id}/cases/case-0/review", base(&server));
+    let csv_url = format!("{}/answer-runs/{id}/scores.csv", base(&server));
+    let reviewed = response(client.post(&review_url).json(&review(true)), StatusCode::OK).await;
+    assert_eq!(reviewed["reviewed"], 1);
+    let rows = csv_rows(&csv(&client, &server, id).await);
+    assert_eq!(rows[0]["correctness"], "true");
+    let snapshot_path = dir
+        .path()
+        .join("benchmarks")
+        .join(benchmark.id.to_string())
+        .join("benchmark.json");
+    let run_path = dir.path().join("answer-runs").join(id).join("run.json");
+    let original_snapshot = std::fs::read(&snapshot_path).unwrap();
+    let original_run = std::fs::read(&run_path).unwrap();
+
+    for damage in [
+        "different-evaluator",
+        "corrupt-json",
+        "missing-json",
+        "different-id",
+    ] {
+        match damage {
+            "different-evaluator" => {
+                let mut different = benchmark.clone();
+                different.metric_kind = "hotpotqa_answer_v1".into();
+                different.configuration = Some(
+                    Catalog::from_yaml(include_str!("../benchmarks.yaml"))
+                        .unwrap()
+                        .resolve(&backend::config::LoadRequest {
+                            benchmark: "hotpotqa".into(),
+                            limit: None,
+                        })
+                        .unwrap(),
+                );
+                std::fs::write(&snapshot_path, serde_json::to_vec(&different).unwrap()).unwrap();
+            }
+            "corrupt-json" => std::fs::write(&snapshot_path, b"{ incomplete").unwrap(),
+            "missing-json" => std::fs::remove_file(&snapshot_path).unwrap(),
+            "different-id" => {
+                let mut different = benchmark.clone();
+                different.id = Uuid::new_v4();
+                std::fs::write(&snapshot_path, serde_json::to_vec(&different).unwrap()).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        response(client.get(&csv_url), StatusCode::INTERNAL_SERVER_ERROR).await;
+        response(
+            client.post(&review_url).json(&review(false)),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        assert_eq!(
+            std::fs::read(&run_path).unwrap(),
+            original_run,
+            "{damage} must not modify the review"
+        );
+        std::fs::write(&snapshot_path, &original_snapshot).unwrap();
+    }
+    let saved = store.answer_run(id.parse().unwrap()).unwrap();
+    assert_eq!(
+        csv_rows(std::str::from_utf8(&store.answer_csv(&saved).unwrap()).unwrap())[0]["correctness"],
+        "true"
+    );
+    assert_eq!(
+        csv_rows(&csv(&client, &server, id).await)[0]["correctness"],
+        "true"
     );
 }

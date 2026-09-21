@@ -1,4 +1,7 @@
-use backend::{catalog::Catalog, config::Config, server::router, storage::Store};
+use backend::{
+    config::{Catalog, Config},
+    server::{Store, router},
+};
 use std::sync::Arc;
 
 #[tokio::main]

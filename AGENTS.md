@@ -9,8 +9,9 @@ Its frontend and backend live together in this submodule; Genesis is a thin host
   registration, host integration, and resources only in internal builds; verify
   they are absent from release builds, rather than merely hiding navigation.
 - Read `README.md` for the existing HTTP interface and metric interpretation.
-  Use `apps/backend/src/server.rs`, `catalog.rs`, and `trials.rs` as the source of
-  truth for request shapes and responses. Backend changes continue independently;
+  Use `apps/backend/src/lib.rs`, `config.rs`, `server.rs`, and the relevant named
+  benchmark module as the source of truth for request shapes and responses.
+  Backend changes continue independently;
   coordinate contract changes rather than inventing endpoints.
 - Keep result tables first. Benchmark definitions and dataset preparation are
   managed through YAML/Git and backend setup, not frontend catalog editing.
@@ -34,6 +35,27 @@ Its frontend and backend live together in this submodule; Genesis is a thin host
   `pnpm-workspace.yaml` when wiring the dashboard. They discover `Modules/dev` for development only; keep it excluded from release builds.
 
 ## Backend direction and isolation
+
+Keep benchmark policy in its named `apps/backend/src/<benchmark>.rs` module:
+definition validation, snapshot initialization/loading, run support, candidate
+selection, evaluation, and benchmark-specific CSV columns. `ragtruth.rs` and
+`hotpotqa.rs` are the working implementations. LongMemEval, TempRAGEval, QASPER,
+AbstentionBench, MultiHop-RAG, and RAGBench have named modules but remain
+catalog-only; do not imply their loaders or official evaluators are implemented.
+
+`main.rs`, `lib.rs`, `config.rs`, and `server.rs` assemble common infrastructure.
+The inline `server::persistence` and `server::generation` modules own storage and
+Nebula execution mechanics, with policy supplied through `BenchmarkModule` and
+`AnswerEvaluation`, not benchmark-name branches. Register new modules in
+`lib::BENCHMARKS` and add matching YAML entries. Use `MetricValues` for
+evaluator-specific numeric metrics; each evaluator owns their interpretation and
+CSV output. Keep the existing API, YAML, saved snapshots/runs, and fingerprints
+compatible. The existing `Case` fields preserve the current wire format; new
+data shapes may require explicit versioned extensions.
+
+Leave `init.rs` to the user. It is unchanged and does not implement a first-run
+wizard or CRUD. Benchmark-module `initialize()` functions prepare snapshots;
+they are separate from application initialization.
 
 Use the actual Genesis storage and Nebula implementations in experimental
 checkouts, with separate storage roots and backend processes. Successful changes
