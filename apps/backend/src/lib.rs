@@ -4,6 +4,7 @@ pub mod answers;
 pub mod catalog;
 pub mod config;
 mod hotpotqa;
+pub mod init;
 pub mod load_benchmarks;
 pub mod server;
 pub mod storage;
