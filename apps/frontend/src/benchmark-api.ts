@@ -1,4 +1,4 @@
-/** The server contract in apps/backend/src/{server,catalog,trials,storage}.rs. */
+/** The server contract in apps/backend/src/{server,config,lib}.rs and benchmarks/*.rs. */
 export interface BenchmarkDefinition {
   name: string;
   source: string;
@@ -12,6 +12,7 @@ export interface BenchmarkDefinition {
 }
 
 export interface Catalog {
+  module_keys?: Record<string, string>;
   benchmarks: Record<string, BenchmarkDefinition>;
 }
 
@@ -21,6 +22,7 @@ export interface BenchmarkConfiguration {
 }
 
 export interface BenchmarkInfo {
+  module_key?: string | null;
   id: string;
   source: string;
   split: string;
@@ -66,7 +68,7 @@ export interface Scores {
 
 export interface BenchmarkRun {
   id: string;
-  request: { benchmark_id: string; top_k: number; label: string };
+  request: { benchmark_id: string; top_k: number; label: string; description?: string };
   metric_kind: string;
   benchmark_fingerprint: string;
   status: 'running' | 'completed' | 'failed' | 'interrupted';
@@ -88,6 +90,7 @@ export interface LoadBenchmarkRequest {
 }
 
 export interface StartRunRequest {
+  description?: string;
   benchmark_id: string;
   top_k?: number;
   label: string;
@@ -159,7 +162,9 @@ function isCatalog(value: unknown): value is Catalog {
   return (
     isRecord(value) &&
     isRecord(value.benchmarks) &&
-    Object.values(value.benchmarks).every(isDefinition)
+    Object.values(value.benchmarks).every(isDefinition) &&
+    (value.module_keys === undefined ||
+      (isRecord(value.module_keys) && Object.values(value.module_keys).every(isText)))
   );
 }
 
@@ -169,6 +174,7 @@ function isBenchmarkInfo(value: unknown): value is BenchmarkInfo {
     hasStrings(value, ['id', 'source', 'split', 'metric_kind', 'corpus_path', 'fingerprint']) &&
     isCount(value.case_count) &&
     isCount(value.document_count) &&
+    (value.module_key === undefined || value.module_key === null || isText(value.module_key)) &&
     hasConfiguration(value)
   );
 }

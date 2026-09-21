@@ -25,6 +25,7 @@ export interface RetrievalDashboardProps {
   onOpenAnswers?: (benchmarkId: string) => void;
   api?: BenchmarkApi;
   pollInterval?: number;
+  inspectionOnly?: boolean;
 }
 
 const METRICS: { key: keyof Scores; title: string; description: string }[] = [
@@ -80,6 +81,7 @@ export function RetrievalDashboard({
   onOpenAnswers,
   api: providedApi,
   pollInterval = 3000,
+  inspectionOnly = false,
 }: RetrievalDashboardProps) {
   const api = useMemo(() => providedApi ?? createBenchmarkApi(), [providedApi]);
   const workspace = useBenchmarkWorkspace(api, pollInterval);
@@ -182,8 +184,9 @@ export function RetrievalDashboard({
     });
   }
 
+  const Container = inspectionOnly ? 'div' : 'main';
   return (
-    <main className={styles.dashboard}>
+    <Container className={styles.dashboard}>
       <section className={styles.results} aria-label="Benchmark results">
         <header className={styles.resultsHeading}>
           <h1>Architecture comparison</h1>
@@ -405,12 +408,14 @@ export function RetrievalDashboard({
           </p>
         )}
       </section>
-      <BenchmarkCatalog
-        api={api}
-        snapshots={workspace.benchmarks}
-        onOpenAnswers={onOpenAnswers}
-        pollInterval={pollInterval}
-      />
+      {!inspectionOnly && (
+        <BenchmarkCatalog
+          api={api}
+          snapshots={workspace.benchmarks}
+          onOpenAnswers={onOpenAnswers}
+          pollInterval={pollInterval}
+        />
+      )}
       {workspace.error && (
         <div className={styles.error} role="alert">
           <strong>Could not refresh benchmark data.</strong> {workspace.error}
@@ -435,78 +440,80 @@ export function RetrievalDashboard({
           {notice}
         </p>
       )}
-      <div className={styles.setup}>
-        <form className={styles.panel} onSubmit={startRun} aria-label="Start benchmark run">
-          <div className={styles.panelHeading}>
-            <h2>Run an architecture</h2>
-            <span>Existing Nebula runtime</span>
-          </div>
-          {!retrievalBenchmarks.length && (
-            <p className={styles.muted}>
-              No prepared snapshots yet. RAGTruth QA is defined in the team’s Git-managed YAML.
-              Follow the backend README to prepare its snapshot and index the corpus in Nebula.
-            </p>
-          )}
-          <label>
-            Loaded snapshot
-            <select
-              value={selectedBenchmark?.id ?? ''}
-              onChange={(event) => {
-                update({ benchmarkId: event.target.value });
-                setTopK('');
-                setSnapshot(null);
-              }}
-              disabled={!!pending || !retrievalBenchmarks.length}
-            >
-              <option value="" disabled>
-                No prepared snapshots
-              </option>
-              {retrievalBenchmarks.map((item) => (
-                <option key={item.id} value={item.id}>
-                  {benchmarkName(item)} · {item.case_count} cases · {item.id.slice(0, 8)}
+      {!inspectionOnly && (
+        <div className={styles.setup}>
+          <form className={styles.panel} onSubmit={startRun} aria-label="Start benchmark run">
+            <div className={styles.panelHeading}>
+              <h2>Run an architecture</h2>
+              <span>Existing Nebula runtime</span>
+            </div>
+            {!retrievalBenchmarks.length && (
+              <p className={styles.muted}>
+                No prepared snapshots yet. RAGTruth QA is defined in the team’s Git-managed YAML.
+                Follow the backend README to prepare its snapshot and index the corpus in Nebula.
+              </p>
+            )}
+            <label>
+              Loaded snapshot
+              <select
+                value={selectedBenchmark?.id ?? ''}
+                onChange={(event) => {
+                  update({ benchmarkId: event.target.value });
+                  setTopK('');
+                  setSnapshot(null);
+                }}
+                disabled={!!pending || !retrievalBenchmarks.length}
+              >
+                <option value="" disabled>
+                  No prepared snapshots
                 </option>
-              ))}
-            </select>
-          </label>
-          <div className={styles.fields}>
-            <label>
-              Architecture label
-              <input
-                value={label}
-                onChange={(event) => setLabel(event.target.value)}
-                placeholder="e.g. Dense retrieval baseline"
-                disabled={!!pending}
-              />
+                {retrievalBenchmarks.map((item) => (
+                  <option key={item.id} value={item.id}>
+                    {benchmarkName(item)} · {item.case_count} cases · {item.id.slice(0, 8)}
+                  </option>
+                ))}
+              </select>
             </label>
-            <label>
-              Top k
-              <input
-                type="number"
-                min="1"
-                max="100"
-                step="1"
-                value={topK}
-                placeholder={String(
-                  selectedBenchmark?.configuration?.definition.defaults.top_k ?? 8,
-                )}
-                onChange={(event) => setTopK(event.target.value)}
-                disabled={!!pending}
-              />
-            </label>
-            <button className={styles.primaryButton} disabled={!canRun}>
-              {pending === 'run'
-                ? 'Starting…'
-                : activeRuns.length
-                  ? 'Run in progress'
-                  : 'Start run'}
-            </button>
-          </div>
-          <small>
-            The label records your externally configured architecture. It does not change models or
-            launch Nebula. Top k defaults to the saved snapshot.
-          </small>
-        </form>
-      </div>
+            <div className={styles.fields}>
+              <label>
+                Architecture label
+                <input
+                  value={label}
+                  onChange={(event) => setLabel(event.target.value)}
+                  placeholder="e.g. Dense retrieval baseline"
+                  disabled={!!pending}
+                />
+              </label>
+              <label>
+                Top k
+                <input
+                  type="number"
+                  min="1"
+                  max="100"
+                  step="1"
+                  value={topK}
+                  placeholder={String(
+                    selectedBenchmark?.configuration?.definition.defaults.top_k ?? 8,
+                  )}
+                  onChange={(event) => setTopK(event.target.value)}
+                  disabled={!!pending}
+                />
+              </label>
+              <button className={styles.primaryButton} disabled={!canRun}>
+                {pending === 'run'
+                  ? 'Starting…'
+                  : activeRuns.length
+                    ? 'Run in progress'
+                    : 'Start run'}
+              </button>
+            </div>
+            <small>
+              The label records your externally configured architecture. It does not change models
+              or launch Nebula. Top k defaults to the saved snapshot.
+            </small>
+          </form>
+        </div>
+      )}
       {selectedBenchmark && (
         <section className={styles.corpus} aria-label="Selected snapshot">
           <div>
@@ -597,6 +604,6 @@ export function RetrievalDashboard({
         Benchmark definitions are maintained in YAML through Git. Results come from the benchmark
         server. One active run per server; saved results remain available across sessions.
       </footer>
-    </main>
+    </Container>
   );
 }

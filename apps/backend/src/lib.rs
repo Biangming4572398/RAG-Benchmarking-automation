@@ -15,6 +15,7 @@ pub mod benchmarks;
 pub mod config;
 pub mod init;
 pub mod server;
+pub mod suite;
 
 use crate::{
     benchmarks::{hotpotqa::AnswerReference, ragtruth::ReferenceOutput},
@@ -35,6 +36,9 @@ pub trait BenchmarkModule: Sync {
     fn validate_definition(&self, definition: &BenchmarkDefinition) -> Result<()>;
     fn initialize(&self, request: &ResolvedBenchmark) -> Result<Benchmark>;
 
+    fn supports_retrieval(&self) -> bool {
+        false
+    }
     fn answer_evaluation(&self) -> Option<&'static dyn AnswerEvaluation> {
         None
     }

@@ -2,23 +2,29 @@
 
 The experimental architecture comparison dashboard lives in
 [`apps/frontend`](apps/frontend/README.md). Open it with `pnpm benchmark:ui` from
-the Genesis workspace, or use the Benchmarking dock item in development Genesis.
-Its results table comes first, comparing benchmarks against architecture labels.
-It connects through a development proxy, starts runs on saved snapshots, polls
-progress, compares compatible retrieval results, and downloads CSV files. Its
-Generated answers tab runs the configured Nebula generation profile, scores
-HotpotQA answers automatically, and records explicit human reviews of answer quality.
-Benchmark definitions are managed through Git in
-[`apps/backend/benchmarks.yaml`](apps/backend/benchmarks.yaml), including
-RAGTruth QA, HotpotQA, LongMemEval — cleaned, TempRAGEval, QASPER,
-AbstentionBench, MultiHop-RAG and RAGBench. The read-only catalog appears below
-the results in both tabs, including entries that have no prepared snapshot.
-RAGTruth and HotpotQA have working loaders and evaluators; the six newly registered
-suites are explicitly marked **Integration required**, with their setup requirements
-and publisher links. Registering a suite does not make it runnable or produce scores.
-Prepare supported snapshots with the HTTP API as described below; their saved
-names appear in the dashboard automatically. Its UI, API client, and standalone
-proxy live inside this submodule.
+the Genesis repository root, or use the Benchmarking dock item in development
+Genesis. The development server compiles and starts the Rust backend when needed.
+The dashboard uses a macOS-style sidebar to select one benchmark, with separate
+Retrieval and Generated answers tables showing saved executions by run number.
+It supports search, status filters, notes, CSV exports, evidence inspection, and
+compatible-run comparisons.
+
+**Run all benchmarks** creates one durable suite. It selects the latest prepared
+snapshot for each benchmark module, executes every supported mode in sequence,
+and associates the resulting executions with one suite run number. Unsupported
+benchmarks, missing snapshots, and unavailable generation are recorded with
+skipped reasons. Suite history retains these outcomes alongside execution results.
+RAGTruth and HotpotQA have working loaders and evaluators; LongMemEval — cleaned,
+TempRAGEval, QASPER, AbstentionBench, MultiHop-RAG and RAGBench remain catalog-only
+and are marked **Integration required**. Registration alone does not make a
+benchmark runnable or produce scores.
+
+Definitions are managed through Git in
+[`apps/backend/benchmarks.yaml`](apps/backend/benchmarks.yaml). Prepare supported
+snapshots with the HTTP API as described below. The dashboard's **Benchmark setup
+& snapshots** section shows preparation guidance and saved corpus paths; it does
+not edit definitions or load datasets. Its UI, API clients, styling, standalone
+proxy, and backend build/lifecycle script live inside this submodule.
 
 Developer-only Rust HTTP server for loading benchmark data with Polars, running
 Nebula retrieval and answer generation, and retaining results and human reviews.
@@ -52,6 +58,10 @@ shared infrastructure:
   modules provide atomic file writes, recovery, Nebula transport, provenance checks,
   bounded request batches, and failure logging. Benchmark modules supply the
   selection/scoring/export policy; shared mechanics do not branch on benchmark names.
+- `suite.rs` plans durable suites, pins one snapshot per canonical module, and
+  executes supported retrieval/generation modes serially through module contracts.
+  The same server run slot covers the entire suite.
+
 - `init.rs` remains unchanged and reserved for the user's initialization work.
   No first-run setup wizard or benchmark CRUD mechanism is implemented. A named
   module's `initialize()` prepares a snapshot; it does not initialize the dashboard.
@@ -67,8 +77,10 @@ run modes reject requests by default; YAML alone does not implement a benchmark.
 
 `MetricValues` is a map from metric names to numeric values, so evaluators can
 declare different result metrics without extending a shared fixed score struct.
-Metric meaning and denominators remain evaluator-owned. This backend contract
-does not automatically teach the frontend how to present a new evaluator.
+Metric meaning and denominators remain evaluator-owned. The main dashboard
+builds its columns from the result table's `metric.*` and `review.*` fields.
+Detailed evidence/review interfaces still need appropriate support when a new
+evaluator introduces a different case or review format.
 
 This reorganization preserves the existing HTTP API, YAML definitions, saved
 snapshot/run formats, and snapshot fingerprint calculation. `Case` deliberately
@@ -231,7 +243,8 @@ batch must finish before the next batch starts. Each response is persisted as it
 arrives, with cases retained in benchmark order. Request failures are recorded
 per question and the remaining batches continue. A run that attempts all cases
 with some failures finishes with `status: failed`; the dashboard labels it
-“finished with errors.” Runtime/provenance changes and storage failures stop
+“Failed,” with processed and failed counts; its detailed inspector also labels
+fully attempted failed runs “finished with errors.” Runtime/provenance changes and storage failures stop
 scheduling new batches. Refusals and `evidence-only` responses are retained as
 separate outcomes. Saved `max_in_flight` records the batch limit; older runs
 default to one.
@@ -242,7 +255,7 @@ records Moonshot's upstream status/category, recognized error codes, request byt
 count, output-token limit, attempt and elapsed time. Provider free-text errors,
 prompts and credentials are excluded. The backend syncs each failure to
 `answer-runs/<run-id>/failures.jsonl`; the run JSON and CSV also retain the
-diagnostics. Open **Answers & review → Download failure log** for a JSONL export
+diagnostics. Open **Inspect → Answers & review → Download failure log** for a JSONL export
 of recorded case failures. Older runs remain readable but cannot recover
 provider details that were never saved. Nebula additionally emits structured
 provider failure events to its backend log.
@@ -302,7 +315,50 @@ The benchmark API requires no authentication and only accepts loopback bind
 addresses. `NEBULA_API_TOKEN` authenticates the runner's requests to Nebula and
 stays in backend configuration.
 
-Run in `apps/backend` using Rust 1.95 or newer:
+From the Genesis repository root, after initializing the submodule and installing
+workspace dependencies:
+
+```sh
+pnpm benchmark:ui       # Validate/build the backend, start it, and open the dashboard
+pnpm benchmark:build    # Validate/build the Rust backend without starting a server
+pnpm benchmark:backend  # Validate/build and run the backend without the dashboard
+```
+
+`pnpm start` also starts the benchmark backend through Genesis's generic
+`genesisDevelopment.backend` hook. This hook only runs for the internal development
+server; release builds do not load the module's backend script. The standalone UI
+uses the same module-owned lifecycle implementation in `scripts/backend.mjs`.
+
+The script checks `apps/backend/target/debug/backend` (`backend.exe` on Windows)
+for executable identity/version, a matching source/build-environment fingerprint,
+and a matching binary digest. A missing, stale, damaged, or unvalidated binary
+triggers `cargo build --locked --bin backend` with the module backend's manifest
+and target directory. The first build requires Rust 1.95 or newer, may download
+Cargo dependencies, and can take several minutes. Later starts reuse the validated
+build. Compilation or readiness failures are reported in the terminal.
+
+Managed UI startup uses `http://127.0.0.1:4319`. It reuses an existing healthy
+benchmark API; otherwise it starts a child process and waits for health/catalog
+responses. Closing the development server stops a child it started, while an
+already-running API remains externally owned. To manage the backend yourself,
+set `BENCHMARK_API_TARGET` to its loopback origin before starting the UI—even when
+using the default port. An explicit target disables automatic build/start/stop.
+For example:
+
+```sh
+export BENCHMARK_API_TARGET='http://127.0.0.1:4320'
+pnpm benchmark:ui
+```
+
+`pnpm benchmark:backend` uses `BENCHMARK_ADDR` (default `127.0.0.1:4319`). Managed
+processes run with `apps/backend` as their working directory, so the defaults are
+`apps/backend/benchmark-data` for data and `apps/backend/benchmarks.yaml` for the
+catalog. Set an absolute `BENCHMARK_DATA_DIR` to isolate an experiment. The process
+inherits backend-only Nebula settings; automatic startup does not launch Nebula,
+load datasets, or prepare an index. Restart the managed server after changing its
+configuration or Rust sources.
+
+You can also run directly in `apps/backend` using Rust 1.95 or newer:
 
 ```sh
 export BENCHMARK_DATA_DIR='/absolute/path/to/experiment-data'
@@ -314,9 +370,8 @@ cargo run --locked
 The server prints `BENCHMARK_BACKEND_PORT=<port>`; port 0 selects an available
 port.
 There is no permissive browser CORS configuration; the internal dashboard uses a
-server-side development proxy. When running `pnpm benchmark:ui`, optionally set
-`BENCHMARK_API_TARGET` to the backend origin when it differs from
-`http://127.0.0.1:4319`. Only one server may own a data directory.
+server-side development proxy. An explicit `BENCHMARK_API_TARGET` connects the
+UI to a separately managed backend. Only one server may own a data directory.
 
 Load a named benchmark using its YAML defaults:
 
@@ -343,7 +398,9 @@ and copy the exported Markdown passages from both snapshots into a dedicated
 combined corpus. Preserve filenames and bytes, keep the snapshots immutable, and
 point Nebula at the combined directory. Each runner selects only its benchmark's
 sources; HotpotQA further selects each question's supplied candidates.
-Then restart this benchmark server with:
+Then restart this benchmark server with the following environment (the command
+below runs in `apps/backend`; use `pnpm benchmark:backend` from the repository
+root for the managed equivalent):
 
 ```sh
 export NEBULA_API_BASE='http://127.0.0.1:NEBULA_PORT/api/nebula/v1'
@@ -381,27 +438,80 @@ selections fail explicitly before querying; use a smaller load `limit` until
 Nebula supports larger selections. HotpotQA validates each question's smaller
 candidate selection separately.
 
+## Run every benchmark
+
+The dashboard's **Run all benchmarks** action sends one request to
+`POST /api/benchmarks/v1/suite-runs`. The selected sidebar benchmark only affects
+which results you view; it does not restrict the suite. For example:
+
+```sh
+curl -sS http://127.0.0.1:4319/api/benchmarks/v1/suite-runs \
+  -H 'Content-Type: application/json' \
+  -d '{"architecture_label":"Dense retrieval v2","description":"New chunking; same corpus","profile_id":"PROFILE-FROM-ANSWER-RUNTIME"}'
+```
+
+`architecture_label` is required and must contain 1–256 UTF-8 bytes without
+surrounding whitespace. Optional `description` defaults to an empty string and
+allows at most 4000 UTF-8 bytes. Omit `profile_id` to skip generation; otherwise use
+an enabled profile reported by `/answer-runtime`. Optional `top_k` accepts 1–100
+and overrides retrieval settings only. Without it, retrieval uses the pinned
+snapshot's saved default. Generation retains its evaluator's fixed settings.
+The dashboard exposes the architecture label, notes, and runtime profile; top-k
+can be supplied through the API.
+
+Planning chooses the most recently saved snapshot per canonical benchmark module
+(save time, then UUID for ties) and pins its ID before accepting the suite. YAML
+aliases for one module do not create duplicate executions. Prepared snapshots
+remain eligible even if their catalog entry was removed. RAGTruth runs retrieval
+and, when a profile is supplied, generation; HotpotQA runs generation. Unsupported
+modules and missing snapshots are recorded as `skipped`, as is generation without
+a profile or with an unavailable runtime. A setup or worker failure is recorded
+for its item while later items are still attempted, unless persistence itself
+fails. The server holds its one active-run slot across the whole suite; competing
+suite or individual-run requests receive HTTP 409.
+
+HTTP 202 returns a `SuiteRun` with `id`, global `run_number`, the accepted
+`request`, `status`, `started_at_ms`, nullable `finished_at_ms`/`error`, and `items`.
+Each item contains its canonical `benchmark` key, nullable `benchmark_id`,
+`mode` (`retrieval`, `generation`, or null), `status`, nullable child `run_id`, and
+nullable `reason`. Item states are `queued`, `running`, `completed`, `failed`,
+`interrupted`, and `skipped`. Poll `/suite-runs/{id}` for one suite or `/suite-runs`
+for history. A suite fails if an item fails/is interrupted or if every item was
+skipped; a completed suite can still contain skipped items, so inspect its coverage.
+
+Each created execution keeps its own globally unique `run_number` and UUID.
+Comparison rows also include `suite_id` and `suite_run_number`; the dashboard
+shows the shared suite number prominently and the execution number underneath.
+Standalone `/runs` and `/answer-runs` requests remain supported and have no suite
+association. Skipped or pre-execution failures may have no child row; their outcome
+and reason remain in suite history.
+
 ## HTTP interface
 
 All paths have prefix `/api/benchmarks/v1`.
 
-| Method | Path                                       | Result                                                        |
-| ------ | ------------------------------------------ | ------------------------------------------------------------- |
-| GET    | `/health`                                  | Server liveness                                               |
-| GET    | `/catalog`                                 | Configured benchmark names, definitions and defaults          |
-| POST   | `/benchmarks`                              | Load/snapshot dataset and export corpus; HTTP 201             |
-| GET    | `/benchmarks`                              | Dataset summaries and corpus paths                            |
-| GET    | `/benchmarks/{id}`                         | Full saved cases, contexts, and historical annotations        |
-| POST   | `/runs`                                    | Start retrieval run; HTTP 202                                 |
-| GET    | `/runs`                                    | Saved run summaries, including progress                       |
-| GET    | `/runs/{id}`                               | Run status, settings, source IDs, watermark, means, error     |
-| GET    | `/runs/{id}/scores.csv`                    | Download completed/partial CSV after run stops                |
-| GET    | `/answer-runtime`                          | Actual embedding identity and generation profile availability |
-| POST   | `/answer-runs`                             | Start generated-answer run; HTTP 202                          |
-| GET    | `/answer-runs`                             | Saved answer-run summaries and review coverage                |
-| GET    | `/answer-runs/{id}`                        | Summary plus per-case answers, evidence, outcomes and reviews |
-| POST   | `/answer-runs/{id}/cases/{case_id}/review` | Save human judgments after run stops                          |
-| GET    | `/answer-runs/{id}/scores.csv`             | Download answers and current human reviews after run stops    |
+| Method | Path                                       | Result                                                          |
+| ------ | ------------------------------------------ | --------------------------------------------------------------- |
+| GET    | `/health`                                  | Server liveness                                                 |
+| GET    | `/catalog`                                 | Configured benchmark names, definitions and defaults            |
+| POST   | `/benchmarks`                              | Load/snapshot dataset and export corpus; HTTP 201               |
+| GET    | `/benchmarks`                              | Dataset summaries and corpus paths                              |
+| GET    | `/benchmarks/{id}`                         | Full saved cases, contexts, and historical annotations          |
+| GET    | `/results`                                 | Per-benchmark comparison tables, columns and string-valued rows |
+| GET    | `/results/{benchmark}/scores.csv`          | Download a canonical module's comparison table in both modes    |
+| POST   | `/suite-runs`                              | Start one suite across prepared benchmark modules; HTTP 202     |
+| GET    | `/suite-runs`                              | Saved suite history, including skipped and failed items         |
+| GET    | `/suite-runs/{id}`                         | One suite's request, status and execution associations          |
+| POST   | `/runs`                                    | Start retrieval run; HTTP 202                                   |
+| GET    | `/runs`                                    | Saved run summaries, including progress                         |
+| GET    | `/runs/{id}`                               | Run status, settings, source IDs, watermark, means, error       |
+| GET    | `/runs/{id}/scores.csv`                    | Download completed/partial CSV after run stops                  |
+| GET    | `/answer-runtime`                          | Actual embedding identity and generation profile availability   |
+| POST   | `/answer-runs`                             | Start generated-answer run; HTTP 202                            |
+| GET    | `/answer-runs`                             | Saved answer-run summaries and review coverage                  |
+| GET    | `/answer-runs/{id}`                        | Summary plus per-case answers, evidence, outcomes and reviews   |
+| POST   | `/answer-runs/{id}/cases/{case_id}/review` | Save human judgments after run stops                            |
+| GET    | `/answer-runs/{id}/scores.csv`             | Download answers and current human reviews after run stops      |
 
 Run states are `running`, `completed`, `failed`, and `interrupted`. Startup marks
 unfinished runs interrupted rather than silently resuming against a new index.
@@ -413,8 +523,9 @@ Nebula protocol objects preserved in summaries retain their original camelCase.
 ## Result storage
 
 All artifacts live under `BENCHMARK_DATA_DIR`. Benchmark comparison tables have
-one row per execution, updated as progress or human reviews are saved. Repeating
-an architecture creates another row with a new run number.
+one row per created execution, updated as progress or human reviews are saved.
+Repeating a suite creates new execution rows associated with a new suite
+number. Outcomes without a child execution remain in the suite registry.
 
 ```text
 experiment-data/
@@ -439,15 +550,21 @@ The CSV filename uses the registered benchmark module key, such as
 share its table; the `mode` and `evaluation` columns identify how each row was
 measured. Columns include `run_number`, `run_id`, `architecture_name`, status,
 snapshot ID/fingerprint, top-k, completion counts, timestamps, and available
-model identities. Retrieval and automatic answer scores use `metric.<name>`
+model identities, description, and optional suite ID/number.
+`GET /results` returns `{ "benchmarks": [{ "benchmark": "module-key", "columns": [],
+"rows": [] }] }`; each row maps column names to strings, with empty strings for
+unavailable values. Retrieval and automatic answer scores use `metric.<name>`
 columns; human review scores use `review.<name>`. Each table contains the union
 of metrics recorded by its runs. Unavailable metrics stay blank rather than
 becoming zero. Check evaluation, snapshot fingerprint and settings before
 comparing scores; failed or partial runs remain visible.
 
-`results/runs.json` assigns run numbers starting at 1 across all benchmarks and
-both run modes in this data directory. It maps each number to the detailed run
-UUID, benchmark, mode, architecture name, and description:
+`results/runs.json` assigns run numbers starting at 1 from one sequence shared by
+suites and individual executions across all benchmarks and both run modes. Its
+`runs` map holds execution references, and `suite_runs` holds full suite records
+including the pinned plan and child associations. A registry containing only a
+legacy standalone execution can look like this (an empty `suite_runs` field may
+be omitted):
 
 ```json
 {
@@ -460,18 +577,28 @@ UUID, benchmark, mode, architecture name, and description:
       "architecture_name": "baseline",
       "description": "Original indexing configuration"
     }
-  }
+  },
+  "suite_runs": {}
 }
 ```
 
+A subsequent suite reserves number 2 in `suite_runs`; its first child reserves
+number 3 in `runs`. That child's comparison row has `run_number: "3"` and
+`suite_run_number: "2"`. Further children receive their own numbers while sharing
+suite number 2. Older registries without `suite_runs` remain readable.
+
 The registry owns run numbers and descriptions. To amend notes, stop the backend
-and edit the relevant `description` in `results/runs.json`; it is preserved when
-the backend restarts. Keep the registry with the detailed run artifacts: deleting
+and edit `runs[execution_number].description` or
+`suite_runs[suite_number].request.description` in `results/runs.json`. These are
+separate notes; edits are preserved when the backend restarts. Keep the registry with the detailed run artifacts: deleting
 it loses the assigned numbering and edited descriptions. The comparison CSVs
 are derived files and are rebuilt from saved runs and the registry at startup.
 On the first startup with older runs, unregistered runs receive numbers in start
 time order, with UUID as the tie-breaker. Existing registered numbers are retained.
 Unfinished runs become `interrupted`, and the rebuilt tables reflect that status.
+Running suites also become `interrupted`: completed children are retained, active
+children are reconciled with their saved runs, and queued items that never started
+are marked interrupted. Startup never automatically reruns a suite or child.
 
 The per-run files retain detailed evidence. Retrieval `scores.csv` includes
 run/case/source identifiers, query, top-k, status, latency, individual metrics,
@@ -485,8 +612,7 @@ preserve other cases' reviews.
 JSON files and benchmark comparison CSVs are each replaced atomically. Updates
 across the detailed run, registry, and comparison CSV are not one transaction;
 startup rebuilds comparison tables from the saved artifacts after an interruption.
-There is no database dependency. This storage change adds no frontend controls
-or first-run initialization behavior.
+There is no database dependency or first-run initialization wizard.
 
 ## Verification
 
@@ -499,7 +625,9 @@ cargo clippy --locked --all-targets -- -D warnings
 
 Tests use real local Parquet and HTTP with a scripted Nebula peer, checking
 deduplication, CSV quoting, source selection, known ranks, index drift, failures,
-token-free startup, loopback binding, persistence, and interrupted-run recovery. The optional live
+token-free startup, loopback binding, persistence, interrupted-run recovery, suite
+planning/execution, and shared numbering. Frontend and build-script checks are
+documented in [`apps/frontend/README.md`](apps/frontend/README.md#verify). The optional live
 Hugging Face smoke test requires network access:
 
 ```sh

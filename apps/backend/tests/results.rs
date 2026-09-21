@@ -32,6 +32,9 @@ const SHARED_COLUMNS: &[&str] = &[
     "finished_at_ms",
     "embedding_model",
     "generation_model",
+    "description",
+    "suite_id",
+    "suite_run_number",
 ];
 
 fn benchmark(metric: &str) -> Benchmark {

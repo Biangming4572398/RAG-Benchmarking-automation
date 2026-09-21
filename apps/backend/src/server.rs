@@ -50,6 +50,16 @@ pub fn router(store: Arc<Store>, nebula: Option<NebulaConfig>, catalog: Catalog)
         )
         .route("/api/benchmarks/v1/benchmarks/{id}", get(benchmark))
         .route("/api/benchmarks/v1/catalog", get(get_catalog))
+        .route("/api/benchmarks/v1/results", get(result_tables))
+        .route(
+            "/api/benchmarks/v1/results/{benchmark}/scores.csv",
+            get(result_csv),
+        )
+        .route(
+            "/api/benchmarks/v1/suite-runs",
+            get(list_suites).post(start_suite),
+        )
+        .route("/api/benchmarks/v1/suite-runs/{id}", get(suite))
         .route("/api/benchmarks/v1/runs", get(list_runs).post(start_run))
         .route("/api/benchmarks/v1/runs/{id}", get(run))
         .route("/api/benchmarks/v1/runs/{id}/scores.csv", get(scores))
@@ -89,7 +99,17 @@ async fn list_benchmarks(State(state): State<Arc<AppState>>) -> ApiResult<impl I
 }
 
 async fn get_catalog(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    Json(state.catalog.clone())
+    let module_keys: std::collections::BTreeMap<_, _> = state
+        .catalog
+        .benchmarks
+        .iter()
+        .filter_map(|(key, definition)| {
+            crate::module_for_definition(Some(key), definition)
+                .ok()
+                .map(|module| (key, module.key()))
+        })
+        .collect();
+    Json(json!({ "benchmarks": state.catalog.benchmarks, "module_keys": module_keys }))
 }
 
 async fn load(
@@ -132,6 +152,98 @@ async fn benchmark(
     Ok(Json(state.store.benchmark(id).map_err(|_| {
         ApiError(StatusCode::NOT_FOUND, "Benchmark not found".into())
     })?))
+}
+
+async fn result_tables(State(state): State<Arc<AppState>>) -> ApiResult<impl IntoResponse> {
+    Ok(Json(state.store.result_tables()?))
+}
+
+async fn result_csv(
+    State(state): State<Arc<AppState>>,
+    Path(benchmark): Path<String>,
+) -> ApiResult<impl IntoResponse> {
+    let bytes = state.store.result_csv(&benchmark).map_err(|_| {
+        ApiError(
+            StatusCode::NOT_FOUND,
+            "Benchmark result table not found".into(),
+        )
+    })?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "text/csv; charset=utf-8".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{benchmark}.csv\""),
+            ),
+        ],
+        bytes,
+    ))
+}
+
+async fn list_suites(State(state): State<Arc<AppState>>) -> ApiResult<impl IntoResponse> {
+    Ok(Json(state.store.suites()?))
+}
+
+async fn suite(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<impl IntoResponse> {
+    Ok(Json(state.store.suite(id).map_err(|_| {
+        ApiError(StatusCode::NOT_FOUND, "Suite run not found".into())
+    })?))
+}
+
+async fn start_suite(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<crate::suite::StartSuiteRequest>,
+) -> ApiResult<impl IntoResponse> {
+    request
+        .validate()
+        .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))?;
+    let config = state.nebula.clone().ok_or_else(|| {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Configure a Nebula backend before starting benchmark runs".into(),
+        )
+    })?;
+    let permit = state.run_slot.clone().try_acquire_owned().map_err(|_| {
+        ApiError(
+            StatusCode::CONFLICT,
+            "A benchmark run is already active".into(),
+        )
+    })?;
+    let mut suite = crate::suite::plan(&state.store, &state.catalog, request)?;
+    state.store.create_suite(&mut suite)?;
+    let accepted = suite.clone();
+    tokio::spawn(async move {
+        let _permit = permit;
+        let id = suite.id;
+        let worker_store = state.store.clone();
+        let outcome = tokio::spawn(crate::suite::execute(worker_store, config, suite)).await;
+        let error = match outcome {
+            Ok(Ok(())) => return,
+            Ok(Err(error)) => error.to_string(),
+            Err(_) => "Suite worker stopped unexpectedly".into(),
+        };
+        if let Ok(mut failed) = state.store.suite(id) {
+            failed.status = RunStatus::Failed;
+            failed.error = Some(error.clone());
+            failed.finished_at_ms = Some(crate::now_ms());
+            for item in &mut failed.items {
+                if matches!(
+                    item.status,
+                    crate::suite::SuiteItemStatus::Queued | crate::suite::SuiteItemStatus::Running
+                ) {
+                    item.status = crate::suite::SuiteItemStatus::Failed;
+                    item.reason = Some(error.clone());
+                }
+            }
+            if let Err(error) = state.store.save_suite(&failed) {
+                eprintln!("Cannot persist failed suite {id}: {error}");
+            }
+        }
+    });
+    Ok((StatusCode::ACCEPTED, Json(accepted)))
 }
 
 async fn list_runs(State(state): State<Arc<AppState>>) -> ApiResult<impl IntoResponse> {
@@ -356,8 +468,10 @@ mod persistence {
 
     use crate::{
         AnswerCase, AnswerReviewRequest, AnswerRun, AnswerRunSummary, Benchmark, BenchmarkModule,
-        Error, MetricValues, Result, ReviewFailure, Run, RunStatus, config::ResolvedBenchmark,
+        Error, MetricValues, Result, ReviewFailure, Run, RunStatus,
+        config::ResolvedBenchmark,
         digest, module_for_answer_run, module_for_snapshot,
+        suite::{SuiteItemStatus, SuiteMode, SuiteRun},
     };
 
     pub struct Store {
@@ -377,6 +491,8 @@ mod persistence {
         pub source: String,
         pub split: String,
         pub metric_kind: String,
+        #[serde(default)]
+        pub module_key: Option<String>,
         pub case_count: usize,
         pub document_count: usize,
         pub corpus_path: PathBuf,
@@ -458,6 +574,40 @@ mod persistence {
             for row in rows {
                 results.upsert(row)?;
             }
+            // Reconcile queued and active suites after child executions have been recovered.
+            for suite in results.registry.suite_runs.values_mut() {
+                if suite.status == RunStatus::Running {
+                    for item in &mut suite.items {
+                        if matches!(
+                            item.status,
+                            SuiteItemStatus::Queued | SuiteItemStatus::Running
+                        ) {
+                            let child = item.run_id.and_then(|id| match item.mode {
+                                Some(SuiteMode::Retrieval) => {
+                                    store.run(id).ok().map(|run| (run.status, run.error))
+                                }
+                                Some(SuiteMode::Generation) => store
+                                    .answer_run(id)
+                                    .ok()
+                                    .map(|run| (run.summary.status, run.summary.error)),
+                                None => None,
+                            });
+                            let (status, reason) = child.unwrap_or((
+                                RunStatus::Interrupted,
+                                Some("Server stopped before this execution began".into()),
+                            ));
+                            item.status = status.into();
+                            item.reason = reason;
+                        }
+                    }
+                    suite.status = RunStatus::Interrupted;
+                    suite.finished_at_ms = Some(crate::now_ms());
+                    suite.error = Some(
+                        "Server stopped before the suite completed; saved results are retained"
+                            .into(),
+                    );
+                }
+            }
             results.save_all(&store.root.join("results"))?;
             drop(results);
             Ok(store)
@@ -484,6 +634,9 @@ mod persistence {
             let benchmark = self.benchmark(id)?;
             Ok(BenchmarkInfo {
                 id,
+                module_key: module_for_snapshot(&benchmark)
+                    .ok()
+                    .map(|module| module.key().to_owned()),
                 fingerprint: digest(&serde_json::to_vec(&(
                     &benchmark.metric_kind,
                     &benchmark.cases,
@@ -504,6 +657,118 @@ mod persistence {
                 .into_iter()
                 .map(|id| self.benchmark_info(id))
                 .collect()
+        }
+
+        /// Oldest first; filesystem save time also supports snapshots written before this API.
+        pub fn benchmarks_by_saved_time(&self) -> Result<Vec<Benchmark>> {
+            let mut snapshots = Vec::new();
+            for id in ids_in(&self.root.join("benchmarks"))? {
+                let saved =
+                    fs::metadata(self.benchmark_path(id).join("benchmark.json"))?.modified()?;
+                snapshots.push((saved, id, self.benchmark(id)?));
+            }
+            snapshots.sort_by_key(|(saved, id, _)| (*saved, *id));
+            Ok(snapshots
+                .into_iter()
+                .map(|(_, _, benchmark)| benchmark)
+                .collect())
+        }
+
+        pub fn create_suite(&self, suite: &mut SuiteRun) -> Result<()> {
+            let mut results = self
+                .results
+                .lock()
+                .map_err(|_| Error("Result tables are unavailable".into()))?;
+            if suite.run_number != 0
+                || results
+                    .registry
+                    .suite_runs
+                    .values()
+                    .any(|existing| existing.id == suite.id)
+            {
+                return Err(Error("Suite already exists".into()));
+            }
+            let number = results.registry.next_run_number;
+            results.registry.next_run_number = number
+                .checked_add(1)
+                .ok_or_else(|| Error("Run numbers are exhausted".into()))?;
+            suite.run_number = number;
+            results.registry.suite_runs.insert(number, suite.clone());
+            atomic_json(&self.root.join("results/runs.json"), &results.registry)
+        }
+
+        pub fn save_suite(&self, suite: &SuiteRun) -> Result<()> {
+            let mut results = self
+                .results
+                .lock()
+                .map_err(|_| Error("Result tables are unavailable".into()))?;
+            let existing = results
+                .registry
+                .suite_runs
+                .get_mut(&suite.run_number)
+                .filter(|existing| existing.id == suite.id)
+                .ok_or_else(|| Error("Suite has not been created".into()))?;
+            let mut saved = suite.clone();
+            saved
+                .request
+                .description
+                .clone_from(&existing.request.description);
+            *existing = saved;
+            atomic_json(&self.root.join("results/runs.json"), &results.registry)
+        }
+
+        pub fn suites(&self) -> Result<Vec<SuiteRun>> {
+            let results = self
+                .results
+                .lock()
+                .map_err(|_| Error("Result tables are unavailable".into()))?;
+            Ok(results
+                .registry
+                .suite_runs
+                .values()
+                .rev()
+                .cloned()
+                .collect())
+        }
+
+        pub fn suite(&self, id: Uuid) -> Result<SuiteRun> {
+            self.suites()?
+                .into_iter()
+                .find(|suite| suite.id == id)
+                .ok_or_else(|| Error("Suite not found".into()))
+        }
+
+        pub fn result_tables(&self) -> Result<ComparisonResults> {
+            let results = self
+                .results
+                .lock()
+                .map_err(|_| Error("Result tables are unavailable".into()))?;
+            let keys: BTreeSet<_> = results
+                .registry
+                .runs
+                .values()
+                .map(|reference| reference.benchmark.as_str())
+                .collect();
+            Ok(ComparisonResults {
+                benchmarks: keys.into_iter().map(|key| results.table(key)).collect(),
+            })
+        }
+
+        pub fn result_csv(&self, benchmark: &str) -> Result<Vec<u8>> {
+            validate_result_name(benchmark)?;
+            let results = self
+                .results
+                .lock()
+                .map_err(|_| Error("Result tables are unavailable".into()))?;
+            if !results
+                .registry
+                .runs
+                .values()
+                .any(|reference| reference.benchmark == benchmark)
+            {
+                return Err(Error("Benchmark result table not found".into()));
+            }
+            results.table(benchmark).csv()
         }
 
         pub fn create_run(&self, run: &Run) -> Result<()> {
@@ -785,6 +1050,12 @@ mod persistence {
         next_run_number: u64,
         #[serde(deserialize_with = "unique_run_numbers")]
         runs: BTreeMap<u64, RunReference>,
+        #[serde(
+            default,
+            skip_serializing_if = "BTreeMap::is_empty",
+            deserialize_with = "unique_suite_numbers"
+        )]
+        suite_runs: BTreeMap<u64, SuiteRun>,
     }
 
     fn unique_run_numbers<'de, D: serde::Deserializer<'de>>(
@@ -815,6 +1086,61 @@ mod persistence {
             }
         }
         deserializer.deserialize_map(References)
+    }
+
+    fn unique_suite_numbers<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<BTreeMap<u64, SuiteRun>, D::Error> {
+        struct Suites;
+        impl<'de> serde::de::Visitor<'de> for Suites {
+            type Value = BTreeMap<u64, SuiteRun>;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a map of unique suite run numbers")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut suites = BTreeMap::new();
+                while let Some((key, value)) = map.next_entry::<String, SuiteRun>()? {
+                    let number = key.parse::<u64>().map_err(serde::de::Error::custom)?;
+                    if suites.insert(number, value).is_some() {
+                        return Err(serde::de::Error::custom(
+                            "Duplicate suite number in results/runs.json",
+                        ));
+                    }
+                }
+                Ok(suites)
+            }
+        }
+        deserializer.deserialize_map(Suites)
+    }
+
+    #[derive(Serialize)]
+    pub struct ComparisonResults {
+        pub benchmarks: Vec<ComparisonTable>,
+    }
+
+    #[derive(Serialize)]
+    pub struct ComparisonTable {
+        pub benchmark: String,
+        pub columns: Vec<String>,
+        pub rows: Vec<BTreeMap<String, String>>,
+    }
+
+    impl ComparisonTable {
+        fn csv(&self) -> Result<Vec<u8>> {
+            let mut csv = csv::Writer::from_writer(Vec::new());
+            csv.write_record(&self.columns)?;
+            for row in &self.rows {
+                csv.write_record(
+                    self.columns
+                        .iter()
+                        .map(|column| row.get(column).map(String::as_str).unwrap_or("")),
+                )?;
+            }
+            csv.into_inner().map_err(|error| Error(error.to_string()))
+        }
     }
 
     // CSVs are rebuildable projections. The registry owns human run numbers/descriptions;
@@ -850,6 +1176,9 @@ mod persistence {
         "finished_at_ms",
         "embedding_model",
         "generation_model",
+        "description",
+        "suite_id",
+        "suite_run_number",
     ];
 
     impl ResultRow {
@@ -956,6 +1285,7 @@ mod persistence {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => RunRegistry {
                     next_run_number: 1,
                     runs: BTreeMap::new(),
+                    suite_runs: BTreeMap::new(),
                 },
                 Err(error) => return Err(error.into()),
             };
@@ -969,6 +1299,49 @@ mod persistence {
                     return Err(Error(
                         "Invalid or duplicate run number/ID in results/runs.json".into(),
                     ));
+                }
+            }
+            let mut suite_children = BTreeSet::new();
+            for (number, suite) in &registry.suite_runs {
+                if *number == 0
+                    || *number >= registry.next_run_number
+                    || *number != suite.run_number
+                    || registry.runs.contains_key(number)
+                    || !ids.insert(suite.id)
+                {
+                    return Err(Error(
+                        "Invalid or duplicate suite number/ID in results/runs.json".into(),
+                    ));
+                }
+                suite.request.validate()?;
+                for item in &suite.items {
+                    validate_result_name(&item.benchmark)?;
+                    if let Some(id) = item.run_id {
+                        if !suite_children.insert(id)
+                            || item.mode.is_none()
+                            || item.benchmark_id.is_none()
+                        {
+                            return Err(Error(
+                                "Invalid or duplicate suite execution in results/runs.json".into(),
+                            ));
+                        }
+                        if let Some(reference) = registry
+                            .runs
+                            .values()
+                            .find(|reference| reference.run_id == id)
+                        {
+                            let mode = match item.mode {
+                                Some(SuiteMode::Retrieval) => RunMode::Retrieval,
+                                _ => RunMode::Generation,
+                            };
+                            if reference.benchmark != item.benchmark || reference.mode != mode {
+                                return Err(Error(
+                                    "Suite execution identity does not match results/runs.json"
+                                        .into(),
+                                ));
+                            }
+                        }
+                    }
                 }
             }
             if registry.next_run_number == 0 {
@@ -1054,38 +1427,60 @@ mod persistence {
             Ok(())
         }
 
-        fn save_csv(&self, root: &Path, benchmark: &str) -> Result<()> {
+        fn table(&self, benchmark: &str) -> ComparisonTable {
             let rows: Vec<_> = self
                 .registry
                 .runs
                 .iter()
                 .filter(|(_, reference)| reference.benchmark == benchmark)
                 .filter_map(|(number, reference)| {
-                    self.rows.get(&reference.run_id).map(|row| (number, row))
+                    self.rows.get(&reference.run_id).map(|row| {
+                        let mut values = row.values.clone();
+                        values.insert("run_number".into(), number.to_string());
+                        values.insert("description".into(), reference.description.clone());
+                        if let Some(suite) = self.registry.suite_runs.values().find(|suite| {
+                            suite
+                                .items
+                                .iter()
+                                .any(|item| item.run_id == Some(reference.run_id))
+                        }) {
+                            values.insert("suite_id".into(), suite.id.to_string());
+                            values.insert("suite_run_number".into(), suite.run_number.to_string());
+                        }
+                        values
+                    })
                 })
                 .collect();
             let metrics: BTreeSet<_> = rows
                 .iter()
-                .flat_map(|(_, row)| row.values.keys())
+                .flat_map(|row| row.keys())
                 .filter(|name| name.starts_with("metric.") || name.starts_with("review."))
-                .map(String::as_str)
+                .cloned()
                 .collect();
-            let columns: Vec<_> = RESULT_COLUMNS.iter().copied().chain(metrics).collect();
-            let mut file = tempfile::NamedTempFile::new_in(root)?;
-            {
-                let mut csv = csv::Writer::from_writer(&mut file);
-                csv.write_record(&columns)?;
-                for (number, row) in rows {
-                    csv.write_record(columns.iter().map(|column| {
-                        if *column == "run_number" {
-                            number.to_string()
-                        } else {
-                            row.values.get(*column).cloned().unwrap_or_default()
-                        }
-                    }))?;
-                }
-                csv.flush()?;
+            let columns: Vec<_> = RESULT_COLUMNS
+                .iter()
+                .map(|column| (*column).to_string())
+                .chain(metrics)
+                .collect();
+            let rows = rows
+                .into_iter()
+                .map(|mut row| {
+                    for column in &columns {
+                        row.entry(column.clone()).or_default();
+                    }
+                    row
+                })
+                .collect();
+            ComparisonTable {
+                benchmark: benchmark.into(),
+                columns,
+                rows,
             }
+        }
+
+        fn save_csv(&self, root: &Path, benchmark: &str) -> Result<()> {
+            let mut file = tempfile::NamedTempFile::new_in(root)?;
+            file.write_all(&self.table(benchmark).csv()?)?;
             file.as_file().sync_all()?;
             file.persist(root.join(format!("{benchmark}.csv")))
                 .map_err(|error| Error(error.error.to_string()))?;

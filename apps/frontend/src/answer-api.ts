@@ -20,6 +20,7 @@ export interface AnswerRuntime {
 }
 
 export interface StartAnswerRunRequest {
+  description?: string;
   benchmark_id: string;
   architecture_label: string;
   profile_id: string;

@@ -9,6 +9,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "backend:build": "node scripts/backend.mjs build",
+    "backend:start": "node scripts/backend.mjs start",
     "typecheck": "tsc --noEmit",
     "test": "vitest run"
   },
@@ -32,6 +34,7 @@
     "vitest": "^2.1.9"
   },
   "genesisDevelopment": {
+    "backend": "./scripts/backend.mjs",
     "proxy": {
       "path": "/api/benchmarks/v1",
       "targetEnv": "BENCHMARK_API_TARGET",

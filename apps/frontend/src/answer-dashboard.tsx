@@ -27,6 +27,7 @@ interface Props {
   initialState?: unknown;
   onStateChange?: (state: unknown) => void;
   pollInterval?: number;
+  inspectionOnly?: boolean;
 }
 const EMPTY: {
   runs: AnswerRunSummary[];
@@ -79,6 +80,7 @@ export function AnswerDashboard({
   initialState,
   onStateChange,
   pollInterval = 3000,
+  inspectionOnly = false,
 }: Props) {
   const [state, setState] = useState(() => restore(initialState));
   const [architecture, setArchitecture] = useState('');
@@ -248,8 +250,9 @@ export function AnswerDashboard({
       saveDownload(blob, `${run.id}-answers.csv`);
     });
   }
+  const Container = inspectionOnly ? 'div' : 'main';
   return (
-    <main className={styles.dashboard}>
+    <Container className={styles.dashboard}>
       <section className={styles.results} aria-label="Generated answer results">
         <header className={styles.resultsHeading}>
           <h1>Architecture &amp; model comparison</h1>
@@ -529,15 +532,17 @@ export function AnswerDashboard({
           </p>
         )}
       </section>
-      <BenchmarkCatalog
-        api={benchmarkApi}
-        snapshots={benchmarks}
-        pollInterval={pollInterval}
-        onOpenAnswers={(benchmarkId) => {
-          update({ benchmarkId });
-          runForm.current?.scrollIntoView?.({ block: 'start', behavior: 'smooth' });
-        }}
-      />
+      {!inspectionOnly && (
+        <BenchmarkCatalog
+          api={benchmarkApi}
+          snapshots={benchmarks}
+          pollInterval={pollInterval}
+          onOpenAnswers={(benchmarkId) => {
+            update({ benchmarkId });
+            runForm.current?.scrollIntoView?.({ block: 'start', behavior: 'smooth' });
+          }}
+        />
+      )}
       {workspace.error && (
         <p className={styles.error} role="alert">
           {workspace.error}
@@ -554,107 +559,111 @@ export function AnswerDashboard({
           {notice}
         </p>
       )}
-      <form
-        className={`${styles.panel} ${styles.setup}`}
-        aria-label="Start answer run"
-        ref={runForm}
-        onSubmit={start}
-      >
-        <div className={styles.panelHeading}>
-          <h2>Run an architecture + model pairing</h2>
-          <span>{evaluationLabel(selectedHotpot ? 'hotpotqa_answer_v1' : 'manual_review_v1')}</span>
-        </div>
-        {runtime && !runtime.available && (
-          <p className={styles.notice}>
-            {runtime.reason ??
-              'The configured Nebula runtime does not have an available generation model.'}
-          </p>
-        )}
-        <div className={styles.pairingFields}>
-          <label>
-            Benchmark snapshot
-            <select
-              value={selected?.id ?? ''}
-              disabled={!!pending || !benchmarks.length}
-              onChange={(event) => update({ benchmarkId: event.target.value })}
-            >
-              <option value="" disabled>
-                No prepared snapshots
-              </option>
-              {benchmarks.map((item) => (
-                <option key={item.id} value={item.id}>
-                  {name(item)} · {item.case_count} cases · {item.id.slice(0, 8)}
+      {!inspectionOnly && (
+        <form
+          className={`${styles.panel} ${styles.setup}`}
+          aria-label="Start answer run"
+          ref={runForm}
+          onSubmit={start}
+        >
+          <div className={styles.panelHeading}>
+            <h2>Run an architecture + model pairing</h2>
+            <span>
+              {evaluationLabel(selectedHotpot ? 'hotpotqa_answer_v1' : 'manual_review_v1')}
+            </span>
+          </div>
+          {runtime && !runtime.available && (
+            <p className={styles.notice}>
+              {runtime.reason ??
+                'The configured Nebula runtime does not have an available generation model.'}
+            </p>
+          )}
+          <div className={styles.pairingFields}>
+            <label>
+              Benchmark snapshot
+              <select
+                value={selected?.id ?? ''}
+                disabled={!!pending || !benchmarks.length}
+                onChange={(event) => update({ benchmarkId: event.target.value })}
+              >
+                <option value="" disabled>
+                  No prepared snapshots
                 </option>
-              ))}
-            </select>
-          </label>
-          <label>
-            Architecture label
-            <input
-              required
-              value={architecture}
-              onChange={(event) => setArchitecture(event.target.value)}
-              disabled={!!pending}
-              placeholder="e.g. Dense retrieval baseline"
-            />
-          </label>
-          <label>
-            Generation model
-            <select
-              value={profile?.id ?? ''}
-              disabled={!!pending || !profiles.length}
-              onChange={(event) => setProfileId(event.target.value)}
-            >
-              <option value="" disabled>
-                No enabled generation model
-              </option>
-              {profiles.map((item) => (
-                <option key={item.id} value={item.id}>
-                  {item.label}
+                {benchmarks.map((item) => (
+                  <option key={item.id} value={item.id}>
+                    {name(item)} · {item.case_count} cases · {item.id.slice(0, 8)}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              Architecture label
+              <input
+                required
+                value={architecture}
+                onChange={(event) => setArchitecture(event.target.value)}
+                disabled={!!pending}
+                placeholder="e.g. Dense retrieval baseline"
+              />
+            </label>
+            <label>
+              Generation model
+              <select
+                value={profile?.id ?? ''}
+                disabled={!!pending || !profiles.length}
+                onChange={(event) => setProfileId(event.target.value)}
+              >
+                <option value="" disabled>
+                  No enabled generation model
                 </option>
-              ))}
-            </select>
-          </label>
-        </div>
-        <div className={styles.panelHeading}>
-          <p className={styles.muted}>
-            Embedding: {runtime?.embedding_model?.id ?? 'Not available'}
-            <small>
-              {runtime?.embedding_model?.revision
-                ? `Revision ${runtime.embedding_model.revision}`
-                : ''}
-            </small>
-          </p>
-          <button
-            className={styles.primaryButton}
-            disabled={
-              !workspace.connected ||
-              !runtime?.available ||
-              !selected ||
-              !profile ||
-              active ||
-              !!pending
-            }
-          >
-            {pending === 'start' ? 'Starting…' : active ? 'Run in progress' : 'Generate answers'}
-          </button>
-        </div>
-        {selectedHotpot && (
-          <p className={styles.explanation}>
-            HotpotQA uses each question’s supplied candidate passages (typically ten). Reference
-            answers are kept out of retrieval and generation. EM/F1 score the full returned answer
-            without extracting a shorter answer. Nebula’s strict evidence quotations can therefore
-            score low against short references. These are subset scores, not an official leaderboard
-            result.
-          </p>
-        )}
-        <small>
-          Uses the configured Nebula model and retrieval settings (top k 8). Generation may use your
-          configured provider and incur its charges. Each question gets a fresh conversation.
-          Requests run in batches of up to four; the next batch waits for every response. Request
-          failures are recorded and the remaining questions continue.
-        </small>
-      </form>
+                {profiles.map((item) => (
+                  <option key={item.id} value={item.id}>
+                    {item.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+          <div className={styles.panelHeading}>
+            <p className={styles.muted}>
+              Embedding: {runtime?.embedding_model?.id ?? 'Not available'}
+              <small>
+                {runtime?.embedding_model?.revision
+                  ? `Revision ${runtime.embedding_model.revision}`
+                  : ''}
+              </small>
+            </p>
+            <button
+              className={styles.primaryButton}
+              disabled={
+                !workspace.connected ||
+                !runtime?.available ||
+                !selected ||
+                !profile ||
+                active ||
+                !!pending
+              }
+            >
+              {pending === 'start' ? 'Starting…' : active ? 'Run in progress' : 'Generate answers'}
+            </button>
+          </div>
+          {selectedHotpot && (
+            <p className={styles.explanation}>
+              HotpotQA uses each question’s supplied candidate passages (typically ten). Reference
+              answers are kept out of retrieval and generation. EM/F1 score the full returned answer
+              without extracting a shorter answer. Nebula’s strict evidence quotations can therefore
+              score low against short references. These are subset scores, not an official
+              leaderboard result.
+            </p>
+          )}
+          <small>
+            Uses the configured Nebula model and retrieval settings (top k 8). Generation may use
+            your configured provider and incur its charges. Each question gets a fresh conversation.
+            Requests run in batches of up to four; the next batch waits for every response. Request
+            failures are recorded and the remaining questions continue.
+          </small>
+        </form>
+      )}
       {detail && (
         <section className={styles.detail} ref={detailElement} aria-label="Answer run details">
           <div className={styles.panelHeading}>
@@ -858,7 +867,7 @@ export function AnswerDashboard({
         Benchmark definitions stay in YAML. HotpotQA uses reference-answer matching; RAGTruth’s
         historical annotations are not reused as scores for newly generated answers.
       </footer>
-    </main>
+    </Container>
   );
 }
 

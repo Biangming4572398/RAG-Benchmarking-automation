@@ -51,6 +51,10 @@ impl BenchmarkModule for Ragtruth {
         Some(&RAGTRUTH)
     }
 
+    fn supports_retrieval(&self) -> bool {
+        true
+    }
+
     fn prepare_retrieval(
         &self,
         request: RunRequest,

@@ -56,5 +56,11 @@ describe('standalone benchmark backend connection', () => {
     const config = (viteConfig as UserConfigFnObject)({ command: 'build', mode: 'production' });
 
     expect(config.server?.proxy).toBeUndefined();
+    expect(config.plugins).toEqual([]);
+  });
+
+  it('does not compile or launch the backend while Vitest initializes Vite', () => {
+    const config = (viteConfig as UserConfigFnObject)({ command: 'serve', mode: 'test' });
+    expect(config.plugins).toEqual([]);
   });
 });

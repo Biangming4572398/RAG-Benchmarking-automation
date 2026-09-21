@@ -6,6 +6,10 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::args().nth(1).as_deref() == Some("--version") {
+        println!("rag-benchmark-backend {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let config = Config::from_env()?;
     let catalog = Catalog::load(&config.catalog_path)?;
     let store = Arc::new(Store::open(&config.data_dir)?);
