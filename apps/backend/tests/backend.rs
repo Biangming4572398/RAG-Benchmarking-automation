@@ -207,7 +207,15 @@ fn run_descriptions_default_to_empty_and_accept_bounded_multiline_text() {
     assert!(request.description.is_empty());
     assert_eq!(serde_json::to_value(&request).unwrap(), legacy);
     let start: StartRunRequest = serde_json::from_value(legacy.clone()).unwrap();
-    assert!(start.resolve(&benchmark).description.is_empty());
+    let resolved = start.resolve(&benchmark);
+    assert!(resolved.description.is_empty());
+    assert_eq!(resolved.label, "Baseline");
+    let unlabelled = json!({"benchmark_id": benchmark.id, "top_k": 2});
+    let start: StartRunRequest = serde_json::from_value(unlabelled.clone()).unwrap();
+    assert_eq!(start.resolve(&benchmark).label, "baseline");
+    // Historical retrieval records keep their original empty-label default.
+    let stored: RunRequest = serde_json::from_value(unlabelled).unwrap();
+    assert!(stored.label.is_empty());
 
     let description = "Line one\nLine two, with \"quotes\".\n";
     let mut described = legacy;
@@ -220,6 +228,14 @@ fn run_descriptions_default_to_empty_and_accept_bounded_multiline_text() {
     request.description.push('x');
     let error = Run::new(request, &benchmark, "fp".into()).err().unwrap();
     assert!(error.to_string().contains("description"));
+
+    let answer: backend::StartAnswerRunRequest = serde_json::from_value(json!({
+        "benchmark_id": benchmark.id,
+        "profile_id": "kimi"
+    }))
+    .unwrap();
+    assert_eq!(answer.architecture_label, "baseline");
+    assert!(answer.validate().is_ok());
 
     let legacy_answer = json!({
         "benchmark_id": benchmark.id,
@@ -414,13 +430,14 @@ async fn api_loads_runs_scores_and_reopens_without_a_database() {
     assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
     let response = client
         .post(format!("{base}/runs"))
-        .json(&json!({"benchmark_id":loaded["id"], "label":"baseline"}))
+        .json(&json!({"benchmark_id":loaded["id"]}))
         .send()
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::ACCEPTED);
     let run: Value = response.json().await.unwrap();
     assert_eq!(run["request"]["top_k"], 2);
+    assert_eq!(run["request"]["label"], "baseline");
     let id = run["id"].as_str().unwrap();
     let result = wait_run(&client, &base, id).await;
     assert_eq!(result["status"], "completed", "{result}");

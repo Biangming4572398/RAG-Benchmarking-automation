@@ -161,6 +161,8 @@ describe('Live benchmarking dashboard', () => {
     );
     expect(api.getCatalog).toHaveBeenCalled();
     expect(api.loadBenchmark).not.toHaveBeenCalled();
+    expect(screen.getByLabelText('Architecture label')).toHaveValue('baseline');
+    await user.clear(screen.getByLabelText('Architecture label'));
     await user.type(screen.getByLabelText('Architecture label'), 'Hybrid retrieval');
     await user.click(screen.getByRole('button', { name: 'Start run' }));
     await waitFor(() =>
@@ -197,11 +199,10 @@ describe('Live benchmarking dashboard', () => {
     expect(snapshots).toHaveValue(benchmark.id);
     expect(within(snapshots).getByRole('option', { name: /RAGTruth QA/ })).toBeInTheDocument();
     expect(within(snapshots).queryByRole('option', { name: /HotpotQA/ })).not.toBeInTheDocument();
-    await user.type(screen.getByLabelText('Architecture label'), 'Retrieval baseline');
     await user.click(screen.getByRole('button', { name: 'Start run' }));
     await waitFor(() =>
       expect(api.startRun).toHaveBeenCalledWith(
-        { benchmark_id: benchmark.id, label: 'Retrieval baseline' },
+        { benchmark_id: benchmark.id, label: 'baseline' },
         expect.any(AbortSignal),
       ),
     );

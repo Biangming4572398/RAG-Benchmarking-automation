@@ -466,14 +466,22 @@ async fn exercise_api(fail_retrieval: bool) {
         .unwrap();
     assert_eq!(catalog["module_keys"]["ragtruth-qa"], "ragtruth-qa");
     assert_eq!(catalog["module_keys"].as_object().unwrap().len(), 8);
+    let mut body = serde_json::to_value(request()).unwrap();
+    let expected_label = if fail_retrieval {
+        "Suite architecture"
+    } else {
+        body.as_object_mut().unwrap().remove("architecture_label");
+        "baseline"
+    };
     let accepted = client
         .post(format!("{base}/suite-runs"))
-        .json(&request())
+        .json(&body)
         .send()
         .await
         .unwrap();
     assert_eq!(accepted.status(), StatusCode::ACCEPTED);
     let accepted: SuiteRun = accepted.json().await.unwrap();
+    assert_eq!(accepted.request.architecture_label, expected_label);
     tokio::time::timeout(Duration::from_secs(5), script.started.notified())
         .await
         .unwrap();
@@ -550,6 +558,7 @@ async fn exercise_api(fail_retrieval: bool) {
         for row in table["rows"].as_array().unwrap() {
             assert_eq!(row["suite_run_number"], accepted.run_number.to_string());
             assert_eq!(row["suite_id"], accepted.id.to_string());
+            assert_eq!(row["architecture_name"], expected_label);
             assert_ne!(row["run_number"], row["suite_run_number"]);
             if row["mode"] == "generation" && table["benchmark"] == "ragtruth-qa" {
                 assert_eq!(row["reviewed"], "0");

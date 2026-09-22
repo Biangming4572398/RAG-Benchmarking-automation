@@ -282,12 +282,16 @@ pub struct RunRequest {
     pub description: String,
 }
 
+fn default_architecture_label() -> String {
+    "baseline".to_owned()
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StartRunRequest {
     pub benchmark_id: Uuid,
     pub top_k: Option<usize>,
-    #[serde(default)]
+    #[serde(default = "crate::default_architecture_label")]
     pub label: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
@@ -364,6 +368,7 @@ pub struct AnswerRuntime {
 #[serde(deny_unknown_fields)]
 pub struct StartAnswerRunRequest {
     pub benchmark_id: Uuid,
+    #[serde(default = "crate::default_architecture_label")]
     pub architecture_label: String,
     pub profile_id: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]

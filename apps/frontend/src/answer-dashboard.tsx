@@ -83,7 +83,7 @@ export function AnswerDashboard({
   inspectionOnly = false,
 }: Props) {
   const [state, setState] = useState(() => restore(initialState));
-  const [architecture, setArchitecture] = useState('');
+  const [architecture, setArchitecture] = useState('baseline');
   const [profileId, setProfileId] = useState('');
   const [pending, setPending] = useState('');
   const [actionError, setActionError] = useState('');

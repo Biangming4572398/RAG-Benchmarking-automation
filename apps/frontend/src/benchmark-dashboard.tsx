@@ -111,7 +111,7 @@ export function BenchmarkDashboard({
   const [state, setState] = useState(() => restore(initialState));
   const [page, setPage] = useState(0);
   const [showRunForm, setShowRunForm] = useState(false);
-  const [architecture, setArchitecture] = useState('');
+  const [architecture, setArchitecture] = useState('baseline');
   const [description, setDescription] = useState('');
   const [profileId, setProfileId] = useState('');
   const [pending, setPending] = useState(false);

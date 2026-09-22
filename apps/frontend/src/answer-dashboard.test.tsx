@@ -328,6 +328,8 @@ describe('Generated answer dashboard', () => {
     await user.selectOptions(screen.getByLabelText('Benchmark snapshot'), hotpotBenchmark.id);
     expect(screen.getByText('HotpotQA EM/F1 v1')).toBeVisible();
     await user.selectOptions(screen.getByLabelText('Generation model'), 'generator-b');
+    expect(screen.getByLabelText('Architecture label')).toHaveValue('baseline');
+    await user.clear(screen.getByLabelText('Architecture label'));
     await user.type(screen.getByLabelText('Architecture label'), '  Hybrid candidate  ');
     await user.click(screen.getByRole('button', { name: 'Generate answers' }));
     await waitFor(() =>

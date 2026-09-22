@@ -11,6 +11,12 @@ Retrieval and Generated answers tables showing saved executions by run number.
 It supports search, status filters, notes, CSV exports, evidence inspection, and
 compatible-run comparisons.
 
+The default architecture label is `baseline`, referring to the current Nebula
+implementation at commit `a16724265d0142684349b773c5e475e2f79ea818`.
+When evaluating later Nebula changes, supply a distinct architecture label and
+record that revision in the run description. Runtime embedding and generation
+model identities are still captured from Nebula for each run.
+
 **Run all benchmarks** creates one durable suite. It selects the latest prepared
 snapshot for each benchmark module, executes every supported mode in sequence,
 and associates the resulting executions with one suite run number. Unsupported
@@ -460,7 +466,9 @@ Both retrieval and answer-run requests accept an optional `description` of at
 most 4000 UTF-8 bytes, including multiline text. It defaults to an empty string
 and records the experiment notes in the run reference registry. Retrieval
 `label` and generation `architecture_label` become the result table
-`architecture_name`.
+`architecture_name`. Omitted `label` or `architecture_label` defaults to
+`baseline`; supplying a label names a later experiment. Existing saved labels
+are preserved.
 
 This returns HTTP 202 with a run ID. Poll its status, then download `scores.csv`.
 Only one run is active per server, keeping latency measurements free from
@@ -487,9 +495,9 @@ curl -sS http://127.0.0.1:4319/api/benchmarks/v1/suite-runs \
   -d '{"architecture_label":"Dense retrieval v2","description":"New chunking; same corpus","profile_id":"PROFILE-FROM-ANSWER-RUNTIME"}'
 ```
 
-`architecture_label` is required and must contain 1–256 UTF-8 bytes without
-surrounding whitespace. Optional `description` defaults to an empty string and
-allows at most 4000 UTF-8 bytes. Omit `profile_id` to skip generation; otherwise use
+`architecture_label` defaults to `baseline` when omitted. An explicit value must
+contain 1–256 UTF-8 bytes without surrounding whitespace. Optional `description`
+defaults to an empty string and allows at most 4000 UTF-8 bytes. Omit `profile_id` to skip generation; otherwise use
 an enabled profile reported by `/answer-runtime`. Optional `top_k` accepts 1–100
 and overrides retrieval settings only. Without it, retrieval uses the pinned
 snapshot's saved default. Generation retains its evaluator's fixed settings.

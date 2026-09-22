@@ -211,6 +211,8 @@ describe('Benchmark workspace', () => {
     await screen.findByText('Connected');
     await user.click(screen.getByRole('button', { name: /HotpotQA 1 run/ }));
     await user.click(screen.getByRole('button', { name: 'Run all benchmarks' }));
+    expect(screen.getByRole('textbox', { name: 'Architecture label' })).toHaveValue('baseline');
+    await user.clear(screen.getByRole('textbox', { name: 'Architecture label' }));
     await user.type(screen.getByRole('textbox', { name: 'Architecture label' }), 'Dense v3');
     await user.type(screen.getByRole('textbox', { name: 'Run notes' }), 'New index\nSame passages');
     props.resultsApi.listSuites.mockResolvedValue([suite]);
@@ -273,13 +275,13 @@ describe('Benchmark workspace', () => {
     render(<BenchmarkDashboard {...props} />);
     await screen.findByText('Connected');
     await user.click(screen.getByRole('button', { name: 'Run all benchmarks' }));
-    await user.type(screen.getByRole('textbox', { name: 'Architecture label' }), 'Full suite');
+    expect(screen.getByRole('textbox', { name: 'Architecture label' })).toHaveValue('baseline');
     expect(screen.getByText('Checking generation availability…')).toBeVisible();
     expect(screen.getByRole('button', { name: 'Start suite run' })).toBeDisabled();
     await act(async () => resolveRuntime(available));
     await user.click(screen.getByRole('button', { name: 'Start suite run' }));
     expect(props.resultsApi.startSuite).toHaveBeenCalledWith(
-      expect.objectContaining({ profile_id: 'profile' }),
+      { architecture_label: 'baseline', description: '', profile_id: 'profile' },
       expect.any(AbortSignal),
     );
     expect(props.resultsApi.startSuite).toHaveBeenCalledTimes(1);
@@ -324,7 +326,6 @@ describe('Benchmark workspace', () => {
     await screen.findByText('Connected');
     props.resultsApi.startSuite.mockRejectedValue(new Error('Connection lost'));
     await user.click(screen.getByRole('button', { name: 'Run all benchmarks' }));
-    await user.type(screen.getByRole('textbox', { name: 'Architecture label' }), 'Baseline');
     await user.click(screen.getByRole('button', { name: 'Start suite run' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('Connection lost');
     expect(props.resultsApi.startSuite).toHaveBeenCalledTimes(1);
@@ -342,6 +343,7 @@ describe('Benchmark workspace', () => {
     await screen.findByText('Connected');
     await user.click(screen.getByRole('button', { name: 'Run all benchmarks' }));
     expect(screen.getByText(/Answer evaluations will be skipped/)).toBeVisible();
+    await user.clear(screen.getByRole('textbox', { name: 'Architecture label' }));
     await user.type(screen.getByRole('textbox', { name: 'Architecture label' }), 'Retrieval');
     await user.click(screen.getByRole('button', { name: 'Start suite run' }));
     expect(props.resultsApi.startSuite).toHaveBeenCalledWith(

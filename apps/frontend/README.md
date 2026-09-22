@@ -85,8 +85,9 @@ static build separately requires an equivalent proxy.
 1. Select a benchmark in the sidebar. Its saved results appear by run number;
    switch between Retrieval and Generated answers. Search by run number,
    architecture, model, or notes; filter by status and page through saved rows.
-2. Choose **Run all benchmarks**, enter an architecture label and optional run
-   notes, and select an enabled generation profile from the configured Nebula
+2. Choose **Run all benchmarks**, keep the default architecture label `baseline`
+   for the current Nebula implementation or enter a label for a variant. Add optional run
+   notes and select an enabled generation profile from the configured Nebula
    runtime. The UI waits for the initial runtime availability check before
    allowing submission. Labels allow 1–256 UTF-8 bytes and notes up to 4000 bytes.
 3. Start the suite. The selected sidebar benchmark does not limit the run. The

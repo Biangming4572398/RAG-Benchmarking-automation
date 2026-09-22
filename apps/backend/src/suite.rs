@@ -14,6 +14,7 @@ use crate::{
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct StartSuiteRequest {
+    #[serde(default = "crate::default_architecture_label")]
     pub architecture_label: String,
     #[serde(default)]
     pub description: String,

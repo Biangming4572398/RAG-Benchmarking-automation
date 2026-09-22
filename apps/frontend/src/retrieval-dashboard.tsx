@@ -87,7 +87,7 @@ export function RetrievalDashboard({
   const workspace = useBenchmarkWorkspace(api, pollInterval);
   const [state, setState] = useState(() => restoreState(initialState));
   const [topK, setTopK] = useState('');
-  const [label, setLabel] = useState('');
+  const [label, setLabel] = useState('baseline');
   const [pending, setPending] = useState('');
   const [actionError, setActionError] = useState('');
   const [notice, setNotice] = useState('');
