@@ -34,6 +34,13 @@ export interface SuitePreparation {
   reason: string | null;
 }
 
+export interface Initialization {
+  status: 'initializing' | 'ready' | 'failed';
+  phase: 'preparing' | 'indexing' | 'ready' | 'failed';
+  preparations: SuitePreparation[];
+  error: string | null;
+}
+
 export interface SuiteRun {
   id: string;
   run_number: number;
@@ -48,6 +55,7 @@ export interface SuiteRun {
 }
 
 export interface ResultsApi {
+  getInitialization(signal?: AbortSignal): Promise<Initialization>;
   getResults(signal?: AbortSignal): Promise<Results>;
   listSuites(signal?: AbortSignal): Promise<SuiteRun[]>;
   startSuite(request: SuiteRequest, signal?: AbortSignal): Promise<SuiteRun>;
@@ -63,6 +71,26 @@ const count = (value: unknown): value is number =>
   typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 const entryStatus = (value: unknown) =>
   ['queued', 'running', 'completed', 'failed', 'interrupted', 'skipped'].includes(String(value));
+function preparation(value: unknown): value is SuitePreparation {
+  return (
+    record(value) &&
+    text(value.benchmark) &&
+    nullableText(value.benchmark_id) &&
+    entryStatus(value.status) &&
+    nullableText(value.reason)
+  );
+}
+function initialization(value: unknown): value is Initialization {
+  return (
+    record(value) &&
+    ((value.status === 'initializing' && ['preparing', 'indexing'].includes(String(value.phase))) ||
+      (value.status === 'ready' && value.phase === 'ready') ||
+      (value.status === 'failed' && value.phase === 'failed')) &&
+    Array.isArray(value.preparations) &&
+    value.preparations.every(preparation) &&
+    nullableText(value.error)
+  );
+}
 
 function results(value: unknown): value is Results {
   return (
@@ -108,15 +136,7 @@ function suite(value: unknown): value is SuiteRun {
     (value.phase === undefined ||
       ['preparing', 'indexing', 'running', 'finished'].includes(String(value.phase))) &&
     (value.preparations === undefined ||
-      (Array.isArray(value.preparations) &&
-        value.preparations.every(
-          (preparation) =>
-            record(preparation) &&
-            text(preparation.benchmark) &&
-            nullableText(preparation.benchmark_id) &&
-            entryStatus(preparation.status) &&
-            nullableText(preparation.reason),
-        ))) &&
+      (Array.isArray(value.preparations) && value.preparations.every(preparation))) &&
     Array.isArray(value.items) &&
     value.items.every(
       (entry) =>
@@ -173,6 +193,19 @@ export function createResultsApi(fetchImpl: typeof fetch = globalThis.fetch): Re
     return value;
   }
   return {
+    async getInitialization(signal) {
+      try {
+        return await request('/initialization', initialization, signal);
+      } catch (cause) {
+        if (cause instanceof ApiError && cause.status === 404) {
+          throw new ApiError(
+            'This server does not support benchmark initialization. Update and restart the benchmark backend.',
+            404,
+          );
+        }
+        throw cause;
+      }
+    },
     getResults: (signal) => request('/results', results, signal),
     listSuites: (signal) =>
       request(

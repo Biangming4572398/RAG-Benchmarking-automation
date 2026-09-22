@@ -1,5 +1,8 @@
 //! HTTP assembly and shared persistence/Nebula execution infrastructure.
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use axum::{
     Json, Router,
@@ -8,6 +11,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
@@ -27,6 +31,43 @@ struct AppState {
     catalog: Catalog,
     run_slot: Arc<Semaphore>,
     load_slot: Arc<Semaphore>,
+    initialization: Option<Arc<Mutex<Initialization>>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InitializationStatus {
+    Initializing,
+    Ready,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InitializationPhase {
+    Preparing,
+    Indexing,
+    Ready,
+    Failed,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub struct Initialization {
+    pub status: InitializationStatus,
+    pub phase: InitializationPhase,
+    pub preparations: Vec<crate::suite::SuitePreparation>,
+    pub error: Option<String>,
+}
+
+impl Initialization {
+    fn ready() -> Self {
+        Self {
+            status: InitializationStatus::Ready,
+            phase: InitializationPhase::Ready,
+            preparations: vec![],
+            error: None,
+        }
+    }
 }
 
 pub fn router(store: Arc<Store>, nebula: Option<NebulaConfig>, catalog: Catalog) -> Result<Router> {
@@ -39,6 +80,26 @@ pub fn router_with_corpus(
     catalog: Catalog,
     nebula_corpus: Option<PathBuf>,
 ) -> Result<Router> {
+    assemble_router(store, nebula, catalog, nebula_corpus, false)
+}
+
+/// Serve immediately while preparing and indexing all supported catalog datasets.
+pub fn router_with_initialization(
+    store: Arc<Store>,
+    nebula: Option<NebulaConfig>,
+    catalog: Catalog,
+    nebula_corpus: Option<PathBuf>,
+) -> Result<Router> {
+    assemble_router(store, nebula, catalog, nebula_corpus, true)
+}
+
+fn assemble_router(
+    store: Arc<Store>,
+    nebula: Option<NebulaConfig>,
+    catalog: Catalog,
+    nebula_corpus: Option<PathBuf>,
+    initialize: bool,
+) -> Result<Router> {
     if let Some(config) = &nebula {
         config.validate()?;
     }
@@ -49,12 +110,24 @@ pub fn router_with_corpus(
         catalog,
         run_slot: Arc::new(Semaphore::new(1)),
         load_slot: Arc::new(Semaphore::new(1)),
+        initialization: initialize.then(|| {
+            Arc::new(Mutex::new(Initialization {
+                status: InitializationStatus::Initializing,
+                phase: InitializationPhase::Preparing,
+                preparations: vec![],
+                error: None,
+            }))
+        }),
     });
+    if initialize {
+        start_initialization(state.clone())?;
+    }
     Ok(Router::new()
         .route(
             "/api/benchmarks/v1/health",
             get(|| async { Json(json!({"status": "ok"})) }),
         )
+        .route("/api/benchmarks/v1/initialization", get(initialization))
         .route(
             "/api/benchmarks/v1/benchmarks",
             get(list_benchmarks).post(load),
@@ -92,6 +165,152 @@ pub fn router_with_corpus(
         .with_state(state))
 }
 
+fn initialization_state(state: &AppState) -> Result<Initialization> {
+    state.initialization.as_ref().map_or_else(
+        || Ok(Initialization::ready()),
+        |value| {
+            value
+                .lock()
+                .map(|value| value.clone())
+                .map_err(|_| Error("Initialization state is unavailable".into()))
+        },
+    )
+}
+
+fn save_initialization(state: &AppState, progress: &Initialization) -> Result<()> {
+    if let Some(value) = &state.initialization {
+        *value
+            .lock()
+            .map_err(|_| Error("Initialization state is unavailable".into()))? = progress.clone();
+    }
+    state.store.save_initialization(progress)
+}
+
+fn start_initialization(state: Arc<AppState>) -> Result<()> {
+    let run_permit = state
+        .run_slot
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| Error("Cannot reserve benchmark initialization".into()))?;
+    let load_permit = state
+        .load_slot
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| Error("Cannot reserve dataset initialization".into()))?;
+    state
+        .store
+        .save_initialization(&initialization_state(&state)?)?;
+    tokio::spawn(async move {
+        let _run_permit = run_permit;
+        let _load_permit = load_permit;
+        let worker = state.clone();
+        let error = match tokio::spawn(async move { initialize_worker(&worker).await }).await {
+            Ok(Ok(())) => return,
+            Ok(Err(error)) => error.to_string(),
+            Err(_) => "Dashboard initialization worker stopped unexpectedly".into(),
+        };
+        let mut progress = initialization_state(&state).unwrap_or_else(|_| Initialization::ready());
+        progress.status = InitializationStatus::Failed;
+        progress.phase = InitializationPhase::Failed;
+        progress.error = Some(error.clone());
+        for preparation in &mut progress.preparations {
+            if matches!(
+                preparation.status,
+                crate::suite::SuiteItemStatus::Queued | crate::suite::SuiteItemStatus::Running
+            ) {
+                preparation.status = crate::suite::SuiteItemStatus::Failed;
+                preparation.reason = Some(error.clone());
+            }
+        }
+        if let Err(error) = save_initialization(&state, &progress) {
+            eprintln!("Cannot persist dashboard initialization failure: {error}");
+        }
+    });
+    Ok(())
+}
+
+async fn initialize_worker(state: &Arc<AppState>) -> Result<()> {
+    let store = state.store.clone();
+    let catalog = state.catalog.clone();
+    let mut preparations =
+        tokio::task::spawn_blocking(move || crate::suite::plan_preparations(&store, &catalog))
+            .await
+            .map_err(|_| Error("Cannot plan dashboard initialization".into()))??;
+    let had_missing_snapshots = preparations.iter().any(|item| {
+        item.benchmark_id.is_none() && item.status == crate::suite::SuiteItemStatus::Queued
+    });
+    let mut progress = Initialization {
+        status: InitializationStatus::Initializing,
+        phase: InitializationPhase::Preparing,
+        preparations: preparations.clone(),
+        error: None,
+    };
+    save_initialization(state, &progress)?;
+    let benchmarks =
+        crate::suite::prepare_snapshots(state.store.clone(), &mut preparations, |updated| {
+            progress.preparations = updated.to_vec();
+            save_initialization(state, &progress)
+        })
+        .await?;
+    progress.preparations = preparations;
+    let preparation_errors: Vec<_> = progress
+        .preparations
+        .iter()
+        .filter(|item| item.status == crate::suite::SuiteItemStatus::Failed)
+        .map(|item| {
+            format!(
+                "{}: {}",
+                item.benchmark,
+                item.reason
+                    .as_deref()
+                    .unwrap_or("Dataset preparation failed")
+            )
+        })
+        .collect();
+    if !benchmarks.is_empty() {
+        progress.phase = InitializationPhase::Indexing;
+        save_initialization(state, &progress)?;
+        let config = state.nebula.clone().ok_or_else(|| Error(
+            "Dashboard initialization requires NEBULA_API_BASE and NEBULA_API_TOKEN to index and verify the prepared datasets".into()))?;
+        if let Some(corpus) = &state.nebula_corpus {
+            crate::corpus::prepare(corpus.clone(), config, benchmarks).await?;
+        } else if had_missing_snapshots {
+            return Err(Error("Dashboard initialization prepared the datasets but automatic indexing requires BENCHMARK_NEBULA_CORPUS pointing to Nebula's dedicated benchmark corpus. Start through the managed launcher, or configure that directory and enable Nebula's -benchmark-reindex option.".into()));
+        } else {
+            crate::corpus::verify(&config, &benchmarks).await?;
+        }
+    }
+    if !preparation_errors.is_empty() {
+        return Err(Error(format!(
+            "Dataset initialization failed: {}",
+            preparation_errors.join("; ")
+        )));
+    }
+    progress.status = InitializationStatus::Ready;
+    progress.phase = InitializationPhase::Ready;
+    save_initialization(state, &progress)
+}
+
+async fn initialization(State(state): State<Arc<AppState>>) -> ApiResult<impl IntoResponse> {
+    Ok(Json(initialization_state(&state)?))
+}
+
+fn require_initialized(state: &AppState) -> ApiResult<()> {
+    let progress = initialization_state(state)?;
+    if progress.status == InitializationStatus::Ready {
+        return Ok(());
+    }
+    let reason = progress.error.unwrap_or_else(|| match progress.phase {
+        InitializationPhase::Preparing => progress.preparations.iter()
+            .find(|item| item.status == crate::suite::SuiteItemStatus::Running)
+            .map(|item| format!("Dashboard initialization is preparing {}", item.benchmark))
+            .unwrap_or_else(|| "Dashboard initialization is preparing benchmark datasets".into()),
+        InitializationPhase::Indexing => "Dashboard initialization is indexing the prepared datasets in Nebula".into(),
+        _ => "Dashboard initialization has not completed; restart the backend after correcting its configuration".into(),
+    });
+    Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, reason))
+}
+
 type ApiResult<T> = std::result::Result<T, ApiError>;
 struct ApiError(StatusCode, String);
 impl IntoResponse for ApiError {
@@ -127,6 +346,7 @@ async fn load(
     State(state): State<Arc<AppState>>,
     Json(request): Json<LoadRequest>,
 ) -> ApiResult<impl IntoResponse> {
+    require_initialized(&state)?;
     let request = state
         .catalog
         .resolve(&request)
@@ -208,6 +428,7 @@ async fn start_suite(
     State(state): State<Arc<AppState>>,
     Json(request): Json<crate::suite::StartSuiteRequest>,
 ) -> ApiResult<impl IntoResponse> {
+    require_initialized(&state)?;
     request
         .validate()
         .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))?;
@@ -307,6 +528,7 @@ async fn start_run(
     State(state): State<Arc<AppState>>,
     Json(request): Json<StartRunRequest>,
 ) -> ApiResult<impl IntoResponse> {
+    require_initialized(&state)?;
     let config = state.nebula.clone().ok_or_else(|| {
         ApiError(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -401,6 +623,7 @@ async fn start_answer_run(
     State(state): State<Arc<AppState>>,
     Json(request): Json<StartAnswerRunRequest>,
 ) -> ApiResult<impl IntoResponse> {
+    require_initialized(&state)?;
     request
         .validate()
         .map_err(|error| ApiError(StatusCode::BAD_REQUEST, error.to_string()))?;
@@ -546,6 +769,14 @@ mod persistence {
     }
 
     impl Store {
+        pub fn initialization(&self) -> Result<super::Initialization> {
+            read_json(&self.root.join("initialization.json"))
+        }
+
+        pub fn save_initialization(&self, initialization: &super::Initialization) -> Result<()> {
+            atomic_json(&self.root.join("initialization.json"), initialization)
+        }
+
         pub fn open(root: &Path) -> Result<Self> {
             fs::create_dir_all(root)?;
             let root = root.canonicalize()?;

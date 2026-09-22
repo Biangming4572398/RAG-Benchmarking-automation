@@ -44,7 +44,7 @@ if (process.argv[2] === '--version') {
   const server = http.createServer((request, response) => {
     response.setHeader('Content-Type', 'application/json');
     const path = request.url.split('/').at(-1);
-    response.end(JSON.stringify(path === 'health' ? {status: 'ok'} : path === 'results' ? {benchmarks: []} : path === 'suite-runs' ? [] : {benchmarks: {}}));
+    response.end(JSON.stringify(path === 'health' ? {status: 'ok'} : path === 'results' ? {benchmarks: []} : path === 'suite-runs' ? [] : path === 'initialization' ? {status: process.env.FIXTURE_INITIALIZATION_STATUS || 'ready', preparations: []} : {benchmarks: {}}));
   });
   server.listen(Number(port), host, () => console.log('BENCHMARK_BACKEND_PORT=' + server.address().port));
   process.once('SIGINT', () => server.close());
@@ -191,6 +191,16 @@ describe('automatic Rust backend build', () => {
     });
   });
 
+  it.each(['initializing', 'failed'])('keeps the API available while initialization is %s', async (status) => {
+    const options = await fixture();
+    options.env.FIXTURE_INITIALIZATION_STATUS = status;
+    const target = await availableTarget();
+    stops.push(await startBackend({ ...options, target }));
+    expect(await (await fetch(`${target}/api/benchmarks/v1/initialization`)).json()).toEqual({
+      status, preparations: [],
+    });
+  });
+
   it('reuses an already healthy server without compiling or taking ownership', async () => {
     const options = await fixture();
     const target = await availableTarget();
@@ -250,8 +260,9 @@ describe('automatic Rust backend build', () => {
     const options = await fixture();
     stops.push(await startBackend({ ...options, target: 'http://127.0.0.1:0' }));
     const message = options.log.mock.calls.at(-1)?.[0] as string;
-    const target = message.replace('Benchmark backend ready at ', '');
-    expect(new URL(target).port).not.toBe('0');
+    const target = /Benchmark API available at (http:\/\/[^;]+)/.exec(message)?.[1];
+    expect(target).toBeDefined();
+    expect(new URL(target!).port).not.toBe('0');
     expect((await fetch(`${target}/api/benchmarks/v1/health`)).ok).toBe(true);
   });
 
@@ -261,6 +272,8 @@ describe('automatic Rust backend build', () => {
       response.setHeader('Content-Type', 'application/json');
       if (request.url?.endsWith('/health')) response.end(JSON.stringify({ status: 'ok' }));
       else if (request.url?.endsWith('/catalog')) response.end(JSON.stringify({ benchmarks: {} }));
+      else if (request.url?.endsWith('/results')) response.end(JSON.stringify({ benchmarks: [] }));
+      else if (request.url?.endsWith('/suite-runs')) response.end('[]');
       else {
         response.statusCode = 404;
         response.end('{}');
@@ -275,7 +288,7 @@ describe('automatic Rust backend build', () => {
     if (!address || typeof address === 'string') throw new Error('Expected TCP listener');
     const target = `http://127.0.0.1:${address.port}`;
     await expect(startBackend({ ...options, target })).rejects.toThrow(
-      'requires the results and suite-runs APIs',
+      'requires the results, suite-runs and initialization APIs',
     );
     expect(options.log).not.toHaveBeenCalled();
     expect((await fetch(`${target}/api/benchmarks/v1/health`)).ok).toBe(true);

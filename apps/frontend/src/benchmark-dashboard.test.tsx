@@ -134,6 +134,12 @@ function setup() {
     downloadScores: vi.fn<AnswerApi['downloadScores']>(),
   };
   const resultsApi = {
+    getInitialization: vi.fn().mockResolvedValue({
+      status: 'ready',
+      phase: 'ready',
+      preparations: [],
+      error: null,
+    }),
     getResults: vi.fn<ResultsApi['getResults']>().mockResolvedValue({
       benchmarks: [
         { benchmark: 'ragtruth-qa', columns: Object.keys(row), rows: [row] },
@@ -322,6 +328,78 @@ describe('Benchmark workspace', () => {
     expect(props.api.loadBenchmark).not.toHaveBeenCalled();
     expect(props.api.startRun).not.toHaveBeenCalled();
     expect(props.answerApi.startRun).not.toHaveBeenCalled();
+  });
+  it('waits for server startup preparation and indexing before allowing a suite to start', async () => {
+    const user = userEvent.setup();
+    const props = setup();
+    props.api.listBenchmarks.mockResolvedValue([]);
+    props.resultsApi.getResults.mockResolvedValue({ benchmarks: [] });
+    const initializing = {
+      status: 'initializing',
+      phase: 'preparing',
+      error: null,
+      preparations: [
+        {
+          benchmark: 'hotpotqa',
+          benchmark_id: null,
+          status: 'running',
+          reason: 'Downloading the HotpotQA dataset',
+        },
+      ],
+    };
+    props.resultsApi.getInitialization.mockResolvedValue(initializing);
+    render(<BenchmarkDashboard {...props} />);
+    await screen.findByText('Connected');
+    expect(screen.getByRole('status')).toHaveTextContent('Preparing benchmarks: HotpotQA.');
+    expect(screen.getByRole('status')).toHaveTextContent('Downloading the HotpotQA dataset');
+    await user.click(screen.getByRole('button', { name: 'Run all benchmarks' }));
+    expect(screen.getByRole('button', { name: 'Start suite run' })).toBeDisabled();
+    expect(
+      screen.getByText('Benchmark initialization must finish before a suite can start.'),
+    ).toBeVisible();
+    await user.click(screen.getByRole('button', { name: 'Start suite run' }));
+    expect(props.resultsApi.startSuite).not.toHaveBeenCalled();
+    expect(props.api.loadBenchmark).not.toHaveBeenCalled();
+
+    props.resultsApi.getInitialization.mockResolvedValue({ ...initializing, phase: 'indexing' });
+    await user.click(screen.getByRole('button', { name: 'Refresh' }));
+    expect(screen.getByRole('status')).toHaveTextContent('Indexing benchmark passages in Nebula.');
+    expect(screen.getByRole('button', { name: 'Start suite run' })).toBeDisabled();
+
+    props.resultsApi.getInitialization.mockResolvedValue({
+      status: 'ready',
+      phase: 'ready',
+      preparations: [],
+      error: null,
+    });
+    await user.click(screen.getByRole('button', { name: 'Refresh' }));
+    expect(screen.getByRole('button', { name: 'Start suite run' })).toBeEnabled();
+    expect(props.resultsApi.startSuite).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: 'Start suite run' }));
+    expect(props.resultsApi.startSuite).toHaveBeenCalledTimes(1);
+  });
+  it('shows a startup failure and keeps suites disabled until the backend is restarted successfully', async () => {
+    const user = userEvent.setup();
+    const props = setup();
+    props.api.listBenchmarks.mockResolvedValue([]);
+    props.resultsApi.getResults.mockResolvedValue({ benchmarks: [] });
+    props.resultsApi.getInitialization.mockResolvedValue({
+      status: 'failed',
+      phase: 'failed',
+      preparations: [],
+      error: 'Dataset download failed: checksum mismatch',
+    });
+    render(<BenchmarkDashboard {...props} />);
+    await screen.findByText('Connected');
+    const failure = screen.getByRole('alert');
+    expect(failure).toHaveTextContent('Dataset download failed: checksum mismatch');
+    expect(failure).toHaveTextContent('Restart the benchmark backend to retry initialization.');
+    await user.click(screen.getByRole('button', { name: 'Run all benchmarks' }));
+    expect(screen.getByRole('button', { name: 'Start suite run' })).toBeDisabled();
+    expect(
+      screen.queryByText('Benchmark initialization complete. Ready to run.'),
+    ).not.toBeInTheDocument();
+    expect(props.resultsApi.startSuite).not.toHaveBeenCalled();
   });
   it('keeps a catalog without supported loaders or snapshots from starting an empty suite', async () => {
     const props = setup();

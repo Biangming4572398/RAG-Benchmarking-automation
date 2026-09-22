@@ -124,9 +124,11 @@ pub struct SuiteItem {
     pub reason: Option<String>,
 }
 
-/// Snapshot choices and missing-dataset definitions are fixed before accepting a suite.
-pub fn plan(store: &Store, catalog: &Catalog, request: StartSuiteRequest) -> Result<SuiteRun> {
-    request.validate()?;
+/// Resolve canonical modules identically for startup and suite runs.
+fn inventory(
+    store: &Store,
+    catalog: &Catalog,
+) -> Result<Vec<(&'static dyn crate::BenchmarkModule, SuitePreparation)>> {
     let mut snapshots: BTreeMap<String, Benchmark> = BTreeMap::new();
     let mut modules = BTreeMap::new();
     let mut definitions = BTreeMap::new();
@@ -152,14 +154,47 @@ pub fn plan(store: &Store, catalog: &Catalog, request: StartSuiteRequest) -> Res
         modules.insert(module.key().to_string(), module);
         snapshots.insert(module.key().to_string(), benchmark);
     }
+    Ok(modules
+        .into_iter()
+        .map(|(key, module)| {
+            let benchmark = snapshots.get(&key);
+            let preparation = SuitePreparation {
+                benchmark: key.clone(),
+                benchmark_id: benchmark.map(|value| value.id),
+                configuration: benchmark
+                    .and_then(|value| value.configuration.clone())
+                    .or_else(|| definitions.get(&key).cloned()),
+                status: if benchmark.is_some() {
+                    SuiteItemStatus::Completed
+                } else {
+                    SuiteItemStatus::Queued
+                },
+                reason: None,
+            };
+            (module, preparation)
+        })
+        .collect())
+}
+
+/// Prepare all integrated datasets at startup, independent of selected run modes/profiles.
+pub fn plan_preparations(store: &Store, catalog: &Catalog) -> Result<Vec<SuitePreparation>> {
+    Ok(inventory(store, catalog)?
+        .into_iter()
+        .filter(|(module, _)| module.supports_retrieval() || module.answer_evaluation().is_some())
+        .map(|(_, preparation)| preparation)
+        .collect())
+}
+
+/// Snapshot choices and missing-dataset definitions are fixed before accepting a suite.
+pub fn plan(store: &Store, catalog: &Catalog, request: StartSuiteRequest) -> Result<SuiteRun> {
+    request.validate()?;
     let mut items = Vec::new();
     let mut preparations = Vec::new();
     // Include prepared snapshots whose definitions were removed from the current catalog.
-    for (key, module) in modules {
-        let benchmark = snapshots.get(&key);
+    for (module, mut preparation) in inventory(store, catalog)? {
         let base = SuiteItem {
-            benchmark: key.clone(),
-            benchmark_id: benchmark.map(|value| value.id),
+            benchmark: preparation.benchmark.clone(),
+            benchmark_id: preparation.benchmark_id,
             mode: None,
             run_id: None,
             status: SuiteItemStatus::Skipped,
@@ -174,21 +209,11 @@ pub fn plan(store: &Store, catalog: &Catalog, request: StartSuiteRequest) -> Res
             });
         } else {
             let executable = module.supports_retrieval() || request.profile_id.is_some();
-            preparations.push(SuitePreparation {
-                benchmark: key.clone(),
-                benchmark_id: benchmark.map(|value| value.id),
-                configuration: benchmark
-                    .and_then(|value| value.configuration.clone())
-                    .or_else(|| definitions.get(&key).cloned()),
-                status: if !executable {
-                    SuiteItemStatus::Skipped
-                } else if benchmark.is_some() {
-                    SuiteItemStatus::Completed
-                } else {
-                    SuiteItemStatus::Queued
-                },
-                reason: (!executable).then(|| "No generation profile selected".into()),
-            });
+            if !executable {
+                preparation.status = SuiteItemStatus::Skipped;
+                preparation.reason = Some("No generation profile selected".into());
+            }
+            preparations.push(preparation);
             if module.supports_retrieval() {
                 items.push(SuiteItem {
                     mode: Some(SuiteMode::Retrieval),
@@ -228,27 +253,22 @@ pub fn plan(store: &Store, catalog: &Catalog, request: StartSuiteRequest) -> Res
     })
 }
 
-/// Prepare each missing dataset once, then return only snapshots with queued executions.
-/// The caller publishes this corpus and waits for indexing before calling `execute`.
-pub async fn prepare(store: Arc<Store>, suite: &mut SuiteRun) -> Result<Vec<Benchmark>> {
-    if suite.run_number == 0 {
-        return Err(Error(
-            "Persist the accepted suite before preparing its datasets".into(),
-        ));
-    }
-    suite.phase = SuitePhase::Preparing;
-    store.save_suite(suite)?;
+/// Load/reuse snapshots without creating experiments or consuming run numbers.
+/// Report each outcome before advancing, including individual preparation failures.
+pub async fn prepare_snapshots(
+    store: Arc<Store>,
+    preparations: &mut [SuitePreparation],
+    mut progress: impl FnMut(&[SuitePreparation]) -> Result<()>,
+) -> Result<Vec<Benchmark>> {
     let mut snapshots = BTreeMap::new();
-    for index in 0..suite.preparations.len() {
-        let preparation = suite.preparations[index].clone();
-        if !suite.items.iter().any(|item| {
-            item.benchmark == preparation.benchmark && item.status == SuiteItemStatus::Queued
-        }) {
+    for index in 0..preparations.len() {
+        let preparation = preparations[index].clone();
+        if preparation.status == SuiteItemStatus::Skipped {
             continue;
         }
-        suite.preparations[index].status = SuiteItemStatus::Running;
-        suite.preparations[index].reason = None;
-        store.save_suite(suite)?;
+        preparations[index].status = SuiteItemStatus::Running;
+        preparations[index].reason = None;
+        progress(preparations)?;
         let result = if let Some(id) = preparation.benchmark_id {
             store.benchmark(id)
         } else if let Some(configuration) = preparation.configuration {
@@ -273,38 +293,74 @@ pub async fn prepare(store: Arc<Store>, suite: &mut SuiteRun) -> Result<Vec<Benc
         let result = result.and_then(|benchmark| {
             if module_for_snapshot(&benchmark)?.key() != preparation.benchmark {
                 return Err(Error(
-                    "Prepared snapshot does not match its suite benchmark".into(),
+                    "Prepared snapshot does not match its benchmark".into(),
                 ));
             }
             Ok(benchmark)
         });
         match result {
             Ok(benchmark) => {
-                suite.preparations[index].benchmark_id = Some(benchmark.id);
-                suite.preparations[index].status = SuiteItemStatus::Completed;
-                for item in &mut suite.items {
-                    if item.benchmark == preparation.benchmark {
-                        item.benchmark_id = Some(benchmark.id);
-                    }
-                }
+                preparations[index].benchmark_id = Some(benchmark.id);
+                preparations[index].status = SuiteItemStatus::Completed;
                 snapshots.insert(benchmark.id, benchmark);
             }
             Err(error) => {
-                suite.preparations[index].status = SuiteItemStatus::Failed;
-                suite.preparations[index].reason = Some(error.to_string());
-                for item in &mut suite.items {
-                    if item.benchmark == preparation.benchmark
-                        && item.status == SuiteItemStatus::Queued
-                    {
-                        item.status = SuiteItemStatus::Failed;
-                        item.reason = Some(format!("Dataset preparation failed: {error}"));
-                    }
+                preparations[index].status = SuiteItemStatus::Failed;
+                preparations[index].reason = Some(error.to_string());
+            }
+        }
+        progress(preparations)?;
+    }
+    Ok(snapshots.into_values().collect())
+}
+
+/// Prepare missing datasets and return snapshots with queued executions.
+/// Publish/index this corpus before calling `execute`.
+pub async fn prepare(store: Arc<Store>, suite: &mut SuiteRun) -> Result<Vec<Benchmark>> {
+    if suite.run_number == 0 {
+        return Err(Error(
+            "Persist the accepted suite before preparing its datasets".into(),
+        ));
+    }
+    suite.phase = SuitePhase::Preparing;
+    store.save_suite(suite)?;
+    let mut preparations = suite.preparations.clone();
+    for preparation in &mut preparations {
+        if !suite.items.iter().any(|item| {
+            item.benchmark == preparation.benchmark && item.status == SuiteItemStatus::Queued
+        }) {
+            preparation.status = SuiteItemStatus::Skipped;
+        }
+    }
+    let prepared = prepare_snapshots(store.clone(), &mut preparations, |progress| {
+        suite.preparations = progress.to_vec();
+        for preparation in progress {
+            for item in &mut suite.items {
+                if item.benchmark != preparation.benchmark {
+                    continue;
+                }
+                if let Some(id) = preparation.benchmark_id {
+                    item.benchmark_id = Some(id);
+                }
+                if preparation.status == SuiteItemStatus::Failed
+                    && item.status == SuiteItemStatus::Queued
+                {
+                    item.status = SuiteItemStatus::Failed;
+                    item.reason = Some(format!(
+                        "Dataset preparation failed: {}",
+                        preparation.reason.as_deref().unwrap_or("Unknown error")
+                    ));
                 }
             }
         }
-        store.save_suite(suite)?;
-    }
-    // Old saved suites predate preparation records, but already pin prepared snapshots.
+        store.save_suite(suite)
+    })
+    .await?;
+    let mut snapshots: BTreeMap<_, _> = prepared
+        .into_iter()
+        .map(|value| (value.id, value))
+        .collect();
+    // Old suites predate preparation records but already pin saved snapshots.
     for item in &suite.items {
         if item.status == SuiteItemStatus::Queued
             && let Some(id) = item.benchmark_id

@@ -184,6 +184,11 @@ async function backendState(target) {
       return 'incompatible';
     if (!Array.isArray((await read('results'))?.benchmarks)) return 'incompatible';
     if (!Array.isArray(await read('suite-runs'))) return 'incompatible';
+    const initialization = await read('initialization');
+    if (
+      !['initializing', 'ready', 'failed'].includes(initialization?.status) ||
+      !Array.isArray(initialization.preparations)
+    ) return 'incompatible';
     return 'ready';
   } catch {
     return reachable ? 'incompatible' : 'absent';
@@ -194,7 +199,7 @@ async function reuseExistingBackend(target) {
   const state = await backendState(target);
   if (state === 'incompatible') {
     throw new Error(
-      `An incompatible server is already running at ${target}. Stop or restart that server with the rewritten benchmark backend; the dashboard requires the results and suite-runs APIs. The existing process was left running.`,
+      `An incompatible server is already running at ${target}. Stop or restart that server with the rewritten benchmark backend; the dashboard requires the results, suite-runs and initialization APIs. The existing process was left running.`,
     );
   }
   return state === 'ready';
@@ -279,7 +284,7 @@ export async function startBackend({
     while (Date.now() < deadline) {
       if (failure) throw failure;
       if (await reuseExistingBackend(target)) {
-        log(`Benchmark backend ready at ${target}`);
+        log(`Benchmark API available at ${target}; dashboard shows initialization progress`);
         return stop;
       }
       await new Promise((resolveDelay) => setTimeout(resolveDelay, 100));

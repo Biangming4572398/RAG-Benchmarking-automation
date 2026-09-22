@@ -17,14 +17,16 @@ When evaluating later Nebula changes, supply a distinct architecture label and
 record that revision in the run description. Runtime embedding and generation
 model identities are still captured from Nebula for each run.
 
-**Run all benchmarks** creates one durable suite, even on an empty snapshot store.
-It reuses the latest prepared snapshot for each benchmark module and automatically
-downloads/prepares missing supported datasets from the pinned YAML definitions.
-The suite runner publishes their passage text to Nebula's dedicated corpus
-and indexes it before the suite executes every supported mode in sequence,
-and associates the resulting executions with one suite run number. Unsupported
-benchmarks and unavailable generation are recorded with skipped reasons. Preparation
-and indexing failures are saved in suite history alongside execution results.
+Rust server startup automatically prepares missing supported datasets from pinned
+YAML definitions, reuses the latest saved snapshot for each benchmark module,
+and publishes/indexes their passage text in Nebula's dedicated corpus. The dashboard
+shows initialization progress and enables runs once preparation and indexing succeed.
+Opening the dashboard creates no experiment records and consumes no run numbers.
+
+**Run all benchmarks** creates one durable suite and executes every supported mode
+in sequence, associating executions with one suite run number. Unsupported benchmarks
+and unavailable generation are recorded with skipped reasons. Preparation remains
+a fallback for suites; failures are retained with the affected operation.
 RAGTruth and HotpotQA have working loaders and evaluators; LongMemEval — cleaned,
 TempRAGEval, QASPER, AbstentionBench, MultiHop-RAG and RAGBench remain catalog-only
 and are marked **Integration required**. Registration alone does not make a
@@ -32,8 +34,8 @@ benchmark runnable or produce scores.
 
 Definitions are managed through Git in
 [`apps/backend/benchmarks.yaml`](apps/backend/benchmarks.yaml). Prepare supported
-snapshots explicitly with the HTTP API as described below, or let the first suite
-prepare them automatically. The dashboard's **Benchmark setup & snapshots** section
+snapshots automatically at server startup; the HTTP API also supports explicit
+snapshot loading after initialization. The dashboard's **Benchmark setup & snapshots** section
 shows preparation guidance and saved corpus paths; it does
 not edit definitions or load datasets. Its UI, API clients, styling, standalone
 proxy, and backend build/lifecycle script live inside this submodule.
@@ -62,7 +64,7 @@ evaluation policy, and benchmark-specific CSV columns:
 The files directly under `apps/backend/src` assemble the backend and provide
 shared infrastructure:
 
-- `main.rs` reads configuration, opens storage, and starts the HTTP server.
+- `main.rs` reads configuration, opens storage, starts initialization, and serves HTTP.
 - `lib.rs` declares the benchmark contracts, shared snapshot/run envelopes, and
   the `BENCHMARKS` registry. Dispatch selects registered implementations.
 - `config.rs` reads environment settings and YAML, validates common metadata,
@@ -76,9 +78,10 @@ shared infrastructure:
   The same server run slot covers the entire suite.
 
 Application initialization is handled by `main.rs`. The bundled benchmark YAML
-must exist at startup. A named module's `initialize()` prepares a dataset snapshot
-when requested; startup creates empty storage, not populated snapshots. Starting a
-suite requests any missing supported snapshots automatically.
+must exist at startup. Startup invokes each supported module's `initialize()` for
+missing snapshots, including generation-only datasets, then verifies Nebula indexing.
+The API remains responsive during downloads; `/health` reports liveness, while
+`/initialization` reports readiness. Loads and run starts return HTTP 503 until ready.
 
 To add a benchmark, create `apps/backend/src/benchmarks/<name>.rs`, declare it in
 `benchmarks/mod.rs`, and implement `BenchmarkModule`, including validation,
@@ -378,8 +381,9 @@ for the sibling `Modules/native/Nebula` checkout and uses its public
 `@genesis/nebula/benchmarking` entry point. Genesis's `benchmarking` branch pins a
 Nebula revision providing that entry point. For a standalone checkout, set
 `BENCHMARK_NEBULA_ROOT` to the absolute path of Nebula's `benchmarking` checkout.
-Without any Nebula checkout, the standalone dashboard still supports browsing
-and dataset preparation. A checkout lacking the entry point reports an update error.
+Without any Nebula checkout, snapshots can still be prepared during startup and
+saved results remain browsable, but initialization reports that Nebula must be
+configured before evaluation can run. A checkout lacking the entry point reports an update error.
 
 Nebula builds its Go executable when absent, damaged, or changed since the last
 build, then loads the shared Kimi settings from its own private repository.
@@ -396,14 +400,14 @@ Nebula connection under its existing owner's control.
 | `BENCHMARK_NEBULA_STORAGE` | `<BENCHMARK_DATA_DIR>/nebula/storage` | Nebula's separate mutable index and state |
 | `BENCHMARK_NEBULA_MODEL_DIR` | `~/.genesis/storage/.genesis/modules/nebula/models/intfloat-multilingual-e5-small` | Existing E5 model bundle, reused without changing Genesis's index |
 
-The corpus and state directories are created if absent; startup leaves snapshots
-and the corpus empty. **Start suite run** saves a run number immediately, prepares
-missing supported datasets, copies only their exported Markdown passages into the
-dedicated corpus, and requests indexing before any evaluation runs. The dashboard
-shows preparing, indexing, and execution progress. Existing snapshots and verified
-passages are reused. A download failure is recorded for that benchmark and other
-prepared benchmarks can continue; an indexing failure stops execution and is saved
-on the suite. A stopped server marks unfinished preparation/runs interrupted.
+The corpus and state directories are created if absent. Server startup prepares
+missing supported datasets, copies only exported Markdown passages into the dedicated
+corpus, and requests indexing. Existing snapshots and identical passages are reused.
+The dashboard displays preparing/indexing progress without requiring a button click.
+Initialization failures remain visible and are saved in `<BENCHMARK_DATA_DIR>/initialization.json`;
+correct the cause and restart the backend to retry. Successfully prepared snapshots
+are reused on restart. The status file is separate from suite history and results:
+initialization never allocates a run number or creates a placeholder experiment.
 
 The managed launcher supplies `BENCHMARK_NEBULA_CORPUS` to Rust and enables Nebula's
 authenticated `-benchmark-reindex` endpoint. External Nebula owners must supply the
@@ -412,68 +416,61 @@ existing manually indexed snapshots remain usable without it. Publication preser
 the existing directory and refuses to overwrite different file contents. Never point
 Nebula at the whole benchmark data directory: snapshot JSON includes answers and
 evaluation labels. The managed Nebula launcher provisions its verified embedding
-bundle when needed. No dataset download or paid generation request happens merely
-from opening the dashboard; dataset preparation begins when a suite is submitted.
+bundle when needed. Initial startup can download datasets and embedding assets;
+no paid generation request occurs until a generation run is explicitly submitted.
 
-You can also run directly in `apps/backend` using Rust 1.95 or newer:
+You can also run directly in `apps/backend` using Rust 1.95 or newer. Start an
+external Nebula with a dedicated `-corpus` directory, its own `-module-storage`
+containing the model bundle, and `-benchmark-reindex`. Supply that same corpus and
+its loopback connection to Rust:
 
 ```sh
 export BENCHMARK_DATA_DIR='/absolute/path/to/experiment-data'
 export BENCHMARK_ADDR='127.0.0.1:4319' # optional; this is the default
+export BENCHMARK_NEBULA_CORPUS='/absolute/path/to/experiment-corpus'
+export NEBULA_API_BASE='http://127.0.0.1:NEBULA_PORT/api/nebula/v1'
+export NEBULA_API_TOKEN='the-token-used-to-start-nebula'
 # Optional: export BENCHMARK_CATALOG='/absolute/path/to/benchmarks.yaml'
 cargo run --locked
 ```
 
 The server prints `BENCHMARK_BACKEND_PORT=<port>`; port 0 selects an available
-port.
+port. It immediately begins dataset preparation and indexing. Read
+`GET /api/benchmarks/v1/initialization` until `status` is `ready`; if it is `failed`,
+inspect `error`, correct the cause and restart. `GET /benchmarks` lists the created
+snapshots and their IDs. No initial POST or manual corpus copy is needed.
+
 There is no permissive browser CORS configuration; the internal dashboard uses a
 server-side development proxy. An explicit `BENCHMARK_API_TARGET` connects the
 UI to a separately managed backend. Only one server may own a data directory.
+Previously loaded snapshots survive restart. Without a Nebula connection startup
+still prepares datasets and allows result browsing, but reports initialization
+failure and blocks loads/runs until Nebula is configured and the server restarted.
+Existing manually indexed snapshots can be verified without a corpus write grant.
 
-Load a named benchmark using its YAML defaults:
+After initialization, optionally create another snapshot using YAML defaults:
 
 ```sh
 curl -sS http://127.0.0.1:4319/api/benchmarks/v1/benchmarks \
   -H 'Content-Type: application/json' \
-  -d '{"benchmark":"ragtruth-qa"}'
+  -d '{"benchmark":"ragtruth-qa","limit":50}'
 ```
 
-Use `{"benchmark":"ragtruth-qa","limit":50}` to override the case limit for
-one snapshot. Source, split and adapter now come from the catalog; the previous
-source-based load request is replaced by this named request.
+Omit `limit` to use the YAML default. Source, split and adapter come from the
+catalog. The response includes `id`, `fingerprint`, counts and absolute `corpus_path`.
+Loading is synchronous on a blocking worker; health and result reads remain
+responsive and concurrent loads receive HTTP 409. A suite publishes/indexes the
+latest snapshots before execution. For individual runs, ensure any newly loaded
+snapshot's exported passages are indexed first, or restart to initialize its corpus.
+Only exported Markdown belongs in Nebula's corpus; keep evaluation labels separate.
 
-The response contains the benchmark `id`, `fingerprint`, counts, and absolute
-`corpus_path`. Loading is synchronous and runs on a blocking worker so health
-and result reads remain responsive. A concurrent load receives HTTP 409.
-
-Start a standalone Nebula backend with `-corpus <corpus_path>` and its own
-`-module-storage` directory containing the embedding model bundle. This uses
-Nebula's existing launch contract; the model is not selected by this server.
-Wait until Nebula reports knowledge ready. Keep its files unchanged during a run.
-To use both benchmarks, load `hotpotqa` with the same `/benchmarks` POST endpoint
-and copy the exported Markdown passages from both snapshots into a dedicated
-combined corpus. Preserve filenames and bytes, keep the snapshots immutable, and
-point Nebula at the combined directory. Each runner selects only its benchmark's
-sources; HotpotQA further selects each question's supplied candidates.
-Then restart this benchmark server with the following environment (the command
-below runs in `apps/backend`; use `pnpm benchmark:backend` from the repository
-root for the managed equivalent):
-
-```sh
-export NEBULA_API_BASE='http://127.0.0.1:NEBULA_PORT/api/nebula/v1'
-export NEBULA_API_TOKEN='the-token-used-to-start-nebula'
-cargo run --locked
-```
-
-Previously loaded benchmarks survive restart. Both Nebula settings are optional
-for loading/browsing, but both are required for running. Retrieval-only RAGTruth
-runs call `/retrieve` and do not need remote generation. HotpotQA is available
-through `/answer-runs`; `/runs` rejects answer-only benchmarks.
+Retrieval-only RAGTruth runs call `/retrieve` and need no remote generation.
+HotpotQA uses `/answer-runs`; `/runs` rejects answer-only benchmarks.
 
 ```sh
 curl -sS http://127.0.0.1:4319/api/benchmarks/v1/runs \
   -H 'Content-Type: application/json' \
-  -d '{"benchmark_id":"UUID-FROM-LOAD","label":"baseline","description":"Original indexing configuration"}'
+  -d '{"benchmark_id":"UUID-FROM-BENCHMARKS","label":"baseline","description":"Original indexing configuration"}'
 ```
 
 Both retrieval and answer-run requests accept an optional `description` of at
@@ -558,6 +555,7 @@ All paths have prefix `/api/benchmarks/v1`.
 | Method | Path                                       | Result                                                          |
 | ------ | ------------------------------------------ | --------------------------------------------------------------- |
 | GET    | `/health`                                  | Server liveness                                                 |
+| GET    | `/initialization`                          | Startup readiness, preparation/indexing progress and errors      |
 | GET    | `/catalog`                                 | Configured benchmark names, definitions and defaults            |
 | POST   | `/benchmarks`                              | Load/snapshot dataset and export corpus; HTTP 201               |
 | GET    | `/benchmarks`                              | Dataset summaries and corpus paths                              |

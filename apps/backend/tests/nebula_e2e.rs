@@ -152,6 +152,22 @@ fn save_json(root: &Path, name: &str, value: &Value) {
     fs::write(root.join(name), serde_json::to_vec_pretty(value).unwrap()).unwrap();
 }
 
+async fn wait_for_initialization(client: &reqwest::Client, base: &str, expected: &str) -> Value {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let initialization = response(client.get(format!("{base}/initialization")), 200).await;
+        if matches!(initialization["status"].as_str(), Some("ready" | "failed")) {
+            assert_eq!(initialization["status"], expected, "{initialization}");
+            return initialization;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Dashboard initialization did not finish: {initialization}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 #[tokio::test]
 async fn benchmark_starts_without_credentials_on_loopback() {
     let root = tempfile::tempdir().unwrap();
@@ -159,11 +175,10 @@ async fn benchmark_starts_without_credentials_on_loopback() {
     let mut server = start_benchmark(root.path(), None);
     let port = server.port("BENCHMARK_BACKEND_PORT=").await;
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
-    let health = response(
-        client.get(format!("http://127.0.0.1:{port}/api/benchmarks/v1/health")),
-        200,
-    )
-    .await;
+    let base = format!("http://127.0.0.1:{port}/api/benchmarks/v1");
+    let initialization = wait_for_initialization(&client, &base, "failed").await;
+    assert!(!initialization["error"].is_null());
+    let health = response(client.get(format!("{base}/health")), 200).await;
     assert_eq!(health["status"], "ok");
 }
 
@@ -220,13 +235,12 @@ async fn real_nebula_produces_benchmark_results() {
             .status(),
         reqwest::StatusCode::OK
     );
-    let loaded = response(
-        client
-            .post(format!("{base}/benchmarks"))
-            .json(&json!({"benchmark":"local-qa"})),
-        201,
-    )
-    .await;
+    // Startup prepares the dataset before reporting the missing Nebula
+    // connection; reads remain available even though mutations are now blocked.
+    wait_for_initialization(&client, &base, "failed").await;
+    let snapshots = response(client.get(format!("{base}/benchmarks")), 200).await;
+    assert_eq!(snapshots.as_array().unwrap().len(), 1);
+    let loaded = snapshots[0].clone();
     save_json(&root, "loaded.json", &loaded);
     assert_eq!(loaded["case_count"], 3);
     let corpus = Path::new(loaded["corpus_path"].as_str().unwrap());
@@ -256,7 +270,12 @@ async fn real_nebula_produces_benchmark_results() {
             .arg("-module-storage")
             .arg(&storage)
             .env("NEBULA_API_TOKEN", NEBULA_TOKEN)
-            .env("NEBULA_REMOTE_REASONING", "0"),
+            .env("NEBULA_REMOTE_REASONING", "0")
+            .env_remove("MOONSHOT_API_KEY")
+            .env_remove("MOONSHOT_MODEL")
+            .env_remove("MOONSHOT_BASE_URL")
+            .env_remove("OPENAI_API_KEY")
+            .env_remove("ANTHROPIC_API_KEY"),
         root.join("nebula.log"),
     );
     let nebula_port = nebula.port("NEBULA_BACKEND_PORT=").await;
@@ -284,6 +303,7 @@ async fn real_nebula_produces_benchmark_results() {
     let mut benchmark_server = start_benchmark(&root, Some(nebula_port));
     let port = benchmark_server.port("BENCHMARK_BACKEND_PORT=").await;
     let base = format!("http://127.0.0.1:{port}/api/benchmarks/v1");
+    wait_for_initialization(&client, &base, "ready").await;
     let started = response(
         client
             .post(format!("{base}/runs"))
@@ -425,6 +445,8 @@ async fn real_nebula_cold_start_suite_prepares_indexes_and_runs_without_snapshot
     );
     let nebula_port = nebula.port("NEBULA_BACKEND_PORT=").await;
     let nebula_base = format!("http://127.0.0.1:{nebula_port}/api/nebula/v1");
+    assert!(!root.join("benchmark-data").exists());
+    assert_eq!(fs::read_dir(&corpus).unwrap().count(), 0);
     let mut benchmark_server = start_benchmark_with_corpus(&root, Some(nebula_port), Some(&corpus));
     let benchmark_port = benchmark_server.port("BENCHMARK_BACKEND_PORT=").await;
     let base = format!("http://127.0.0.1:{benchmark_port}/api/benchmarks/v1");
@@ -433,14 +455,55 @@ async fn real_nebula_cold_start_suite_prepares_indexes_and_runs_without_snapshot
         .timeout(Duration::from_secs(30))
         .build()
         .unwrap();
-    assert!(
-        response(client.get(format!("{base}/benchmarks")), 200)
-            .await
-            .as_array()
-            .unwrap()
-            .is_empty()
+    let initialization = wait_for_initialization(&client, &base, "ready").await;
+    save_json(&root, "initialization.json", &initialization);
+    nebula.assert_running();
+    benchmark_server.assert_running();
+
+    // Startup must prepare the supported YAML dataset and index the passages
+    // before any experiment is created or any suite request has been sent.
+    let snapshots = response(client.get(format!("{base}/benchmarks")), 200).await;
+    assert_eq!(snapshots.as_array().unwrap().len(), 1);
+    assert_eq!(snapshots[0]["case_count"], 3);
+    let benchmark_id = snapshots[0]["id"].as_str().unwrap();
+    let snapshot = response(client.get(format!("{base}/benchmarks/{benchmark_id}")), 200).await;
+    save_json(&root, "benchmark.json", &snapshot);
+    let benchmark: Benchmark = serde_json::from_value(snapshot).unwrap();
+    assert_eq!(benchmark.documents.len(), 3);
+    assert_eq!(fs::read_dir(&corpus).unwrap().count(), 3);
+    for document in &benchmark.documents {
+        assert_eq!(
+            fs::read_to_string(corpus.join(&document.filename)).unwrap(),
+            document.text
+        );
+        assert!(!document.text.contains("HISTORICAL_OUTPUT_NOT_FOR_INDEXING"));
+    }
+    let initialized_workspace = response(
+        client
+            .get(format!("{nebula_base}/workspace"))
+            .bearer_auth(NEBULA_TOKEN),
+        200,
+    )
+    .await;
+    save_json(&root, "initialized-workspace.json", &initialized_workspace);
+    assert_eq!(initialized_workspace["status"]["phase"], "ready");
+    assert_eq!(
+        initialized_workspace["sources"].as_array().unwrap().len(),
+        3
     );
-    assert_eq!(fs::read_dir(&corpus).unwrap().count(), 0);
+    for document in &benchmark.documents {
+        assert!(
+            initialized_workspace["sources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|source| {
+                    source["title"] == document.filename
+                        && source["revision"] == document.revision
+                        && source["indexed"] == true
+                })
+        );
+    }
     assert!(
         response(client.get(format!("{base}/suite-runs")), 200)
             .await
@@ -448,17 +511,42 @@ async fn real_nebula_cold_start_suite_prepares_indexes_and_runs_without_snapshot
             .unwrap()
             .is_empty()
     );
+    assert_eq!(
+        response(client.get(format!("{base}/results")), 200).await,
+        json!({"benchmarks":[]})
+    );
+    for route in ["runs", "answer-runs"] {
+        assert!(
+            response(client.get(format!("{base}/{route}")), 200)
+                .await
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+    let registry: Value =
+        serde_json::from_reader(File::open(root.join("benchmark-data/results/runs.json")).unwrap())
+            .unwrap();
+    save_json(&root, "initialized-run-registry.json", &registry);
+    assert_eq!(registry["next_run_number"], 1);
+    assert!(registry["runs"].as_object().unwrap().is_empty());
+    assert!(
+        registry
+            .get("suite_runs")
+            .is_none_or(|runs| runs.as_object().unwrap().is_empty())
+    );
 
     let accepted = response(
         client.post(format!("{base}/suite-runs")).json(&json!({
-            "architecture_label":"real-nebula-cold-start", "description":"Prepare and index the local fixture on first use",
+            "architecture_label":"real-nebula-cold-start", "description":"Run the local fixture already prepared and indexed at startup",
             "profile_id":null
         })), 202,
     ).await;
     save_json(&root, "accepted-suite.json", &accepted);
     assert_eq!(accepted["phase"], "preparing");
+    assert_eq!(accepted["run_number"], 1);
     assert_eq!(accepted["preparations"].as_array().unwrap().len(), 1);
-    assert!(accepted["preparations"][0]["benchmark_id"].is_null());
+    assert_eq!(accepted["preparations"][0]["benchmark_id"], benchmark_id);
     let suite_id = accepted["id"].as_str().unwrap();
     let deadline = Instant::now() + TIMEOUT;
     let suite = loop {
@@ -485,23 +573,10 @@ async fn real_nebula_cold_start_suite_prepares_indexes_and_runs_without_snapshot
         preparation["configuration"]["definition"]["defaults"]["limit"],
         3
     );
-    let benchmark_id = preparation["benchmark_id"].as_str().unwrap();
-    let snapshots = response(client.get(format!("{base}/benchmarks")), 200).await;
-    assert_eq!(snapshots.as_array().unwrap().len(), 1);
-    assert_eq!(snapshots[0]["id"], benchmark_id);
-    assert_eq!(snapshots[0]["case_count"], 3);
-    let snapshot = response(client.get(format!("{base}/benchmarks/{benchmark_id}")), 200).await;
-    save_json(&root, "benchmark.json", &snapshot);
-    let benchmark: Benchmark = serde_json::from_value(snapshot).unwrap();
-    assert_eq!(benchmark.documents.len(), 3);
-    assert_eq!(fs::read_dir(&corpus).unwrap().count(), 3);
-    for document in &benchmark.documents {
-        assert_eq!(
-            fs::read_to_string(corpus.join(&document.filename)).unwrap(),
-            document.text
-        );
-        assert!(!document.text.contains("HISTORICAL_OUTPUT_NOT_FOR_INDEXING"));
-    }
+    assert_eq!(preparation["benchmark_id"], benchmark_id);
+    let snapshots_after_suite = response(client.get(format!("{base}/benchmarks")), 200).await;
+    assert_eq!(snapshots_after_suite.as_array().unwrap().len(), 1);
+    assert_eq!(snapshots_after_suite[0]["id"], benchmark_id);
     let items = suite["items"].as_array().unwrap();
     let retrieval = items
         .iter()

@@ -7,7 +7,13 @@ import {
   type Catalog,
 } from './benchmark-api';
 import { createAnswerApi, type AnswerApi, type AnswerRuntime } from './answer-api';
-import { createResultsApi, type Results, type ResultsApi, type SuiteRun } from './results-api';
+import {
+  createResultsApi,
+  type Initialization,
+  type Results,
+  type ResultsApi,
+  type SuiteRun,
+} from './results-api';
 import { AnswerDashboard } from './answer-dashboard';
 import { RetrievalDashboard } from './retrieval-dashboard';
 import { usePolling } from './use-polling';
@@ -32,12 +38,14 @@ interface WorkspaceData {
   snapshots: BenchmarkInfo[];
   results: Results;
   suites: SuiteRun[];
+  initialization: Initialization | null;
 }
 const EMPTY: WorkspaceData = {
   catalog: { benchmarks: {} },
   snapshots: [],
   results: { benchmarks: [] },
   suites: [],
+  initialization: null,
 };
 const PAGE_SIZE = 25;
 const STATUSES = ['running', 'completed', 'failed', 'interrupted'];
@@ -144,13 +152,14 @@ export function BenchmarkDashboard({
   }, [showRunForm]);
   const load = useCallback(
     async (signal: AbortSignal) => {
-      const [catalog, snapshots, results, suites] = await Promise.all([
+      const [catalog, snapshots, results, suites, initialization] = await Promise.all([
         benchmarkApi.getCatalog(signal),
         benchmarkApi.listBenchmarks(signal),
         tablesApi.getResults(signal),
         tablesApi.listSuites(signal),
+        tablesApi.getInitialization(signal),
       ]);
-      return { catalog, snapshots, results, suites };
+      return { catalog, snapshots, results, suites, initialization };
     },
     [benchmarkApi, tablesApi],
   );
@@ -160,7 +169,8 @@ export function BenchmarkDashboard({
     [generatedApi],
   );
   const runtime = usePolling<AnswerRuntime | null>(loadRuntime, null, pollInterval);
-  const { catalog, snapshots, results, suites } = workspace.data;
+  const { catalog, snapshots, results, suites, initialization } = workspace.data;
+  const initializationReady = initialization?.status === 'ready';
   useEffect(() => {
     if (acceptedSuite && suites.some((suite) => suite.id === acceptedSuite.id)) {
       setAcceptedSuite(null);
@@ -285,6 +295,23 @@ export function BenchmarkDashboard({
     snapshots.some((item) =>
       ['paired_context_recovery_v1', 'hotpotqa_answer_v1'].includes(item.metric_kind),
     );
+  if (initialization?.status === 'initializing') {
+    const preparing =
+      initialization.preparations.find((item) => item.status === 'running') ??
+      initialization.preparations.find((item) => item.status === 'queued');
+    statusNotice =
+      initialization.phase === 'indexing'
+        ? 'Indexing benchmark passages in Nebula.'
+        : preparing
+          ? `Preparing benchmarks: ${displayName(preparing.benchmark, definitions.get(preparing.benchmark))}.`
+          : 'Preparing benchmark datasets.';
+    if (initialization.phase === 'preparing' && preparing?.reason)
+      statusNotice += ` ${preparing.reason}`;
+  } else if (initialization?.status === 'failed') {
+    statusNotice = '';
+  } else if (workspace.connected && initializationReady && !statusNotice && hasRunnable) {
+    statusNotice = 'Benchmark initialization complete. Ready to run.';
+  }
   const selection = useRef({ ids: new Set<string>(), runIds: new Set<string>() });
   selection.current = {
     ids: new Set(selectedSnapshots.map((item) => item.id)),
@@ -358,7 +385,15 @@ export function BenchmarkDashboard({
   }
   function startSuite(event: React.FormEvent) {
     event.preventDefault();
-    if (!workspace.connected || active || pending || !hasRunnable || !runtimeSettled) return;
+    if (
+      !workspace.connected ||
+      !initializationReady ||
+      active ||
+      pending ||
+      !hasRunnable ||
+      !runtimeSettled
+    )
+      return;
     if (!architecture.trim() || new TextEncoder().encode(architecture.trim()).length > 256) {
       setActionError('Architecture label must contain 1–256 UTF-8 bytes.');
       return;
@@ -476,9 +511,11 @@ export function BenchmarkDashboard({
                       : entry?.adapter === 'external_suite'
                         ? 'Integration required'
                         : prepared.has(key)
-                          ? 'Ready to run'
+                          ? initializationReady
+                            ? 'Ready to run'
+                            : 'Snapshot prepared'
                           : supportsPreparation(entry)
-                            ? 'Prepares on run'
+                            ? 'Prepares at startup'
                             : 'Not prepared'}
                   </span>
                 </span>
@@ -508,6 +545,13 @@ export function BenchmarkDashboard({
               {actionError}
             </p>
           )}
+          {initialization?.status === 'failed' && (
+            <p className={styles.error} role="alert">
+              Benchmark initialization failed.{' '}
+              {initialization.error || 'Check the benchmark backend log for details.'} Restart the
+              benchmark backend to retry initialization.
+            </p>
+          )}
           {statusNotice && (
             <p className={styles.notice} role="status">
               {statusNotice}
@@ -531,10 +575,10 @@ export function BenchmarkDashboard({
                 </button>
               </div>
               <p className={styles.muted}>
-                Choose Start suite run below to prepare missing datasets, index their passages in
-                Nebula, and test every supported benchmark in sequence. Retrieval and answer results
-                are saved separately under the same run number. Catalog-only benchmarks and
-                unavailable evaluations are recorded as skipped.
+                The backend prepares datasets and indexes their passages in Nebula at startup.
+                Choose Start suite run below to test every supported benchmark in sequence.
+                Retrieval and answer results are saved separately under the same run number.
+                Catalog-only benchmarks and unavailable evaluations are recorded as skipped.
               </p>
               <div className={styles.suiteFields}>
                 <label>
@@ -585,23 +629,37 @@ export function BenchmarkDashboard({
               )}
               {runtime.connected && profile && !runtime.data?.available && (
                 <p className={styles.muted}>
-                  {runtime.data?.reason || 'Nebula is not ready yet.'} The suite prepares and
-                  indexes the benchmark passages before evaluating answers.
+                  {runtime.data?.reason || 'Nebula is not ready yet.'} Answer evaluation waits for
+                  the configured generation runtime.
                 </p>
               )}
               <p className={styles.muted}>
-                Reuses existing snapshots or downloads missing datasets using the team’s YAML
-                definitions. Generation uses the configured provider.
+                Uses the snapshots prepared from the team’s YAML definitions. Generation uses the
+                configured provider.
               </p>
               <button
                 type="submit"
                 className={styles.primaryButton}
                 disabled={
-                  pending || active || !workspace.connected || !hasRunnable || !runtimeSettled
+                  pending ||
+                  active ||
+                  !workspace.connected ||
+                  !initializationReady ||
+                  !hasRunnable ||
+                  !runtimeSettled
                 }
               >
                 {pending ? 'Starting…' : 'Start suite run'}
               </button>
+              {!initializationReady && (
+                <p className={styles.muted}>
+                  {initialization?.status === 'failed'
+                    ? 'Resolve the startup failure before starting a suite.'
+                    : initialization
+                      ? 'Benchmark initialization must finish before a suite can start.'
+                      : 'Checking benchmark initialization…'}
+                </p>
+              )}
               {!hasRunnable && (
                 <p className={styles.muted}>
                   No supported benchmark definitions or snapshots are available.
@@ -820,7 +878,7 @@ export function BenchmarkDashboard({
                               definition?.evaluation === 'hotpotqa_answer_v1'
                               ? 'This benchmark evaluates generated answers. Switch to Generated answers.'
                               : 'Start a suite run to save results for this benchmark.'
-                            : 'Start a suite run to prepare this benchmark and save its results.'}
+                            : 'The backend prepares this benchmark automatically at startup.'}
                     </p>
                   </div>
                 )}
@@ -965,7 +1023,7 @@ export function BenchmarkDashboard({
               <summary>Benchmark setup &amp; snapshots</summary>
               <p>
                 {supportsPreparation(definition)
-                  ? 'Starting a suite prepares missing snapshots and indexes their passages in Nebula automatically.'
+                  ? 'The backend prepares missing snapshots and indexes their passages in Nebula automatically at startup.'
                   : (definition?.preparation ??
                     'This benchmark needs a backend integration before it can run.')}
               </p>

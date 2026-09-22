@@ -113,13 +113,7 @@ struct Workspace {
 }
 
 async fn index(config: &NebulaConfig, documents: &BTreeMap<String, String>) -> Result<()> {
-    let client = Client::builder()
-        .timeout(Duration::from_secs(15))
-        .connect_timeout(Duration::from_secs(5))
-        .redirect(reqwest::redirect::Policy::none())
-        .no_proxy()
-        .build()
-        .map_err(|_| Error("Cannot create Nebula indexing client".into()))?;
+    let client = client()?;
     let base = config.base_url.trim_end_matches('/');
     loop {
         let response = client
@@ -141,8 +135,13 @@ async fn index(config: &NebulaConfig, documents: &BTreeMap<String, String>) -> R
             status => return Err(Error(format!("Nebula indexing request failed with HTTP {}", status.as_u16()))),
         }
     }
+    wait_ready(&client, config).await?;
+    verify_documents(&client, config, documents).await
+}
+
+async fn wait_ready(client: &Client, config: &NebulaConfig) -> Result<()> {
     loop {
-        let status: KnowledgeStatus = get(&client, config, "knowledge/status").await?;
+        let status: KnowledgeStatus = get(client, config, "knowledge/status").await?;
         match status.status.phase.as_str() {
             "ready" => break,
             "initializing" => tokio::time::sleep(POLL_INTERVAL).await,
@@ -154,7 +153,50 @@ async fn index(config: &NebulaConfig, documents: &BTreeMap<String, String>) -> R
             }
         }
     }
-    let workspace: Workspace = get(&client, config, "workspace").await?;
+    Ok(())
+}
+
+fn client() -> Result<Client> {
+    Client::builder()
+        .timeout(Duration::from_secs(15))
+        .connect_timeout(Duration::from_secs(5))
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .build()
+        .map_err(|_| Error("Cannot create Nebula indexing client".into()))
+}
+
+/// Verify an externally managed, already indexed corpus without requiring write access.
+pub(crate) async fn verify(config: &NebulaConfig, benchmarks: &[Benchmark]) -> Result<()> {
+    config.validate()?;
+    let mut documents = BTreeMap::new();
+    for benchmark in benchmarks {
+        for document in &benchmark.documents {
+            if let Some(revision) =
+                documents.insert(document.filename.clone(), document.revision.clone())
+                && revision != document.revision
+            {
+                return Err(Error(
+                    "Benchmark snapshots contain conflicting passage revisions".into(),
+                ));
+            }
+        }
+    }
+    let client = client()?;
+    tokio::time::timeout(INDEX_TIMEOUT, async {
+        wait_ready(&client, config).await?;
+        verify_documents(&client, config, &documents).await
+    })
+    .await
+    .map_err(|_| Error("Nebula indexing did not finish within 30 minutes".into()))?
+}
+
+async fn verify_documents(
+    client: &Client,
+    config: &NebulaConfig,
+    documents: &BTreeMap<String, String>,
+) -> Result<()> {
+    let workspace: Workspace = get(client, config, "workspace").await?;
     if workspace.status.phase != "ready"
         || documents.iter().any(|(name, revision)| {
             workspace

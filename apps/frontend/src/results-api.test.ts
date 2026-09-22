@@ -36,6 +36,48 @@ function respond(body: unknown, status = 200) {
 }
 
 describe('results and suite API', () => {
+  it('reads and validates backend initialization, including unavailable older servers', async () => {
+    const initializing = {
+      status: 'initializing',
+      phase: 'preparing',
+      error: null,
+      preparations: [
+        {
+          benchmark: 'hotpotqa',
+          benchmark_id: null,
+          status: 'running',
+          reason: 'Downloading dataset',
+        },
+      ],
+    };
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(respond(initializing))
+      .mockResolvedValueOnce(respond({ ...initializing, phase: 'indexing' }))
+      .mockResolvedValueOnce(
+        respond({ status: 'ready', phase: 'ready', preparations: [], error: null }),
+      )
+      .mockResolvedValueOnce(
+        respond({ status: 'failed', phase: 'failed', preparations: [], error: 'Download failed' }),
+      )
+      .mockResolvedValueOnce(respond({ ...initializing, status: 'ready' }))
+      .mockResolvedValueOnce(respond({ ...initializing, preparations: [{}] }))
+      .mockResolvedValueOnce(respond({}, 404));
+    const api = createResultsApi(fetcher);
+    expect(await api.getInitialization()).toEqual(initializing);
+    expect(fetcher.mock.calls[0][0]).toBe('/api/benchmarks/v1/initialization');
+    expect(await api.getInitialization()).toMatchObject({ phase: 'indexing' });
+    expect(await api.getInitialization()).toMatchObject({ status: 'ready' });
+    expect(await api.getInitialization()).toMatchObject({
+      status: 'failed',
+      error: 'Download failed',
+    });
+    await expect(api.getInitialization()).rejects.toThrow('Invalid benchmark response');
+    await expect(api.getInitialization()).rejects.toThrow('Invalid benchmark response');
+    await expect(api.getInitialization()).rejects.toThrow(
+      'Update and restart the benchmark backend',
+    );
+  });
   it('reads backend-owned run numbers and evaluator-specific metric columns', async () => {
     const body = {
       benchmarks: [
