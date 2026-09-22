@@ -66,14 +66,13 @@ enter renderer state or bundles. The benchmark API itself requires no token;
 `NEBULA_API_TOKEN` authenticates its calls to Nebula and must stay in backend
 configuration, outside Git and `VITE_` variables.
 
-Automatic startup leaves the snapshot store and dedicated corpus empty. Follow
+Automatic startup leaves the snapshot store and dedicated corpus empty. The first
+suite prepares missing supported datasets from YAML, publishes only their passage
+text, and waits for Nebula to index the combined corpus before running evaluations.
+The managed launcher configures this automatically; external Nebula owners can use
 the [backend instructions](../../README.md#automatic-nebula-startup-on-the-benchmarking-branch)
-to select model/corpus paths and prepare snapshots. Copy exported passages into
-the configured benchmark corpus. To run both RAGTruth and HotpotQA, index the
-combined exported corpus while preserving its filenames and bytes. The YAML
-catalog is read at startup and does not automatically load snapshots. Restart the
-dashboard development server after copying or changing corpus passages; Nebula
-indexes them during startup. Wait for indexing before running benchmarks.
+to grant the corpus directory and enable indexing. Dataset preparation remains
+backend-owned; the dashboard does not edit definitions or require manual snapshots.
 
 Release packaging excludes development module registrations, frontend assets,
 backend resources, and lifecycle hooks. `pnpm --filter @genesis/benchmarking build`
@@ -89,20 +88,22 @@ static build separately requires an equivalent proxy.
    for the current Nebula implementation or enter a label for a variant. Add optional run
    notes and select an enabled generation profile from the configured Nebula
    runtime. The UI waits for the initial runtime availability check before
-   allowing submission. Labels allow 1–256 UTF-8 bytes and notes up to 4000 bytes.
+   allowing submission. An enabled generation profile can be selected before
+   corpus indexing finishes. Labels allow 1–256 UTF-8 bytes and notes up to 4000 bytes.
    Clicking **Run all benchmarks** again keeps setup open; **Cancel** dismisses it.
 3. Choose **Start suite run** inside the form. The selected sidebar benchmark does
    not limit the run. The backend pins the latest prepared snapshot per canonical
-   benchmark module and
+   benchmark module, or prepares one from its pinned YAML definition when missing.
+   It publishes and indexes the supported benchmark passages, then
    executes every supported mode in sequence. RAGTruth supports retrieval and
    generation; HotpotQA supports generation. Retrieval uses saved snapshot top-k
    defaults; the current generation path uses top-k 8.
-4. The status above the selected results table names the active benchmark and
-   evaluation mode. The selected table stays selected while the suite runs other
+4. The status above the selected results table shows preparation and indexing,
+   then names the active benchmark and evaluation mode. The selected table stays selected while the suite runs other
    benchmarks; its next result appears when that benchmark starts. Open **Suite
    run history** for completed, failed, interrupted, or skipped outcomes.
-   Unprepared benchmarks, catalog-only integrations, and unavailable generation
-   are explicitly recorded as skipped. Selecting a suite
+   Catalog-only integrations and unavailable generation are explicitly recorded
+   as skipped. Preparation and indexing failures remain visible in suite history. Selecting a suite
    in history changes its progress/details disclosure, not the results filter.
 5. Use **Inspect** on an execution for compatible-run comparison, detailed
    settings/evidence, per-run CSV, and answer review. **Export benchmark CSV**

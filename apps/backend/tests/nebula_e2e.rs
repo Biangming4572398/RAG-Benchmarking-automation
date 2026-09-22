@@ -106,10 +106,19 @@ fn fixture(root: &Path) {
 }
 
 fn start_benchmark(root: &Path, nebula_port: Option<u16>) -> Process {
+    start_benchmark_with_corpus(root, nebula_port, None)
+}
+
+fn start_benchmark_with_corpus(
+    root: &Path,
+    nebula_port: Option<u16>,
+    corpus: Option<&Path>,
+) -> Process {
     let mut command = Command::new(env!("CARGO_BIN_EXE_backend"));
     command
         .env("BENCHMARK_ADDR", "127.0.0.1:0")
         .env_remove("BENCHMARK_API_TOKEN")
+        .env_remove("BENCHMARK_NEBULA_CORPUS")
         .env("BENCHMARK_DATA_DIR", root.join("benchmark-data"))
         .env("BENCHMARK_CATALOG", root.join("benchmarks.yaml"))
         .env_remove("NEBULA_API_BASE")
@@ -119,6 +128,9 @@ fn start_benchmark(root: &Path, nebula_port: Option<u16>) -> Process {
             "NEBULA_API_BASE",
             format!("http://127.0.0.1:{port}/api/nebula/v1"),
         );
+    }
+    if let Some(corpus) = corpus {
+        command.env("BENCHMARK_NEBULA_CORPUS", corpus);
     }
     let log = if nebula_port.is_some() {
         "benchmark-run.log"
@@ -360,4 +372,212 @@ async fn real_nebula_produces_benchmark_results() {
         }
     }
     println!("Completed real Nebula run {run_id}: {}", run["means"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires NEBULA_E2E_BINARY with -benchmark-reindex and an installed NEBULA_E2E_MODEL_DIR bundle"]
+async fn real_nebula_cold_start_suite_prepares_indexes_and_runs_without_snapshots() {
+    let binary = fs::canonicalize(
+        env::var_os("NEBULA_E2E_BINARY").expect("Set NEBULA_E2E_BINARY to a built nebula-backend"),
+    )
+    .unwrap();
+    let model =
+        fs::canonicalize(env::var_os("NEBULA_E2E_MODEL_DIR").expect(
+            "Set NEBULA_E2E_MODEL_DIR to an installed intfloat-multilingual-e5-small bundle",
+        ))
+        .unwrap();
+    let temporary;
+    let root = if let Some(parent) = env::var_os("NEBULA_E2E_ARTIFACT_DIR") {
+        fs::create_dir_all(&parent).unwrap();
+        tempfile::Builder::new()
+            .prefix("nebula-cold-suite-")
+            .tempdir_in(parent)
+            .unwrap()
+            .keep()
+    } else {
+        temporary = tempfile::tempdir().unwrap();
+        temporary.path().to_path_buf()
+    };
+    println!("Cold-start suite artifacts: {}", root.display());
+    fixture(&root);
+    let corpus = root.join("nebula-corpus");
+    fs::create_dir(&corpus).unwrap();
+    let storage = root.join("nebula-state");
+    copy_directory(
+        &model,
+        &storage.join("models/intfloat-multilingual-e5-small"),
+    );
+    let mut nebula = Process::start(
+        Command::new(binary)
+            .args(["-addr", "127.0.0.1:0", "-corpus"])
+            .arg(&corpus)
+            .arg("-module-storage")
+            .arg(&storage)
+            .arg("-benchmark-reindex")
+            .env("NEBULA_API_TOKEN", NEBULA_TOKEN)
+            .env("NEBULA_REMOTE_REASONING", "0")
+            .env_remove("MOONSHOT_API_KEY")
+            .env_remove("MOONSHOT_MODEL")
+            .env_remove("MOONSHOT_BASE_URL")
+            .env_remove("OPENAI_API_KEY")
+            .env_remove("ANTHROPIC_API_KEY"),
+        root.join("nebula.log"),
+    );
+    let nebula_port = nebula.port("NEBULA_BACKEND_PORT=").await;
+    let nebula_base = format!("http://127.0.0.1:{nebula_port}/api/nebula/v1");
+    let mut benchmark_server = start_benchmark_with_corpus(&root, Some(nebula_port), Some(&corpus));
+    let benchmark_port = benchmark_server.port("BENCHMARK_BACKEND_PORT=").await;
+    let base = format!("http://127.0.0.1:{benchmark_port}/api/benchmarks/v1");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap();
+    assert!(
+        response(client.get(format!("{base}/benchmarks")), 200)
+            .await
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(fs::read_dir(&corpus).unwrap().count(), 0);
+    assert!(
+        response(client.get(format!("{base}/suite-runs")), 200)
+            .await
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    let accepted = response(
+        client.post(format!("{base}/suite-runs")).json(&json!({
+            "architecture_label":"real-nebula-cold-start", "description":"Prepare and index the local fixture on first use",
+            "profile_id":null
+        })), 202,
+    ).await;
+    save_json(&root, "accepted-suite.json", &accepted);
+    assert_eq!(accepted["phase"], "preparing");
+    assert_eq!(accepted["preparations"].as_array().unwrap().len(), 1);
+    assert!(accepted["preparations"][0]["benchmark_id"].is_null());
+    let suite_id = accepted["id"].as_str().unwrap();
+    let deadline = Instant::now() + TIMEOUT;
+    let suite = loop {
+        nebula.assert_running();
+        benchmark_server.assert_running();
+        let suite = response(client.get(format!("{base}/suite-runs/{suite_id}")), 200).await;
+        save_json(&root, "suite.json", &suite);
+        if suite["status"] != "running" {
+            break suite;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Cold-start suite did not finish: {suite}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    assert_eq!(suite["status"], "completed", "{suite}");
+    assert_eq!(suite["phase"], "finished");
+    assert!(suite["error"].is_null());
+    let preparation = &suite["preparations"][0];
+    assert_eq!(preparation["status"], "completed");
+    assert_eq!(preparation["configuration"]["key"], "local-qa");
+    assert_eq!(
+        preparation["configuration"]["definition"]["defaults"]["limit"],
+        3
+    );
+    let benchmark_id = preparation["benchmark_id"].as_str().unwrap();
+    let snapshots = response(client.get(format!("{base}/benchmarks")), 200).await;
+    assert_eq!(snapshots.as_array().unwrap().len(), 1);
+    assert_eq!(snapshots[0]["id"], benchmark_id);
+    assert_eq!(snapshots[0]["case_count"], 3);
+    let snapshot = response(client.get(format!("{base}/benchmarks/{benchmark_id}")), 200).await;
+    save_json(&root, "benchmark.json", &snapshot);
+    let benchmark: Benchmark = serde_json::from_value(snapshot).unwrap();
+    assert_eq!(benchmark.documents.len(), 3);
+    assert_eq!(fs::read_dir(&corpus).unwrap().count(), 3);
+    for document in &benchmark.documents {
+        assert_eq!(
+            fs::read_to_string(corpus.join(&document.filename)).unwrap(),
+            document.text
+        );
+        assert!(!document.text.contains("HISTORICAL_OUTPUT_NOT_FOR_INDEXING"));
+    }
+    let items = suite["items"].as_array().unwrap();
+    let retrieval = items
+        .iter()
+        .find(|item| item["mode"] == "retrieval")
+        .unwrap();
+    assert_eq!(retrieval["status"], "completed");
+    assert_eq!(retrieval["benchmark_id"], benchmark_id);
+    let generation = items
+        .iter()
+        .find(|item| item["mode"] == "generation")
+        .unwrap();
+    assert_eq!(generation["status"], "skipped");
+    assert!(generation["run_id"].is_null());
+    assert!(
+        response(client.get(format!("{base}/answer-runs")), 200)
+            .await
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let run_id = retrieval["run_id"].as_str().unwrap();
+    let run = response(client.get(format!("{base}/runs/{run_id}")), 200).await;
+    save_json(&root, "run.json", &run);
+    assert_eq!(run["status"], "completed", "{run}");
+    assert_eq!(run["completed"], 3);
+    assert_eq!(run["failed"], 0);
+    assert_eq!(run["means"]["context_hit_at_k"], 1.0);
+    assert_eq!(run["source_ids"].as_array().unwrap().len(), 3);
+    assert_eq!(run["benchmark_fingerprint"], snapshots[0]["fingerprint"]);
+    let workspace = response(
+        client
+            .get(format!("{nebula_base}/workspace"))
+            .bearer_auth(NEBULA_TOKEN),
+        200,
+    )
+    .await;
+    save_json(&root, "workspace.json", &workspace);
+    assert_eq!(workspace["status"]["phase"], "ready");
+    assert_eq!(run["scope"], workspace["scope"]);
+    assert_eq!(run["watermark"], workspace["status"]["watermark"]);
+    for document in &benchmark.documents {
+        assert!(
+            workspace["sources"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|source| {
+                    source["title"] == document.filename
+                        && source["revision"] == document.revision
+                        && source["indexed"] == true
+                })
+        );
+    }
+    let csv = client
+        .get(format!("{base}/runs/{run_id}/scores.csv"))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    fs::write(root.join("scores.csv"), &csv).unwrap();
+    let rows = csv::Reader::from_reader(csv.as_bytes())
+        .deserialize::<std::collections::BTreeMap<String, String>>()
+        .map(|row| row.unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 3);
+    assert!(
+        rows.iter()
+            .all(|row| row["status"] == "ok"
+                && row["context_hit_at_k"].parse::<f64>().unwrap() == 1.0)
+    );
+    println!(
+        "Completed real Nebula cold-start suite {suite_id}: {}",
+        run["means"]
+    );
 }

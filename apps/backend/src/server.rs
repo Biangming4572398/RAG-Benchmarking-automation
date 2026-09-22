@@ -1,5 +1,5 @@
 //! HTTP assembly and shared persistence/Nebula execution infrastructure.
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use axum::{
     Json, Router,
@@ -23,18 +23,29 @@ use crate::{
 struct AppState {
     store: Arc<Store>,
     nebula: Option<NebulaConfig>,
+    nebula_corpus: Option<PathBuf>,
     catalog: Catalog,
     run_slot: Arc<Semaphore>,
     load_slot: Arc<Semaphore>,
 }
 
 pub fn router(store: Arc<Store>, nebula: Option<NebulaConfig>, catalog: Catalog) -> Result<Router> {
+    router_with_corpus(store, nebula, catalog, None)
+}
+
+pub fn router_with_corpus(
+    store: Arc<Store>,
+    nebula: Option<NebulaConfig>,
+    catalog: Catalog,
+    nebula_corpus: Option<PathBuf>,
+) -> Result<Router> {
     if let Some(config) = &nebula {
         config.validate()?;
     }
     let state = Arc::new(AppState {
         store,
         nebula,
+        nebula_corpus,
         catalog,
         run_slot: Arc::new(Semaphore::new(1)),
         load_slot: Arc::new(Semaphore::new(1)),
@@ -213,13 +224,36 @@ async fn start_suite(
         )
     })?;
     let mut suite = crate::suite::plan(&state.store, &state.catalog, request)?;
+    let load_permit = state.load_slot.clone().try_acquire_owned().map_err(|_| {
+        ApiError(
+            StatusCode::CONFLICT,
+            "A benchmark is already loading".into(),
+        )
+    })?;
     state.store.create_suite(&mut suite)?;
     let accepted = suite.clone();
     tokio::spawn(async move {
         let _permit = permit;
         let id = suite.id;
         let worker_store = state.store.clone();
-        let outcome = tokio::spawn(crate::suite::execute(worker_store, config, suite)).await;
+        let corpus = state.nebula_corpus.clone();
+        let outcome = tokio::spawn(async move {
+            let needs_preparation = suite.preparations.iter().any(|item| {
+                item.benchmark_id.is_none() && item.status == crate::suite::SuiteItemStatus::Queued
+            });
+            let benchmarks = crate::suite::prepare(worker_store.clone(), &mut suite).await?;
+            drop(load_permit);
+            if !benchmarks.is_empty() {
+                if let Some(corpus) = corpus {
+                    suite.phase = crate::suite::SuitePhase::Indexing;
+                    worker_store.save_suite(&suite)?;
+                    crate::corpus::prepare(corpus, config.clone(), benchmarks).await?;
+                } else if needs_preparation {
+                    return Err(Error("Automatic indexing requires BENCHMARK_NEBULA_CORPUS pointing to Nebula's dedicated benchmark corpus. Start the dashboard through the managed launcher, or configure that directory and enable Nebula's -benchmark-reindex option.".into()));
+                }
+            }
+            crate::suite::execute(worker_store, config, suite).await
+        }).await;
         let error = match outcome {
             Ok(Ok(())) => return,
             Ok(Err(error)) => error.to_string(),
@@ -227,6 +261,7 @@ async fn start_suite(
         };
         if let Ok(mut failed) = state.store.suite(id) {
             failed.status = RunStatus::Failed;
+            failed.phase = crate::suite::SuitePhase::Finished;
             failed.error = Some(error.clone());
             failed.finished_at_ms = Some(crate::now_ms());
             for item in &mut failed.items {
@@ -236,6 +271,15 @@ async fn start_suite(
                 ) {
                     item.status = crate::suite::SuiteItemStatus::Failed;
                     item.reason = Some(error.clone());
+                }
+            }
+            for preparation in &mut failed.preparations {
+                if matches!(
+                    preparation.status,
+                    crate::suite::SuiteItemStatus::Queued | crate::suite::SuiteItemStatus::Running
+                ) {
+                    preparation.status = crate::suite::SuiteItemStatus::Failed;
+                    preparation.reason = Some(error.clone());
                 }
             }
             if let Err(error) = state.store.save_suite(&failed) {
@@ -577,6 +621,16 @@ mod persistence {
             // Reconcile queued and active suites after child executions have been recovered.
             for suite in results.registry.suite_runs.values_mut() {
                 if suite.status == RunStatus::Running {
+                    for preparation in &mut suite.preparations {
+                        if matches!(
+                            preparation.status,
+                            SuiteItemStatus::Queued | SuiteItemStatus::Running
+                        ) {
+                            preparation.status = SuiteItemStatus::Interrupted;
+                            preparation.reason =
+                                Some("Server stopped during benchmark preparation".into());
+                        }
+                    }
                     for item in &mut suite.items {
                         if matches!(
                             item.status,
@@ -601,6 +655,7 @@ mod persistence {
                         }
                     }
                     suite.status = RunStatus::Interrupted;
+                    suite.phase = crate::suite::SuitePhase::Finished;
                     suite.finished_at_ms = Some(crate::now_ms());
                     suite.error = Some(
                         "Server stopped before the suite completed; saved results are retained"

@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 pub mod benchmarks;
 pub mod config;
+mod corpus;
 pub mod server;
 pub mod suite;
 

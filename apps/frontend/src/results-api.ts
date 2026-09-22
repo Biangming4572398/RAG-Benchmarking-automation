@@ -26,6 +26,14 @@ export interface SuiteEntry {
   reason: string | null;
 }
 
+export interface SuitePreparation {
+  benchmark: string;
+  benchmark_id: string | null;
+  configuration?: unknown;
+  status: SuiteEntry['status'];
+  reason: string | null;
+}
+
 export interface SuiteRun {
   id: string;
   run_number: number;
@@ -35,6 +43,8 @@ export interface SuiteRun {
   finished_at_ms: number | null;
   error: string | null;
   items: SuiteEntry[];
+  phase?: 'preparing' | 'indexing' | 'running' | 'finished';
+  preparations?: SuitePreparation[];
 }
 
 export interface ResultsApi {
@@ -51,6 +61,8 @@ const text = (value: unknown): value is string => typeof value === 'string';
 const nullableText = (value: unknown) => value === null || text(value);
 const count = (value: unknown): value is number =>
   typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+const entryStatus = (value: unknown) =>
+  ['queued', 'running', 'completed', 'failed', 'interrupted', 'skipped'].includes(String(value));
 
 function results(value: unknown): value is Results {
   return (
@@ -93,6 +105,18 @@ function suite(value: unknown): value is SuiteRun {
     count(value.started_at_ms) &&
     (value.finished_at_ms === null || count(value.finished_at_ms)) &&
     nullableText(value.error) &&
+    (value.phase === undefined ||
+      ['preparing', 'indexing', 'running', 'finished'].includes(String(value.phase))) &&
+    (value.preparations === undefined ||
+      (Array.isArray(value.preparations) &&
+        value.preparations.every(
+          (preparation) =>
+            record(preparation) &&
+            text(preparation.benchmark) &&
+            nullableText(preparation.benchmark_id) &&
+            entryStatus(preparation.status) &&
+            nullableText(preparation.reason),
+        ))) &&
     Array.isArray(value.items) &&
     value.items.every(
       (entry) =>
@@ -100,9 +124,7 @@ function suite(value: unknown): value is SuiteRun {
         text(entry.benchmark) &&
         nullableText(entry.benchmark_id) &&
         (entry.mode === null || ['retrieval', 'generation'].includes(String(entry.mode))) &&
-        ['queued', 'running', 'completed', 'failed', 'interrupted', 'skipped'].includes(
-          String(entry.status),
-        ) &&
+        entryStatus(entry.status) &&
         nullableText(entry.run_id) &&
         nullableText(entry.reason),
     )

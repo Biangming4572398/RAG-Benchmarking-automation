@@ -116,6 +116,7 @@ describe('benchmark Nebula connection', () => {
       ...options.env,
       NEBULA_API_BASE: 'http://127.0.0.1:54321/api/nebula/v1',
       NEBULA_API_TOKEN: 'fixture-private-runtime-token',
+      BENCHMARK_NEBULA_CORPUS: started.corpusPath,
     });
     expect(options.env.NEBULA_API_TOKEN).toBeUndefined();
     expect(JSON.stringify(options.log.mock.calls)).not.toContain('fixture-private-runtime-token');

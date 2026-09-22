@@ -12,6 +12,8 @@ pub struct Config {
     pub data_dir: PathBuf,
     pub catalog_path: PathBuf,
     pub nebula: Option<NebulaConfig>,
+    /// Explicitly granted corpus for automatic suite publication and indexing.
+    pub nebula_corpus: Option<PathBuf>,
 }
 
 // Deliberately no Debug/Serialize: credentials never become dashboard data.
@@ -55,6 +57,9 @@ impl Config {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("benchmarks.yaml")),
             nebula,
+            nebula_corpus: env::var_os("BENCHMARK_NEBULA_CORPUS")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
         })
     }
 }

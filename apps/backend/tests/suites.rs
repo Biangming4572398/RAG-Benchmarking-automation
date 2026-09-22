@@ -10,7 +10,7 @@ use backend::{
     benchmarks::hotpotqa::AnswerReference,
     config::{Catalog, NebulaConfig},
     server::{Store, router},
-    suite::{self, StartSuiteRequest, SuiteItemStatus, SuiteMode, SuiteRun},
+    suite::{self, StartSuiteRequest, SuiteItemStatus, SuiteMode, SuitePhase, SuiteRun},
 };
 use serde_json::{Value, json};
 use std::{
@@ -97,10 +97,11 @@ fn suite_plan_pins_latest_snapshot_and_distinguishes_catalog_only_and_unprepared
         .iter()
         .filter(|item| item.status == SuiteItemStatus::Queued)
         .collect();
-    assert_eq!(runnable.len(), 2);
+    assert_eq!(runnable.len(), 3);
     assert!(
         runnable
             .iter()
+            .filter(|item| item.benchmark == "ragtruth-qa")
             .all(|item| item.benchmark_id == Some(latest.id))
     );
     let unprepared = plan
@@ -108,13 +109,17 @@ fn suite_plan_pins_latest_snapshot_and_distinguishes_catalog_only_and_unprepared
         .iter()
         .find(|item| item.benchmark == "hotpotqa")
         .unwrap();
-    assert!(
-        unprepared
-            .reason
-            .as_ref()
-            .unwrap()
-            .contains("No prepared snapshot")
-    );
+    assert_eq!(unprepared.status, SuiteItemStatus::Queued);
+    assert_eq!(unprepared.benchmark_id, None);
+    assert!(unprepared.reason.is_none());
+    assert_eq!(plan.phase, SuitePhase::Preparing);
+    let pending = plan
+        .preparations
+        .iter()
+        .find(|item| item.benchmark == "hotpotqa")
+        .unwrap();
+    assert_eq!(pending.status, SuiteItemStatus::Queued);
+    assert_eq!(pending.configuration.as_ref().unwrap().key, "hotpotqa");
     assert_eq!(
         plan.items
             .iter()
@@ -164,7 +169,7 @@ fn catalog_aliases_share_the_module_table_and_do_not_duplicate_suite_executions(
     let runnable: Vec<_> = suite
         .items
         .iter()
-        .filter(|item| item.status == SuiteItemStatus::Queued)
+        .filter(|item| item.status == SuiteItemStatus::Queued && item.benchmark == "ragtruth-qa")
         .collect();
     assert_eq!(runnable.len(), 2);
     assert!(
@@ -251,10 +256,14 @@ fn suite_recovery_preserves_global_numbers_descriptions_and_child_results() {
 }
 
 #[tokio::test]
-async fn suites_without_runnable_snapshots_fail_with_honest_skipped_reasons() {
+async fn suites_with_only_catalog_entries_fail_with_honest_skipped_reasons() {
     let root = tempfile::tempdir().unwrap();
     let store = Arc::new(Store::open(root.path()).unwrap());
-    let mut suite = suite::plan(&store, &catalog(), request()).unwrap();
+    let mut catalog = catalog();
+    catalog
+        .benchmarks
+        .retain(|_, definition| definition.adapter == "external_suite");
+    let mut suite = suite::plan(&store, &catalog, request()).unwrap();
     store.create_suite(&mut suite).unwrap();
     let id = suite.id;
     suite::execute(
@@ -597,4 +606,369 @@ async fn exercise_api(fail_retrieval: bool) {
         .await
         .unwrap();
     assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+}
+
+fn local_catalog(root: &std::path::Path) -> Catalog {
+    use polars::prelude::*;
+    let hotpot = root.join("hotpot.json");
+    std::fs::write(&hotpot, serde_json::to_vec(&json!([{
+        "_id":"local-hotpot", "question":"Where for hotpotqa?", "answer":"London",
+        "context":(0..10).map(|index| json!([format!("Passage {index}"),[format!("Local passage {index}")]])).collect::<Vec<_>>(),
+        "supporting_facts":[["Passage 0",0]]
+    }])).unwrap()).unwrap();
+    let ragtruth = root.join("ragtruth.parquet");
+    let mut frame = df!(
+        "id" => ["local-ragtruth"], "query" => ["Where for ragtruth?"],
+        "context" => ["A local context passage."], "output" => ["A historical response."],
+        "task_type" => ["QA"], "quality" => ["good"], "model" => ["historical-model"],
+        "hallucination_labels" => ["[]"]
+    )
+    .unwrap();
+    ParquetWriter::new(std::fs::File::create(&ragtruth).unwrap())
+        .finish(&mut frame)
+        .unwrap();
+    let mut catalog = catalog();
+    let definition = catalog.benchmarks.get_mut("ragtruth-qa").unwrap();
+    definition.source = ragtruth.to_string_lossy().into_owned();
+    definition.defaults.limit = 1;
+    let definition = catalog.benchmarks.get_mut("hotpotqa").unwrap();
+    definition.source = hotpot.to_string_lossy().into_owned();
+    definition.source_sha256 = None;
+    definition.defaults.limit = 1;
+    catalog
+}
+
+#[tokio::test]
+async fn cold_suite_prepares_pinned_definitions_once_and_shares_snapshots_between_modes() {
+    let root = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(&root.path().join("data")).unwrap());
+    let mut catalog = local_catalog(root.path());
+    let mut suite = suite::plan(&store, &catalog, request()).unwrap();
+    assert!(store.benchmarks().unwrap().is_empty());
+    assert_eq!(
+        suite
+            .items
+            .iter()
+            .filter(|item| item.status == SuiteItemStatus::Queued)
+            .count(),
+        3
+    );
+    assert!(
+        suite
+            .preparations
+            .iter()
+            .all(|item| item.status == SuiteItemStatus::Queued)
+    );
+    assert!(
+        suite::prepare(store.clone(), &mut suite).await.is_err(),
+        "Preparation requires a durable accepted suite"
+    );
+    store.create_suite(&mut suite).unwrap();
+    for definition in catalog.benchmarks.values_mut() {
+        definition.source = "changed-after-acceptance".into();
+    }
+    let ready = suite::prepare(store.clone(), &mut suite).await.unwrap();
+    assert_eq!(ready.len(), 2);
+    assert_eq!(store.benchmarks().unwrap().len(), 2);
+    assert!(
+        suite
+            .preparations
+            .iter()
+            .all(|item| item.status == SuiteItemStatus::Completed)
+    );
+    let ragtruth: Vec<_> = suite
+        .items
+        .iter()
+        .filter(|item| item.benchmark == "ragtruth-qa")
+        .collect();
+    assert_eq!(ragtruth.len(), 2);
+    assert!(ragtruth[0].benchmark_id.is_some());
+    assert_eq!(ragtruth[0].benchmark_id, ragtruth[1].benchmark_id);
+    for prepared in &ready {
+        assert_eq!(prepared.cases.len(), 1);
+        assert_ne!(prepared.source, "changed-after-acceptance");
+    }
+    let persisted = store.suite(suite.id).unwrap();
+    assert!(
+        persisted
+            .preparations
+            .iter()
+            .all(|item| item.benchmark_id.is_some())
+    );
+    let again = suite::prepare(store.clone(), &mut suite).await.unwrap();
+    assert_eq!(again.len(), 2);
+    assert_eq!(
+        store.benchmarks().unwrap().len(),
+        2,
+        "Reusing the pinned suite must not prepare twice"
+    );
+    assert!(store.runs().unwrap().is_empty());
+    assert!(store.answer_runs().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn preparation_failure_is_durable_and_does_not_cancel_later_benchmarks() {
+    let root = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(&root.path().join("data")).unwrap());
+    let mut catalog = local_catalog(root.path());
+    catalog.benchmarks.get_mut("hotpotqa").unwrap().source = root
+        .path()
+        .join("missing.json")
+        .to_string_lossy()
+        .into_owned();
+    let mut suite = suite::plan(&store, &catalog, request()).unwrap();
+    store.create_suite(&mut suite).unwrap();
+    let ready = suite::prepare(store.clone(), &mut suite).await.unwrap();
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].metric_kind, "paired_context_recovery_v1");
+    let persisted = store.suite(suite.id).unwrap();
+    let failed = persisted
+        .preparations
+        .iter()
+        .find(|item| item.benchmark == "hotpotqa")
+        .unwrap();
+    assert_eq!(failed.status, SuiteItemStatus::Failed);
+    assert!(
+        failed
+            .reason
+            .as_ref()
+            .unwrap()
+            .contains("Cannot read HotpotQA")
+    );
+    assert_eq!(
+        persisted
+            .items
+            .iter()
+            .find(|item| item.benchmark == "hotpotqa")
+            .unwrap()
+            .status,
+        SuiteItemStatus::Failed
+    );
+    assert_eq!(
+        persisted
+            .items
+            .iter()
+            .filter(|item| item.status == SuiteItemStatus::Queued)
+            .count(),
+        2
+    );
+    assert_eq!(store.benchmarks().unwrap().len(), 1);
+}
+
+#[test]
+fn missing_snapshots_pin_the_canonical_definition_and_legacy_suites_still_deserialize() {
+    let root = tempfile::tempdir().unwrap();
+    let store = Store::open(root.path()).unwrap();
+    let mut catalog = catalog();
+    let mut alias = catalog.benchmarks["ragtruth-qa"].clone();
+    alias.source = "alias-source.parquet".into();
+    catalog.benchmarks.insert("aaa-alias".into(), alias.clone());
+    let plan = suite::plan(&store, &catalog, request()).unwrap();
+    let preparation = plan
+        .preparations
+        .iter()
+        .find(|item| item.benchmark == "ragtruth-qa")
+        .unwrap();
+    assert_eq!(
+        preparation.configuration.as_ref().unwrap().key,
+        "ragtruth-qa"
+    );
+    catalog.benchmarks.remove("ragtruth-qa");
+    catalog.benchmarks.insert("zzz-alias".into(), alias);
+    let plan = suite::plan(&store, &catalog, request()).unwrap();
+    assert_eq!(
+        plan.preparations
+            .iter()
+            .find(|item| item.benchmark == "ragtruth-qa")
+            .unwrap()
+            .configuration
+            .as_ref()
+            .unwrap()
+            .key,
+        "aaa-alias"
+    );
+    let mut legacy = serde_json::to_value(plan).unwrap();
+    legacy.as_object_mut().unwrap().remove("phase");
+    legacy.as_object_mut().unwrap().remove("preparations");
+    let decoded: SuiteRun = serde_json::from_value(legacy).unwrap();
+    assert_eq!(decoded.phase, SuitePhase::Running);
+    assert!(decoded.preparations.is_empty());
+}
+
+struct ColdStartScript {
+    store: Arc<Store>,
+    corpus: std::path::PathBuf,
+    script: Arc<Script>,
+    indexed: std::sync::atomic::AtomicBool,
+}
+
+async fn cold_workspace(State(state): State<Arc<ColdStartScript>>) -> Json<Value> {
+    let indexed = state.indexed.load(std::sync::atomic::Ordering::SeqCst);
+    let documents: Vec<_> = state
+        .store
+        .benchmarks_by_saved_time()
+        .unwrap()
+        .into_iter()
+        .flat_map(|snapshot| snapshot.documents)
+        .collect();
+    Json(json!({
+        "scope":{"projectId":"suite-test"},
+        "status":{"phase":if indexed {"ready"} else {"initializing"},"watermark":{"generation":"stable"},
+            "model":{"id":"embedding","revision":"v1","phase":"ready"}},
+        "profiles":[{"id":"profile","label":"Test model","enabled":true}],
+        "sources":documents.iter().map(|doc| json!({"id":doc.id,"title":doc.filename,"revision":doc.revision,"indexed":indexed})).collect::<Vec<_>>()
+    }))
+}
+
+async fn cold_reindex(
+    State(state): State<Arc<ColdStartScript>>,
+    headers: axum::http::HeaderMap,
+) -> (StatusCode, Json<Value>) {
+    assert_eq!(headers["authorization"], "Bearer test-token");
+    let suites = state.store.suites().unwrap();
+    assert_eq!(
+        suites.len(),
+        1,
+        "The accepted suite must be durable before preparation"
+    );
+    assert_eq!(suites[0].phase, SuitePhase::Indexing);
+    assert!(
+        suites[0]
+            .preparations
+            .iter()
+            .all(|item| item.status == SuiteItemStatus::Completed)
+    );
+    let snapshots = state.store.benchmarks_by_saved_time().unwrap();
+    assert_eq!(snapshots.len(), 1);
+    let documents = &snapshots[0].documents;
+    assert_eq!(documents.len(), 10);
+    assert_eq!(
+        std::fs::read_dir(&state.corpus).unwrap().count(),
+        documents.len()
+    );
+    for document in documents {
+        assert!(document.filename.ends_with(".md"));
+        let text = std::fs::read_to_string(state.corpus.join(&document.filename)).unwrap();
+        assert_eq!(text, document.text);
+        assert!(
+            !text.contains("London"),
+            "Reference answers must never enter the corpus"
+        );
+        assert!(!text.contains("supporting_facts"));
+    }
+    assert!(
+        state.script.events.lock().unwrap().is_empty(),
+        "Queries must wait for publication and indexing"
+    );
+    state.script.events.lock().unwrap().push("reindex".into());
+    state
+        .indexed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    (StatusCode::ACCEPTED, Json(json!({"status":"initializing"})))
+}
+
+async fn cold_status(State(state): State<Arc<ColdStartScript>>) -> Json<Value> {
+    Json(
+        json!({"status":{"phase":if state.indexed.load(std::sync::atomic::Ordering::SeqCst) {"ready"} else {"initializing"}}}),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn first_suite_prepares_publishes_indexes_and_runs_from_an_empty_store() {
+    let root = tempfile::tempdir().unwrap();
+    let mut catalog = local_catalog(root.path());
+    catalog.benchmarks.retain(|key, _| key == "hotpotqa");
+    // Derive expected fixture passages without saving any prepared snapshot.
+    let fixture = backend::initialize_benchmark(
+        &catalog
+            .resolve(&backend::config::LoadRequest {
+                benchmark: "hotpotqa".into(),
+                limit: None,
+            })
+            .unwrap(),
+    )
+    .unwrap();
+    let store = Arc::new(Store::open(&root.path().join("data")).unwrap());
+    assert!(store.benchmarks().unwrap().is_empty());
+    let corpus = root.path().join("nebula-corpus");
+    let script = Arc::new(Script {
+        documents: fixture.documents,
+        conversations: Mutex::new(BTreeMap::new()),
+        events: Mutex::new(vec![]),
+        started: Notify::new(),
+        gate: Semaphore::new(1),
+        fail_retrieval: false,
+    });
+    let state = Arc::new(ColdStartScript {
+        store: store.clone(),
+        corpus: corpus.clone(),
+        script: script.clone(),
+        indexed: std::sync::atomic::AtomicBool::new(false),
+    });
+    let nebula = serve(
+        Router::new()
+            .route("/api/nebula/v1/workspace", get(cold_workspace))
+            .route("/api/nebula/v1/knowledge/reindex", post(cold_reindex))
+            .route("/api/nebula/v1/knowledge/status", get(cold_status))
+            .route(
+                "/api/nebula/v1/conversations",
+                post(
+                    |State(state): State<Arc<ColdStartScript>>, body: Json<Value>| async move {
+                        conversation(State(state.script.clone()), body).await
+                    },
+                ),
+            )
+            .route(
+                "/api/nebula/v1/query",
+                post(
+                    |State(state): State<Arc<ColdStartScript>>, body: Json<Value>| async move {
+                        query(State(state.script.clone()), body).await
+                    },
+                ),
+            )
+            .with_state(state),
+    )
+    .await;
+    let server = serve(
+        backend::server::router_with_corpus(
+            store.clone(),
+            Some(NebulaConfig {
+                base_url: format!("{}/api/nebula/v1", nebula.base),
+                token: "test-token".into(),
+            }),
+            catalog,
+            Some(corpus),
+        )
+        .unwrap(),
+    )
+    .await;
+    let base = format!("{}/api/benchmarks/v1", server.base);
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let accepted = client
+        .post(format!("{base}/suite-runs"))
+        .json(&request())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+    let accepted: SuiteRun = accepted.json().await.unwrap();
+    assert_eq!(accepted.phase, SuitePhase::Preparing);
+    assert_eq!(accepted.items[0].benchmark_id, None);
+    let finished = wait_suite(&client, &base, accepted.id).await;
+    assert_eq!(
+        finished.status,
+        RunStatus::Completed,
+        "{}",
+        serde_json::to_string(&finished).unwrap()
+    );
+    assert_eq!(finished.phase, SuitePhase::Finished);
+    assert_eq!(finished.preparations[0].status, SuiteItemStatus::Completed);
+    assert_eq!(finished.items[0].status, SuiteItemStatus::Completed);
+    assert!(finished.items[0].run_id.is_some());
+    assert_eq!(store.benchmarks().unwrap().len(), 1);
+    assert_eq!(store.answer_runs().unwrap().len(), 1);
+    assert_eq!(
+        script.events.lock().unwrap().as_slice(),
+        ["reindex", "hotpotqa generation"]
+    );
 }

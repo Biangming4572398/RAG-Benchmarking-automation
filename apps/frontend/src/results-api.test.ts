@@ -80,6 +80,39 @@ describe('results and suite API', () => {
       .mockResolvedValue(respond([{ ...suite, status: 'interrupted', finished_at_ms: 456 }]));
     expect(await createResultsApi(fetcher).listSuites()).toHaveLength(1);
   });
+  it('reads automatic preparation phases and rejects malformed preparation state', async () => {
+    const preparing = {
+      ...suite,
+      phase: 'preparing',
+      preparations: [
+        {
+          benchmark: 'ragtruth-qa',
+          benchmark_id: null,
+          configuration: { key: 'ragtruth-qa', definition: {} },
+          status: 'running',
+          reason: 'Downloading dataset',
+        },
+      ],
+    };
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(respond(preparing, 202))
+      .mockResolvedValueOnce(respond([{ ...preparing, phase: 'indexing' }]))
+      .mockResolvedValueOnce(respond([{ ...preparing, phase: 'unknown' }]))
+      .mockResolvedValueOnce(
+        respond([
+          {
+            ...preparing,
+            preparations: [{ ...preparing.preparations[0], status: 'unknown' }],
+          },
+        ]),
+      );
+    const api = createResultsApi(fetcher);
+    expect(await api.startSuite({ architecture_label: 'baseline' })).toEqual(preparing);
+    expect(await api.listSuites()).toEqual([{ ...preparing, phase: 'indexing' }]);
+    await expect(api.listSuites()).rejects.toThrow('Invalid benchmark response');
+    await expect(api.listSuites()).rejects.toThrow('Invalid benchmark response');
+  });
   it('rejects malformed results and suite responses', async () => {
     const fetcher = vi
       .fn<typeof fetch>()

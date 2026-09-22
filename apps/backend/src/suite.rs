@@ -6,8 +6,8 @@ use uuid::Uuid;
 
 use crate::{
     Benchmark, Error, Result, RunStatus, StartAnswerRunRequest, StartFailure, StartRunRequest,
-    config::{Catalog, NebulaConfig},
-    module_for_definition, module_for_snapshot, now_ms,
+    config::{Catalog, LoadRequest, NebulaConfig, ResolvedBenchmark},
+    initialize_benchmark, module_for_definition, module_for_snapshot, now_ms,
     server::Store,
 };
 
@@ -58,7 +58,31 @@ pub struct SuiteRun {
     pub started_at_ms: u64,
     pub finished_at_ms: Option<u64>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub phase: SuitePhase,
+    #[serde(default)]
+    pub preparations: Vec<SuitePreparation>,
     pub items: Vec<SuiteItem>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SuitePhase {
+    Preparing,
+    Indexing,
+    #[default]
+    Running,
+    Finished,
+}
+
+/// Definitions are resolved when the suite is accepted, before any download begins.
+#[derive(Clone, Deserialize, Serialize)]
+pub struct SuitePreparation {
+    pub benchmark: String,
+    pub benchmark_id: Option<Uuid>,
+    pub configuration: Option<ResolvedBenchmark>,
+    pub status: SuiteItemStatus,
+    pub reason: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -100,14 +124,26 @@ pub struct SuiteItem {
     pub reason: Option<String>,
 }
 
-/// Snapshot choice is fixed before accepting a suite and survives catalog edits/restarts.
+/// Snapshot choices and missing-dataset definitions are fixed before accepting a suite.
 pub fn plan(store: &Store, catalog: &Catalog, request: StartSuiteRequest) -> Result<SuiteRun> {
     request.validate()?;
     let mut snapshots: BTreeMap<String, Benchmark> = BTreeMap::new();
     let mut modules = BTreeMap::new();
+    let mut definitions = BTreeMap::new();
     for (key, definition) in &catalog.benchmarks {
         let module = module_for_definition(Some(key), definition)?;
-        modules.insert(module.key().to_string(), module);
+        let canonical = module.key().to_string();
+        modules.insert(canonical.clone(), module);
+        // Prefer the canonical entry; otherwise the first sorted alias wins.
+        if key == module.key() || !definitions.contains_key(&canonical) {
+            definitions.insert(
+                canonical,
+                catalog.resolve(&LoadRequest {
+                    benchmark: key.clone(),
+                    limit: None,
+                })?,
+            );
+        }
     }
     // Store sorts oldest first by save time, then UUID for deterministic ties.
     // Catalog aliases share the canonical module key used by comparison tables.
@@ -117,6 +153,7 @@ pub fn plan(store: &Store, catalog: &Catalog, request: StartSuiteRequest) -> Res
         snapshots.insert(module.key().to_string(), benchmark);
     }
     let mut items = Vec::new();
+    let mut preparations = Vec::new();
     // Include prepared snapshots whose definitions were removed from the current catalog.
     for (key, module) in modules {
         let benchmark = snapshots.get(&key);
@@ -135,14 +172,23 @@ pub fn plan(store: &Store, catalog: &Catalog, request: StartSuiteRequest) -> Res
                 ),
                 ..base
             });
-        } else if benchmark.is_none() {
-            items.push(SuiteItem {
-                reason: Some(
-                    "No prepared snapshot; prepare this benchmark before running the suite".into(),
-                ),
-                ..base
-            });
         } else {
+            let executable = module.supports_retrieval() || request.profile_id.is_some();
+            preparations.push(SuitePreparation {
+                benchmark: key.clone(),
+                benchmark_id: benchmark.map(|value| value.id),
+                configuration: benchmark
+                    .and_then(|value| value.configuration.clone())
+                    .or_else(|| definitions.get(&key).cloned()),
+                status: if !executable {
+                    SuiteItemStatus::Skipped
+                } else if benchmark.is_some() {
+                    SuiteItemStatus::Completed
+                } else {
+                    SuiteItemStatus::Queued
+                },
+                reason: (!executable).then(|| "No generation profile selected".into()),
+            });
             if module.supports_retrieval() {
                 items.push(SuiteItem {
                     mode: Some(SuiteMode::Retrieval),
@@ -176,11 +222,103 @@ pub fn plan(store: &Store, catalog: &Catalog, request: StartSuiteRequest) -> Res
         started_at_ms: now_ms(),
         finished_at_ms: None,
         error: None,
+        phase: SuitePhase::Preparing,
+        preparations,
         items,
     })
 }
 
+/// Prepare each missing dataset once, then return only snapshots with queued executions.
+/// The caller publishes this corpus and waits for indexing before calling `execute`.
+pub async fn prepare(store: Arc<Store>, suite: &mut SuiteRun) -> Result<Vec<Benchmark>> {
+    if suite.run_number == 0 {
+        return Err(Error(
+            "Persist the accepted suite before preparing its datasets".into(),
+        ));
+    }
+    suite.phase = SuitePhase::Preparing;
+    store.save_suite(suite)?;
+    let mut snapshots = BTreeMap::new();
+    for index in 0..suite.preparations.len() {
+        let preparation = suite.preparations[index].clone();
+        if !suite.items.iter().any(|item| {
+            item.benchmark == preparation.benchmark && item.status == SuiteItemStatus::Queued
+        }) {
+            continue;
+        }
+        suite.preparations[index].status = SuiteItemStatus::Running;
+        suite.preparations[index].reason = None;
+        store.save_suite(suite)?;
+        let result = if let Some(id) = preparation.benchmark_id {
+            store.benchmark(id)
+        } else if let Some(configuration) = preparation.configuration {
+            let worker_store = store.clone();
+            match tokio::task::spawn_blocking(move || {
+                let benchmark = initialize_benchmark(&configuration)?;
+                worker_store.save_benchmark(&benchmark)?;
+                Ok::<_, Error>(benchmark)
+            })
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(Error(
+                    "Benchmark preparation worker stopped unexpectedly".into(),
+                )),
+            }
+        } else {
+            Err(Error(
+                "No pinned catalog definition is available to prepare this benchmark".into(),
+            ))
+        };
+        let result = result.and_then(|benchmark| {
+            if module_for_snapshot(&benchmark)?.key() != preparation.benchmark {
+                return Err(Error(
+                    "Prepared snapshot does not match its suite benchmark".into(),
+                ));
+            }
+            Ok(benchmark)
+        });
+        match result {
+            Ok(benchmark) => {
+                suite.preparations[index].benchmark_id = Some(benchmark.id);
+                suite.preparations[index].status = SuiteItemStatus::Completed;
+                for item in &mut suite.items {
+                    if item.benchmark == preparation.benchmark {
+                        item.benchmark_id = Some(benchmark.id);
+                    }
+                }
+                snapshots.insert(benchmark.id, benchmark);
+            }
+            Err(error) => {
+                suite.preparations[index].status = SuiteItemStatus::Failed;
+                suite.preparations[index].reason = Some(error.to_string());
+                for item in &mut suite.items {
+                    if item.benchmark == preparation.benchmark
+                        && item.status == SuiteItemStatus::Queued
+                    {
+                        item.status = SuiteItemStatus::Failed;
+                        item.reason = Some(format!("Dataset preparation failed: {error}"));
+                    }
+                }
+            }
+        }
+        store.save_suite(suite)?;
+    }
+    // Old saved suites predate preparation records, but already pin prepared snapshots.
+    for item in &suite.items {
+        if item.status == SuiteItemStatus::Queued
+            && let Some(id) = item.benchmark_id
+            && !snapshots.contains_key(&id)
+        {
+            snapshots.insert(id, store.benchmark(id)?);
+        }
+    }
+    Ok(snapshots.into_values().collect())
+}
+
 pub async fn execute(store: Arc<Store>, config: NebulaConfig, mut suite: SuiteRun) -> Result<()> {
+    suite.phase = SuitePhase::Running;
+    store.save_suite(&suite)?;
     for index in 0..suite.items.len() {
         if suite.items[index].status != SuiteItemStatus::Queued {
             continue;
@@ -210,6 +348,7 @@ pub async fn execute(store: Arc<Store>, config: NebulaConfig, mut suite: SuiteRu
         RunStatus::Completed
     };
     suite.finished_at_ms = Some(now_ms());
+    suite.phase = SuitePhase::Finished;
     store.save_suite(&suite)
 }
 

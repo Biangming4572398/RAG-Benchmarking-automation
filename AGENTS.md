@@ -77,6 +77,12 @@ introduce a database stack for this mapping.
 Application initialization belongs in `main.rs`. The bundled benchmark YAML must
 exist at startup; do not generate a replacement when it is missing.
 Benchmark-module `initialize()` functions prepare snapshots only when requested.
+Starting a suite requests missing supported snapshots automatically from pinned
+YAML definitions; server startup still leaves the snapshot store empty. Persist
+the accepted suite before downloads, retain preparation/indexing failures, and
+publish only exported passage text into the explicitly configured Nebula corpus.
+Wait for authenticated reindex completion and exact passage revisions before
+executing queries; reference answers and snapshot JSON must never be indexed.
 
 Use the actual Genesis storage and Nebula implementations in experimental
 checkouts, with separate storage roots and backend processes. Successful changes
@@ -87,4 +93,5 @@ Generation requires a configured remote-enabled Nebula. The development launcher
 can supervise a separate Nebula using the private module's shared configuration;
 provider credentials remain there and never enter frontend state. Reuse only the
 model bundle from normal Genesis storage, keeping benchmark corpus/index state
-separate. Automatic startup does not prepare snapshots or download models.
+separate. Automatic startup does not prepare snapshots. Nebula's managed launcher
+provisions its verified model bundle and enables the benchmark reindex capability.

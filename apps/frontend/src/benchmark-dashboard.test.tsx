@@ -259,6 +259,86 @@ describe('Benchmark workspace', () => {
     expect(props.api.startRun).not.toHaveBeenCalled();
     expect(props.answerApi.startRun).not.toHaveBeenCalled();
   });
+  it('starts from an empty snapshot store and announces preparation, indexing and execution', async () => {
+    const user = userEvent.setup();
+    const props = setup();
+    props.api.listBenchmarks.mockResolvedValue([]);
+    props.resultsApi.getResults.mockResolvedValue({ benchmarks: [] });
+    props.answerApi.getRuntime.mockResolvedValue({
+      ...(await props.answerApi.getRuntime()),
+      available: false,
+      reason: 'Nebula knowledge is not ready',
+    });
+    const preparing = {
+      ...suite,
+      phase: 'preparing' as const,
+      preparations: [
+        {
+          benchmark: 'hotpotqa',
+          benchmark_id: null,
+          status: 'running' as const,
+          reason: 'Downloading the HotpotQA dataset',
+        },
+      ],
+      items: [
+        { ...suite.items[1], benchmark_id: null, status: 'queued' as const },
+        { ...suite.items[0], benchmark_id: null, run_id: null, status: 'queued' as const },
+        suite.items[2],
+      ],
+    };
+    props.resultsApi.startSuite.mockResolvedValue(preparing);
+    render(<BenchmarkDashboard {...props} />);
+    await screen.findByText('Connected');
+    await user.click(screen.getByRole('button', { name: 'Run all benchmarks' }));
+    expect(screen.getByRole('button', { name: 'Start suite run' })).toBeEnabled();
+    expect(screen.getByRole('combobox', { name: 'Generation profile' })).toBeEnabled();
+    expect(screen.queryByText(/Answer evaluations will be skipped/)).not.toBeInTheDocument();
+    expect(props.resultsApi.startSuite).not.toHaveBeenCalled();
+    props.resultsApi.listSuites.mockResolvedValue([preparing]);
+    await user.click(screen.getByRole('button', { name: 'Start suite run' }));
+    expect(props.resultsApi.startSuite).toHaveBeenCalledWith(
+      { architecture_label: 'baseline', description: '', profile_id: 'profile' },
+      expect.any(AbortSignal),
+    );
+    expect(screen.getByRole('status')).toHaveTextContent('Run #12 preparing: HotpotQA.');
+    expect(screen.getByRole('status')).toHaveTextContent('Downloading the HotpotQA dataset');
+    expect(screen.getByRole('button', { name: 'Run in progress' })).toBeDisabled();
+
+    props.resultsApi.listSuites.mockResolvedValue([{ ...preparing, phase: 'indexing' }]);
+    await user.click(screen.getByRole('button', { name: 'Refresh' }));
+    expect(screen.getByRole('status')).toHaveTextContent('Run #12 indexing the Nebula corpus.');
+    props.resultsApi.listSuites.mockResolvedValue([
+      {
+        ...preparing,
+        phase: 'running',
+        items: [{ ...suite.items[1], status: 'running', run_id: 'hotpot-run' }],
+      },
+    ]);
+    await user.click(screen.getByRole('button', { name: 'Refresh' }));
+    expect(screen.getByRole('status')).toHaveTextContent(
+      'Run #12 in progress: HotpotQA · Generated answers.',
+    );
+    expect(props.resultsApi.startSuite).toHaveBeenCalledTimes(1);
+    expect(props.api.loadBenchmark).not.toHaveBeenCalled();
+    expect(props.api.startRun).not.toHaveBeenCalled();
+    expect(props.answerApi.startRun).not.toHaveBeenCalled();
+  });
+  it('keeps a catalog without supported loaders or snapshots from starting an empty suite', async () => {
+    const props = setup();
+    const user = userEvent.setup();
+    const catalog = await props.api.getCatalog();
+    props.api.getCatalog.mockResolvedValue({ benchmarks: { qasper: catalog.benchmarks.qasper } });
+    props.api.listBenchmarks.mockResolvedValue([]);
+    props.resultsApi.getResults.mockResolvedValue({ benchmarks: [] });
+    render(<BenchmarkDashboard {...props} />);
+    await screen.findByText('Connected');
+    await user.click(screen.getByRole('button', { name: 'Run all benchmarks' }));
+    expect(screen.getByRole('button', { name: 'Start suite run' })).toBeDisabled();
+    expect(
+      screen.getByText('No supported benchmark definitions or snapshots are available.'),
+    ).toBeVisible();
+    expect(props.resultsApi.startSuite).not.toHaveBeenCalled();
+  });
   it('announces the active suite above the selected table while another benchmark runs', async () => {
     const user = userEvent.setup();
     const props = setup();
@@ -457,7 +537,10 @@ describe('Benchmark workspace', () => {
     props.resultsApi.listSuites.mockRejectedValue(new Error('Offline'));
     await user.click(screen.getByRole('button', { name: 'Start suite run' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('Offline');
-    await user.selectOptions(screen.getByRole('combobox', { name: 'Suite run history' }), previous.id);
+    await user.selectOptions(
+      screen.getByRole('combobox', { name: 'Suite run history' }),
+      previous.id,
+    );
     expect(screen.getByRole('status')).toHaveTextContent('Run #12 waiting to start: RAGTruth QA');
     expect(screen.getByRole('button', { name: 'Run in progress' })).toBeDisabled();
 

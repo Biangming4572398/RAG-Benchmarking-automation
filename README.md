@@ -12,16 +12,19 @@ It supports search, status filters, notes, CSV exports, evidence inspection, and
 compatible-run comparisons.
 
 The default architecture label is `baseline`, referring to the current Nebula
-implementation at commit `a16724265d0142684349b773c5e475e2f79ea818`.
+implementation at commit `8c62fd4e9f27b0ff0465cfee7e55679ea49e6a02`.
 When evaluating later Nebula changes, supply a distinct architecture label and
 record that revision in the run description. Runtime embedding and generation
 model identities are still captured from Nebula for each run.
 
-**Run all benchmarks** creates one durable suite. It selects the latest prepared
-snapshot for each benchmark module, executes every supported mode in sequence,
+**Run all benchmarks** creates one durable suite, even on an empty snapshot store.
+It reuses the latest prepared snapshot for each benchmark module and automatically
+downloads/prepares missing supported datasets from the pinned YAML definitions.
+The suite runner publishes their passage text to Nebula's dedicated corpus
+and indexes it before the suite executes every supported mode in sequence,
 and associates the resulting executions with one suite run number. Unsupported
-benchmarks, missing snapshots, and unavailable generation are recorded with
-skipped reasons. Suite history retains these outcomes alongside execution results.
+benchmarks and unavailable generation are recorded with skipped reasons. Preparation
+and indexing failures are saved in suite history alongside execution results.
 RAGTruth and HotpotQA have working loaders and evaluators; LongMemEval — cleaned,
 TempRAGEval, QASPER, AbstentionBench, MultiHop-RAG and RAGBench remain catalog-only
 and are marked **Integration required**. Registration alone does not make a
@@ -29,8 +32,9 @@ benchmark runnable or produce scores.
 
 Definitions are managed through Git in
 [`apps/backend/benchmarks.yaml`](apps/backend/benchmarks.yaml). Prepare supported
-snapshots with the HTTP API as described below. The dashboard's **Benchmark setup
-& snapshots** section shows preparation guidance and saved corpus paths; it does
+snapshots explicitly with the HTTP API as described below, or let the first suite
+prepare them automatically. The dashboard's **Benchmark setup & snapshots** section
+shows preparation guidance and saved corpus paths; it does
 not edit definitions or load datasets. Its UI, API clients, styling, standalone
 proxy, and backend build/lifecycle script live inside this submodule.
 
@@ -73,7 +77,8 @@ shared infrastructure:
 
 Application initialization is handled by `main.rs`. The bundled benchmark YAML
 must exist at startup. A named module's `initialize()` prepares a dataset snapshot
-when requested; startup does not create snapshots.
+when requested; startup creates empty storage, not populated snapshots. Starting a
+suite requests any missing supported snapshots automatically.
 
 To add a benchmark, create `apps/backend/src/benchmarks/<name>.rs`, declare it in
 `benchmarks/mod.rs`, and implement `BenchmarkModule`, including validation,
@@ -391,15 +396,24 @@ Nebula connection under its existing owner's control.
 | `BENCHMARK_NEBULA_STORAGE` | `<BENCHMARK_DATA_DIR>/nebula/storage` | Nebula's separate mutable index and state |
 | `BENCHMARK_NEBULA_MODEL_DIR` | `~/.genesis/storage/.genesis/modules/nebula/models/intfloat-multilingual-e5-small` | Existing E5 model bundle, reused without changing Genesis's index |
 
-The corpus and state directories are created if absent; the corpus is initially
-empty. Snapshots are still prepared explicitly through the API. Copy their
-exported Markdown passages into the configured corpus, preserving filenames and
-bytes, then restart the dashboard development server so Nebula indexes them.
-Restart after each corpus change and wait for indexing to finish before running benchmarks. Never
-point Nebula at the whole benchmark data directory: snapshot JSON includes
-answers and evaluation labels. Models are not downloaded by the launcher. Install
-the embedding bundle first, or set `BENCHMARK_NEBULA_MODEL_DIR` to an existing
-compatible bundle. No paid generation request is made merely by opening the dashboard.
+The corpus and state directories are created if absent; startup leaves snapshots
+and the corpus empty. **Start suite run** saves a run number immediately, prepares
+missing supported datasets, copies only their exported Markdown passages into the
+dedicated corpus, and requests indexing before any evaluation runs. The dashboard
+shows preparing, indexing, and execution progress. Existing snapshots and verified
+passages are reused. A download failure is recorded for that benchmark and other
+prepared benchmarks can continue; an indexing failure stops execution and is saved
+on the suite. A stopped server marks unfinished preparation/runs interrupted.
+
+The managed launcher supplies `BENCHMARK_NEBULA_CORPUS` to Rust and enables Nebula's
+authenticated `-benchmark-reindex` endpoint. External Nebula owners must supply the
+same corpus directory through that setting and enable the flag for automatic setup;
+existing manually indexed snapshots remain usable without it. Publication preserves
+the existing directory and refuses to overwrite different file contents. Never point
+Nebula at the whole benchmark data directory: snapshot JSON includes answers and
+evaluation labels. The managed Nebula launcher provisions its verified embedding
+bundle when needed. No dataset download or paid generation request happens merely
+from opening the dashboard; dataset preparation begins when a suite is submitted.
 
 You can also run directly in `apps/backend` using Rust 1.95 or newer:
 
@@ -505,18 +519,24 @@ The dashboard exposes the architecture label, notes, and runtime profile; top-k
 can be supplied through the API.
 
 Planning chooses the most recently saved snapshot per canonical benchmark module
-(save time, then UUID for ties) and pins its ID before accepting the suite. YAML
-aliases for one module do not create duplicate executions. Prepared snapshots
+(save time, then UUID for ties) and pins its ID before accepting the suite. Missing
+supported snapshots instead pin their resolved YAML definition, then load once
+after the suite is saved. YAML aliases for one module do not create duplicate executions. Prepared snapshots
 remain eligible even if their catalog entry was removed. RAGTruth runs retrieval
 and, when a profile is supplied, generation; HotpotQA runs generation. Unsupported
-modules and missing snapshots are recorded as `skipped`, as is generation without
-a profile or with an unavailable runtime. A setup or worker failure is recorded
+modules are recorded as `skipped`, as is generation without a profile or with an
+unavailable runtime after indexing. A dataset setup or worker failure is recorded
 for its item while later items are still attempted, unless persistence itself
 fails. The server holds its one active-run slot across the whole suite; competing
-suite or individual-run requests receive HTTP 409.
+suite or individual-run requests receive HTTP 409. Corpus publication/indexing is
+a shared prerequisite: failure stops the remaining executions with a saved reason.
 
 HTTP 202 returns a `SuiteRun` with `id`, global `run_number`, the accepted
 `request`, `status`, `started_at_ms`, nullable `finished_at_ms`/`error`, and `items`.
+`phase` reports `preparing`, `indexing`, `running`, or `finished`. `preparations`
+records each supported benchmark's pinned definition, nullable snapshot ID,
+status, and reason. Older saved suites default to phase `running` and an empty
+preparation list; completed/interrupted status remains authoritative.
 Each item contains its canonical `benchmark` key, nullable `benchmark_id`,
 `mode` (`retrieval`, `generation`, or null), `status`, nullable child `run_id`, and
 nullable `reason`. Item states are `queued`, `running`, `completed`, `failed`,

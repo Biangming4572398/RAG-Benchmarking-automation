@@ -75,6 +75,14 @@ function snapshotKey(snapshot: BenchmarkInfo) {
 function displayName(key: string, definition?: BenchmarkDefinition) {
   return definition?.name ?? { 'ragtruth-qa': 'RAGTruth QA', hotpotqa: 'HotpotQA' }[key] ?? key;
 }
+function supportsPreparation(definition?: BenchmarkDefinition) {
+  return (
+    (definition?.adapter === 'ragtruth_qa' &&
+      definition.evaluation === 'paired_context_recovery_v1') ||
+    (definition?.adapter === 'hotpotqa_distractor' &&
+      definition.evaluation === 'hotpotqa_answer_v1')
+  );
+}
 function saveDownload(blob: Blob, name: string) {
   const url = URL.createObjectURL(blob);
   const link = document.createElement('a');
@@ -235,10 +243,19 @@ export function BenchmarkDashboard({
   const activeItem =
     activeSuite?.items.find((item) => item.status === 'running') ??
     activeSuite?.items.find((item) => item.status === 'queued');
+  const activePreparation =
+    activeSuite?.preparations?.find((item) => item.status === 'running') ??
+    activeSuite?.preparations?.find((item) => item.status === 'queued');
   let statusNotice = '';
   if (currentSuite) {
     let progress = currentSuite.status === 'running' ? 'in progress' : currentSuite.status;
-    if (activeItem) {
+    if (activeSuite?.phase === 'preparing') {
+      progress = activePreparation
+        ? `preparing: ${displayName(activePreparation.benchmark, definitions.get(activePreparation.benchmark))}`
+        : 'preparing benchmarks';
+    } else if (activeSuite?.phase === 'indexing') {
+      progress = 'indexing the Nebula corpus';
+    } else if (activeItem) {
       const benchmark = displayName(activeItem.benchmark, definitions.get(activeItem.benchmark));
       const mode = activeItem.mode === 'generation' ? 'Generated answers' : 'Retrieval';
       progress = `${activeItem.status === 'running' ? 'in progress' : 'waiting to start'}: ${benchmark}${activeItem.mode ? ` · ${mode}` : ''}`;
@@ -252,6 +269,9 @@ export function BenchmarkDashboard({
       .map(([status, count]) => `${count} ${status}`)
       .join(' · ');
     statusNotice = `Run #${currentSuite.run_number} ${progress}. ${counts}.`;
+    if (activeSuite?.phase === 'preparing' && activePreparation?.reason) {
+      statusNotice += ` ${activePreparation.reason}`;
+    }
   }
   const active =
     !!activeSuite ||
@@ -260,9 +280,11 @@ export function BenchmarkDashboard({
   const profiles = runtime.data?.profiles.filter((item) => item.enabled) ?? [];
   const profile = profiles.find((item) => item.id === profileId) ?? profiles[0];
   const prepared = new Set(snapshots.map(snapshotKey));
-  const hasRunnable = snapshots.some((item) =>
-    ['paired_context_recovery_v1', 'hotpotqa_answer_v1'].includes(item.metric_kind),
-  );
+  const hasRunnable =
+    Object.values(catalog.benchmarks).some(supportsPreparation) ||
+    snapshots.some((item) =>
+      ['paired_context_recovery_v1', 'hotpotqa_answer_v1'].includes(item.metric_kind),
+    );
   const selection = useRef({ ids: new Set<string>(), runIds: new Set<string>() });
   selection.current = {
     ids: new Set(selectedSnapshots.map((item) => item.id)),
@@ -350,9 +372,7 @@ export function BenchmarkDashboard({
         {
           architecture_label: architecture.trim(),
           description,
-          ...(runtime.connected && runtime.data?.available && profile
-            ? { profile_id: profile.id }
-            : {}),
+          ...(runtime.connected && profile ? { profile_id: profile.id } : {}),
         },
         signal,
       );
@@ -457,7 +477,9 @@ export function BenchmarkDashboard({
                         ? 'Integration required'
                         : prepared.has(key)
                           ? 'Ready to run'
-                          : 'Not prepared'}
+                          : supportsPreparation(entry)
+                            ? 'Prepares on run'
+                            : 'Not prepared'}
                   </span>
                 </span>
               </button>
@@ -509,10 +531,10 @@ export function BenchmarkDashboard({
                 </button>
               </div>
               <p className={styles.muted}>
-                Choose Start suite run below to test every prepared benchmark in sequence. Retrieval
-                and answer results are
-                saved separately under the same run number. Unprepared benchmarks and unavailable
-                evaluations are recorded as skipped.
+                Choose Start suite run below to prepare missing datasets, index their passages in
+                Nebula, and test every supported benchmark in sequence. Retrieval and answer results
+                are saved separately under the same run number. Catalog-only benchmarks and
+                unavailable evaluations are recorded as skipped.
               </p>
               <div className={styles.suiteFields}>
                 <label>
@@ -531,9 +553,7 @@ export function BenchmarkDashboard({
                   <select
                     value={profile?.id ?? ''}
                     onChange={(event) => setProfileId(event.target.value)}
-                    disabled={
-                      pending || !runtime.connected || !runtime.data?.available || !profiles.length
-                    }
+                    disabled={pending || !runtime.connected || !profiles.length}
                   >
                     <option value="" disabled>
                       No generation profile available
@@ -557,15 +577,21 @@ export function BenchmarkDashboard({
                 />
               </label>
               {!runtimeSettled && <p className={styles.muted}>Checking generation availability…</p>}
-              {runtimeSettled && (!runtime.connected || !runtime.data?.available || !profile) && (
+              {runtimeSettled && (!runtime.connected || !profile) && (
                 <p className={styles.muted}>
                   {runtime.error || runtime.data?.reason || 'Generation is unavailable.'} Answer
-                  evaluations will be skipped; prepared retrieval benchmarks can still run.
+                  evaluations will be skipped; supported retrieval benchmarks can still run.
+                </p>
+              )}
+              {runtime.connected && profile && !runtime.data?.available && (
+                <p className={styles.muted}>
+                  {runtime.data?.reason || 'Nebula is not ready yet.'} The suite prepares and
+                  indexes the benchmark passages before evaluating answers.
                 </p>
               )}
               <p className={styles.muted}>
-                Uses the latest prepared snapshot per benchmark and the configured Nebula runtime.
-                Generation uses its configured provider.
+                Reuses existing snapshots or downloads missing datasets using the team’s YAML
+                definitions. Generation uses the configured provider.
               </p>
               <button
                 type="submit"
@@ -578,7 +604,7 @@ export function BenchmarkDashboard({
               </button>
               {!hasRunnable && (
                 <p className={styles.muted}>
-                  Prepare a supported benchmark snapshot using the backend setup instructions first.
+                  No supported benchmark definitions or snapshots are available.
                 </p>
               )}
             </form>
@@ -794,7 +820,7 @@ export function BenchmarkDashboard({
                               definition?.evaluation === 'hotpotqa_answer_v1'
                               ? 'This benchmark evaluates generated answers. Switch to Generated answers.'
                               : 'Start a suite run to save results for this benchmark.'
-                            : 'Prepare a benchmark snapshot in the backend to get started.'}
+                            : 'Start a suite run to prepare this benchmark and save its results.'}
                     </p>
                   </div>
                 )}
@@ -900,6 +926,20 @@ export function BenchmarkDashboard({
                 · {latestSuite.items.filter((item) => item.status === 'skipped').length} skipped
               </summary>
               {latestSuite.error && <p className={styles.error}>{latestSuite.error}</p>}
+              {latestSuite.preparations?.map((preparation) => (
+                <div className={styles.suiteItem} key={`prepare-${preparation.benchmark}`}>
+                  <span>
+                    {displayName(preparation.benchmark, definitions.get(preparation.benchmark))}
+                    <small>Dataset preparation</small>
+                  </span>
+                  <span>
+                    <span className={styles.badge} data-state={preparation.status}>
+                      {statusLabel(preparation.status)}
+                    </span>
+                    {preparation.reason && <small>{preparation.reason}</small>}
+                  </span>
+                </div>
+              ))}
               {latestSuite.items.map((item, index) => (
                 <div className={styles.suiteItem} key={`${item.benchmark}-${item.mode}-${index}`}>
                   <span>
@@ -924,11 +964,13 @@ export function BenchmarkDashboard({
             <details className={styles.disclosure}>
               <summary>Benchmark setup &amp; snapshots</summary>
               <p>
-                {definition?.preparation ??
-                  'Prepare snapshots through the benchmark backend, then index the exported corpus in your configured Nebula runtime.'}
+                {supportsPreparation(definition)
+                  ? 'Starting a suite prepares missing snapshots and indexes their passages in Nebula automatically.'
+                  : (definition?.preparation ??
+                    'This benchmark needs a backend integration before it can run.')}
               </p>
               <p className={styles.muted}>
-                Definitions and dataset preparation are managed in YAML and Git. Each run keeps its
+                Definitions and dataset sources are managed in YAML and Git. Each run keeps its
                 original snapshot fingerprint.
               </p>
               {selectedSnapshots.map((snapshot) => (

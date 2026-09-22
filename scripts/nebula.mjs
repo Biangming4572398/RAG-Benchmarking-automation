@@ -44,7 +44,12 @@ export async function connectNebula({ backendDirectory, env, log }) {
   const runtime = await startBenchmarkNebula({ env, log, corpusPath, moduleStoragePath, modelDirectory });
   log(`Benchmark Nebula corpus: ${corpusPath}`);
   return {
-    env: { ...env, NEBULA_API_BASE: runtime.baseUrl, NEBULA_API_TOKEN: runtime.token },
+    env: {
+      ...env,
+      NEBULA_API_BASE: runtime.baseUrl,
+      NEBULA_API_TOKEN: runtime.token,
+      BENCHMARK_NEBULA_CORPUS: corpusPath,
+    },
     stop: runtime.stop,
   };
 }
