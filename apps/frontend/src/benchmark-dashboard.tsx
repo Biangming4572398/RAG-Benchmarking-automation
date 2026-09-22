@@ -116,7 +116,7 @@ export function BenchmarkDashboard({
   const [profileId, setProfileId] = useState('');
   const [pending, setPending] = useState(false);
   const [actionError, setActionError] = useState('');
-  const [notice, setNotice] = useState('');
+  const [acceptedSuite, setAcceptedSuite] = useState<SuiteRun | null>(null);
   const [suiteId, setSuiteId] = useState('');
   const [inspection, setInspection] = useState<string | null>(null);
   const inspectionHeading = useRef<HTMLHeadingElement | null>(null);
@@ -153,6 +153,11 @@ export function BenchmarkDashboard({
   );
   const runtime = usePolling<AnswerRuntime | null>(loadRuntime, null, pollInterval);
   const { catalog, snapshots, results, suites } = workspace.data;
+  useEffect(() => {
+    if (acceptedSuite && suites.some((suite) => suite.id === acceptedSuite.id)) {
+      setAcceptedSuite(null);
+    }
+  }, [acceptedSuite, suites]);
   const definitions = new Map(
     Object.entries(catalog.benchmarks).map(([key, value]) => [
       catalog.module_keys?.[key] ?? key,
@@ -219,10 +224,37 @@ export function BenchmarkDashboard({
       (column.startsWith('metric.') || (mode === 'generation' && column.startsWith('review.'))) &&
       modeRows.some((row) => row[column] !== undefined && row[column] !== ''),
   );
-  const sortedSuites = [...suites].sort((a, b) => b.run_number - a.run_number);
+  const knownSuites =
+    acceptedSuite && !suites.some((suite) => suite.id === acceptedSuite.id)
+      ? [...suites, acceptedSuite]
+      : suites;
+  const sortedSuites = [...knownSuites].sort((a, b) => b.run_number - a.run_number);
   const latestSuite = sortedSuites.find((suite) => suite.id === suiteId) ?? sortedSuites[0];
+  const activeSuite = sortedSuites.find((suite) => suite.status === 'running');
+  const currentSuite = activeSuite ?? sortedSuites[0];
+  const activeItem =
+    activeSuite?.items.find((item) => item.status === 'running') ??
+    activeSuite?.items.find((item) => item.status === 'queued');
+  let statusNotice = '';
+  if (currentSuite) {
+    let progress = currentSuite.status === 'running' ? 'in progress' : currentSuite.status;
+    if (activeItem) {
+      const benchmark = displayName(activeItem.benchmark, definitions.get(activeItem.benchmark));
+      const mode = activeItem.mode === 'generation' ? 'Generated answers' : 'Retrieval';
+      progress = `${activeItem.status === 'running' ? 'in progress' : 'waiting to start'}: ${benchmark}${activeItem.mode ? ` · ${mode}` : ''}`;
+    }
+    const counts = ['completed', 'failed', 'interrupted', 'skipped']
+      .map(
+        (status) =>
+          [status, currentSuite.items.filter((item) => item.status === status).length] as const,
+      )
+      .filter(([status, count]) => count > 0 || status === 'completed')
+      .map(([status, count]) => `${count} ${status}`)
+      .join(' · ');
+    statusNotice = `Run #${currentSuite.run_number} ${progress}. ${counts}.`;
+  }
   const active =
-    suites.some((suite) => suite.status === 'running') ||
+    !!activeSuite ||
     results.benchmarks.some((item) => item.rows.some((row) => row.status === 'running'));
   const runtimeSettled = !!runtime.updatedAt || !!runtime.error;
   const profiles = runtime.data?.profiles.filter((item) => item.enabled) ?? [];
@@ -289,7 +321,6 @@ export function BenchmarkDashboard({
     operation.current = controller;
     setPending(true);
     setActionError('');
-    setNotice('');
     try {
       await action(controller.signal);
     } catch (cause) {
@@ -327,10 +358,8 @@ export function BenchmarkDashboard({
       );
       if (signal.aborted) return;
       setShowRunForm(false);
+      setAcceptedSuite(suite);
       setSuiteId(suite.id);
-      setNotice(
-        `Run #${suite.run_number} started. All benchmark outcomes are saved automatically.`,
-      );
       update({ query: '', status: 'all' });
       await workspace.reload();
     });
@@ -375,8 +404,12 @@ export function BenchmarkDashboard({
             Refresh
           </button>
           <button
+            type="button"
             className={styles.primaryButton}
-            onClick={() => setShowRunForm((value) => !value)}
+            onClick={() => {
+              setShowRunForm(true);
+              formHeading.current?.focus();
+            }}
             aria-expanded={showRunForm}
             aria-controls={`${id}-new-run`}
             disabled={active}
@@ -453,9 +486,9 @@ export function BenchmarkDashboard({
               {actionError}
             </p>
           )}
-          {notice && (
+          {statusNotice && (
             <p className={styles.notice} role="status">
-              {notice}
+              {statusNotice}
             </p>
           )}
           {showRunForm && (
@@ -476,7 +509,8 @@ export function BenchmarkDashboard({
                 </button>
               </div>
               <p className={styles.muted}>
-                One run tests every prepared benchmark in sequence. Retrieval and answer results are
+                Choose Start suite run below to test every prepared benchmark in sequence. Retrieval
+                and answer results are
                 saved separately under the same run number. Unprepared benchmarks and unavailable
                 evaluations are recorded as skipped.
               </p>
@@ -534,6 +568,7 @@ export function BenchmarkDashboard({
                 Generation uses its configured provider.
               </p>
               <button
+                type="submit"
                 className={styles.primaryButton}
                 disabled={
                   pending || active || !workspace.connected || !hasRunnable || !runtimeSettled

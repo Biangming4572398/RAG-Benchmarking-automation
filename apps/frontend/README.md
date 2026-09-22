@@ -90,14 +90,19 @@ static build separately requires an equivalent proxy.
    notes and select an enabled generation profile from the configured Nebula
    runtime. The UI waits for the initial runtime availability check before
    allowing submission. Labels allow 1–256 UTF-8 bytes and notes up to 4000 bytes.
-3. Start the suite. The selected sidebar benchmark does not limit the run. The
-   backend pins the latest prepared snapshot per canonical benchmark module and
+   Clicking **Run all benchmarks** again keeps setup open; **Cancel** dismisses it.
+3. Choose **Start suite run** inside the form. The selected sidebar benchmark does
+   not limit the run. The backend pins the latest prepared snapshot per canonical
+   benchmark module and
    executes every supported mode in sequence. RAGTruth supports retrieval and
    generation; HotpotQA supports generation. Retrieval uses saved snapshot top-k
    defaults; the current generation path uses top-k 8.
-4. Watch progress and open **Suite run history** for completed, failed, interrupted,
-   or skipped outcomes. Unprepared benchmarks, catalog-only integrations, and
-   unavailable generation are explicitly recorded as skipped. Selecting a suite
+4. The status above the selected results table names the active benchmark and
+   evaluation mode. The selected table stays selected while the suite runs other
+   benchmarks; its next result appears when that benchmark starts. Open **Suite
+   run history** for completed, failed, interrupted, or skipped outcomes.
+   Unprepared benchmarks, catalog-only integrations, and unavailable generation
+   are explicitly recorded as skipped. Selecting a suite
    in history changes its progress/details disclosure, not the results filter.
 5. Use **Inspect** on an execution for compatible-run comparison, detailed
    settings/evidence, per-run CSV, and answer review. **Export benchmark CSV**

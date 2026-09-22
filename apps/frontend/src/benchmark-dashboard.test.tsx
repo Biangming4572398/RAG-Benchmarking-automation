@@ -204,6 +204,30 @@ describe('Benchmark workspace', () => {
     expect(props.api.startRun).not.toHaveBeenCalled();
     expect(props.answerApi.startRun).not.toHaveBeenCalled();
   });
+  it('keeps setup open when Run all benchmarks is clicked again after entering a name', async () => {
+    const user = userEvent.setup();
+    const props = setup();
+    render(<BenchmarkDashboard {...props} />);
+    await screen.findByText('Connected');
+    const open = screen.getByRole('button', { name: 'Run all benchmarks' });
+    await user.click(open);
+    const label = screen.getByRole('textbox', { name: 'Architecture label' });
+    await user.clear(label);
+    await user.type(label, 'Fedora baseline');
+    await user.click(open);
+    expect(screen.getByRole('form', { name: 'Run all benchmarks' })).toBeVisible();
+    expect(label).toHaveValue('Fedora baseline');
+    expect(label).toHaveFocus();
+    expect(props.resultsApi.startSuite).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole('button', { name: 'Start suite run' }));
+    expect(props.resultsApi.startSuite).toHaveBeenCalledTimes(1);
+    expect(props.resultsApi.startSuite).toHaveBeenCalledWith(
+      { architecture_label: 'Fedora baseline', description: '', profile_id: 'profile' },
+      expect.any(AbortSignal),
+    );
+    expect(screen.queryByRole('form', { name: 'Run all benchmarks' })).not.toBeInTheDocument();
+  });
   it('starts one durable suite across all benchmarks regardless of the selected table', async () => {
     const user = userEvent.setup();
     const props = setup();
@@ -227,11 +251,86 @@ describe('Benchmark workspace', () => {
         expect.any(AbortSignal),
       ),
     );
-    expect(await screen.findByText(/Run #12 started/)).toBeVisible();
+    expect(await screen.findByRole('status')).toHaveTextContent(
+      'Run #12 in progress: RAGTruth QA · Retrieval.',
+    );
     expect(screen.getByText('Dataset loader is not integrated')).toBeVisible();
     expect(screen.getByRole('button', { name: 'Run in progress' })).toBeDisabled();
     expect(props.api.startRun).not.toHaveBeenCalled();
     expect(props.answerApi.startRun).not.toHaveBeenCalled();
+  });
+  it('announces the active suite above the selected table while another benchmark runs', async () => {
+    const user = userEvent.setup();
+    const props = setup();
+    const activeSuite: SuiteRun = {
+      ...suite,
+      items: [
+        { ...suite.items[1], status: 'running', run_id: 'hotpot-run' },
+        { ...suite.items[0], status: 'queued', run_id: null },
+        suite.items[2],
+      ],
+    };
+    const previousSuite: SuiteRun = {
+      ...suite,
+      id: 'previous-suite',
+      run_number: 11,
+      status: 'completed',
+      finished_at_ms: 124,
+      items: [],
+    };
+    props.resultsApi.getResults.mockResolvedValue({ benchmarks: [] });
+    props.resultsApi.listSuites.mockResolvedValue([previousSuite, activeSuite]);
+    render(<BenchmarkDashboard {...props} />);
+    await screen.findByText('Connected');
+    const status = screen.getByRole('status');
+    expect(status).toHaveTextContent(
+      'Run #12 in progress: HotpotQA · Generated answers. 0 completed · 1 skipped.',
+    );
+    const selectedBenchmark = screen.getByRole('button', { name: /RAGTruth QA Ready to run/ });
+    expect(selectedBenchmark).toHaveAttribute('aria-current', 'true');
+    expect(screen.getByText('Start a suite run to save results for this benchmark.')).toBeVisible();
+    expect(
+      status.compareDocumentPosition(screen.getByRole('heading', { name: 'RAGTruth QA' })) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+
+    await user.selectOptions(
+      screen.getByRole('combobox', { name: 'Suite run history' }),
+      'previous-suite',
+    );
+    await user.click(screen.getByRole('button', { name: /QASPER Integration required/ }));
+    expect(screen.getByRole('status')).toHaveTextContent('Run #12 in progress: HotpotQA');
+
+    props.resultsApi.listSuites.mockResolvedValue([
+      previousSuite,
+      {
+        ...activeSuite,
+        items: activeSuite.items.map((item) =>
+          item.status === 'running' ? { ...item, status: 'queued', run_id: null } : item,
+        ),
+      },
+    ]);
+    await user.click(screen.getByRole('button', { name: 'Refresh' }));
+    expect(await screen.findByRole('status')).toHaveTextContent(
+      'Run #12 waiting to start: HotpotQA · Generated answers.',
+    );
+    props.resultsApi.listSuites.mockResolvedValue([
+      previousSuite,
+      {
+        ...activeSuite,
+        status: 'failed',
+        finished_at_ms: 125,
+        items: [
+          { ...activeSuite.items[0], status: 'failed', reason: 'Generation failed' },
+          { ...activeSuite.items[1], status: 'completed', run_id: 'rag-run' },
+          activeSuite.items[2],
+        ],
+      },
+    ]);
+    await user.click(screen.getByRole('button', { name: 'Refresh' }));
+    expect(await screen.findByRole('status')).toHaveTextContent(
+      'Run #12 failed. 1 completed · 1 failed · 1 skipped.',
+    );
   });
   it('retains benchmark and filters across remounts and supports keyboard evaluation tabs', async () => {
     const user = userEvent.setup();
@@ -334,6 +433,54 @@ describe('Benchmark workspace', () => {
     expect(await screen.findByText(/Previously loaded results remain visible/)).toBeVisible();
     expect(screen.getByText('Dense v2')).toBeVisible();
     expect(screen.getByRole('button', { name: 'Start suite run' })).toBeDisabled();
+  });
+  it('retains an accepted suite across failed polling and history selection until polling observes it', async () => {
+    const user = userEvent.setup();
+    const props = setup();
+    const accepted: SuiteRun = {
+      ...suite,
+      items: [{ ...suite.items[0], status: 'queued', run_id: null }],
+    };
+    const previous: SuiteRun = {
+      ...suite,
+      id: 'previous-suite',
+      run_number: 11,
+      status: 'completed',
+      finished_at_ms: 124,
+      items: [{ ...suite.items[0], status: 'completed' }],
+    };
+    props.resultsApi.listSuites.mockResolvedValue([previous]);
+    props.resultsApi.startSuite.mockResolvedValue(accepted);
+    render(<BenchmarkDashboard {...props} />);
+    await screen.findByText('Connected');
+    await user.click(screen.getByRole('button', { name: 'Run all benchmarks' }));
+    props.resultsApi.listSuites.mockRejectedValue(new Error('Offline'));
+    await user.click(screen.getByRole('button', { name: 'Start suite run' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Offline');
+    await user.selectOptions(screen.getByRole('combobox', { name: 'Suite run history' }), previous.id);
+    expect(screen.getByRole('status')).toHaveTextContent('Run #12 waiting to start: RAGTruth QA');
+    expect(screen.getByRole('button', { name: 'Run in progress' })).toBeDisabled();
+
+    props.resultsApi.listSuites.mockResolvedValue([previous]);
+    await user.click(screen.getByRole('button', { name: 'Refresh' }));
+    expect(await screen.findByText('Connected')).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Run in progress' })).toBeDisabled();
+    expect(screen.getByRole('status')).toHaveTextContent('Run #12 waiting to start');
+
+    props.resultsApi.listSuites.mockResolvedValue([
+      previous,
+      {
+        ...accepted,
+        status: 'completed',
+        finished_at_ms: 125,
+        items: [{ ...accepted.items[0], status: 'completed' }],
+      },
+    ]);
+    await user.click(screen.getByRole('button', { name: 'Refresh' }));
+    expect(await screen.findByRole('button', { name: 'Run all benchmarks' })).toBeEnabled();
+    expect(screen.getByRole('status')).toHaveTextContent('Run #12 completed. 1 completed.');
+    expect(screen.getByRole('combobox', { name: 'Suite run history' })).toHaveValue(previous.id);
+    expect(props.resultsApi.startSuite).toHaveBeenCalledTimes(1);
   });
   it('continues browsing without a generation runtime and submits no profile for retrieval-only availability', async () => {
     const user = userEvent.setup();
